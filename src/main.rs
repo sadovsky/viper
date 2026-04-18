@@ -139,6 +139,99 @@ impl Default for Song {
 }
 
 impl Song {
+    /// Default startup song: a 16-step Am–F–G–Am loop ("i–VI–VII–i"), a
+    /// progression you'll recognize from plenty of NES-era soundtracks. 140 BPM,
+    /// one chord per bar, with a lead on PU1, arp on PU2, bass on TRI, and a
+    /// simple kick/snare/hat on NOI.
+    fn demo() -> Self {
+        let mut song = Song::default();
+        song.bpm = 140;
+        song.edit_step = 1;
+
+        // Instrument 00 — lead pulse: medium attack, punchy.
+        song.instruments[0] = Instrument {
+            attack_ms: 2, decay_ms: 80, sustain: 0.6,
+            release_ms: 150, duty: 0.5, volume: 0.7,
+        };
+        // Instrument 01 — thinner arp pulse, narrower duty.
+        song.instruments[1] = Instrument {
+            attack_ms: 2, decay_ms: 60, sustain: 0.3,
+            release_ms: 80, duty: 0.25, volume: 0.5,
+        };
+        // Instrument 02 — round triangle bass, long sustain.
+        song.instruments[2] = Instrument {
+            attack_ms: 2, decay_ms: 40, sustain: 0.9,
+            release_ms: 200, duty: 0.5, volume: 0.9,
+        };
+        // Instrument 03 — percussive click for the noise channel.
+        song.instruments[3] = Instrument {
+            attack_ms: 0, decay_ms: 60, sustain: 0.0,
+            release_ms: 20, duty: 0.5, volume: 0.7,
+        };
+
+        // Helper: write (note, instrument) into (step, channel).
+        let put = |song: &mut Song, step: usize, ch: usize, note: u8, instr: u8| {
+            let cell = &mut song.phrases[0].cells[step][ch];
+            cell.note = Some(note);
+            cell.instr = instr;
+            cell.vol = 15;
+        };
+
+        // Lead melody (PU1, ch0) — ascending then descending over the turnaround.
+        const PU1: usize = 0;
+        const PU2: usize = 1;
+        const TRI: usize = 2;
+        const NOI: usize = 3;
+        //       step note
+        put(&mut song,  0, PU1, 81, 0); // A5
+        put(&mut song,  2, PU1, 72, 0); // C5
+        put(&mut song,  3, PU1, 76, 0); // E5
+        put(&mut song,  4, PU1, 77, 0); // F5
+        put(&mut song,  6, PU1, 69, 0); // A4
+        put(&mut song,  7, PU1, 72, 0); // C5
+        put(&mut song,  8, PU1, 67, 0); // G4
+        put(&mut song, 10, PU1, 71, 0); // B4
+        put(&mut song, 11, PU1, 74, 0); // D5
+        put(&mut song, 12, PU1, 81, 0); // A5
+        put(&mut song, 13, PU1, 79, 0); // G5
+        put(&mut song, 14, PU1, 76, 0); // E5
+        put(&mut song, 15, PU1, 72, 0); // C5
+
+        // Arpeggio (PU2, ch1) — every step outlines the current chord.
+        let arp = [
+            57, 64, 69, 72, // Am: A3 E4 A4 C5
+            53, 60, 65, 69, // F:  F3 C4 F4 A4
+            55, 62, 67, 71, // G:  G3 D4 G4 B4
+            57, 64, 69, 64, // Am: A3 E4 A4 E4
+        ];
+        for (s, n) in arp.iter().enumerate() {
+            put(&mut song, s, PU2, *n, 1);
+        }
+
+        // Triangle bass (TRI, ch2) — root note on beats 1 and 3 of each bar.
+        let bass = [
+            (0, 45), (2, 45),   // Am
+            (4, 41), (6, 41),   // F
+            (8, 43), (10, 43),  // G
+            (12, 45), (14, 45), // Am
+        ];
+        for (s, n) in bass {
+            put(&mut song, s, TRI, n, 2);
+        }
+
+        // Drums (NOI, ch3) — kick-hat-snare-hat per bar. The noise generator
+        // ignores pitch, so these numbers just need to be non-None to retrigger.
+        for bar in 0..4 {
+            let base = bar * 4;
+            put(&mut song, base,     NOI, 36, 3); // kick
+            put(&mut song, base + 1, NOI, 60, 3); // hat
+            put(&mut song, base + 2, NOI, 50, 3); // snare
+            put(&mut song, base + 3, NOI, 60, 3); // hat
+        }
+
+        song
+    }
+
     fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .context("serializing song")?;
@@ -237,14 +330,14 @@ struct App {
 impl App {
     fn new() -> Self {
         Self {
-            song: Song::default(),
+            song: Song::demo(),
             mode: Mode::Normal,
             cursor_step: 0,
             cursor_ch: 0,
             pending: Pending::None,
             count: 0,
             command_buf: String::new(),
-            status: "welcome to viper — press : for commands, i to insert".into(),
+            status: "welcome — demo loaded; press space to play, ? for help".into(),
             playing: false,
             play_step: 0,
             selected_instr: 0,

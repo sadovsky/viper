@@ -8,6 +8,10 @@ A vim-keybound chiptune step sequencer for the terminal.
 cargo run
 ```
 
+Boots with a demo phrase loaded — an Am–F–G–Am (i–VI–VII–i) loop with
+lead pulse, arp pulse, triangle bass, and a kick/snare/hat on the noise
+channel. Press `space` to play.
+
 ## Current (stage 1) keys
 
 Normal mode:
