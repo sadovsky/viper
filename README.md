@@ -47,9 +47,12 @@ Command mode:
 - `:set bpm=140`
 - `:set step=4` — auto-advance N steps per inserted note (edit step)
 - `:play` / `:stop`
-- `:w [path]` — save song as JSON (path required the first time)
-- `:e <path>` — load song from JSON
+- `:w [path]` — save song as `.vip` (path required the first time)
+- `:e <path>` — load song from `.vip`
 - `:wq [path]` — save and quit
+- `:gen four` — four-on-floor drums on NOI
+- `:gen euclid <ch> <k> <n> [off]` — Euclidean rhythm on channel
+- `:gen scale <ch> <key> [mode] [density]` — random notes in a mode
 
 Instrument editor mode:
 - `j` / `k` (arrows) — select parameter
@@ -67,6 +70,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 - **Stage 2** ✅ — cpal audio thread, pulse oscillator, sample-accurate step playback
 - **Stage 3** ✅ — 4 voices (PU1/PU2/TRI/NOI), ADSR, instrument editor mode
 - **Stage 4** ✅ — operators (`d y p`), text objects (`ip ab iv`), unnamed register, `.` repeat
+- **Stage 3.5** ✅ — `.vip` text file format + generators (`four_on_floor`, `euclid`, `random_in_scale`)
 
 ### Live play
 

@@ -4,14 +4,15 @@
 //! Stage-2: cpal audio thread producing sound from the edited phrase.
 
 mod audio;
+mod gen;
+mod vip;
 
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -31,7 +32,7 @@ use ratatui::{
 pub(crate) const STEPS_PER_PHRASE: usize = 16;
 pub(crate) const CHANNELS: usize = 4;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Cell {
     /// MIDI note number; None = empty ("---").
     pub note: Option<u8>,
@@ -43,7 +44,7 @@ pub(crate) struct Cell {
     pub fx: Option<(u8, u8)>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub(crate) struct Phrase {
     pub cells: [[Cell; CHANNELS]; STEPS_PER_PHRASE],
 }
@@ -56,7 +57,7 @@ impl Default for Phrase {
 
 pub(crate) const INSTRUMENTS: usize = 16;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Instrument {
     /// Attack time in ms (0 = instant).
     pub attack_ms: u16,
@@ -115,14 +116,14 @@ impl Instrument {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Song {
-    bpm: u16,
+#[derive(Debug)]
+pub(crate) struct Song {
+    pub bpm: u16,
     /// How far to advance the cursor after inserting a note in insert mode.
-    edit_step: usize,
-    phrases: Vec<Phrase>,
+    pub edit_step: usize,
+    pub phrases: Vec<Phrase>,
     /// One phrase loaded at a time for now.
-    current_phrase: usize,
+    pub current_phrase: usize,
     pub instruments: [Instrument; INSTRUMENTS],
 }
 
@@ -143,7 +144,7 @@ impl Song {
     /// progression you'll recognize from plenty of NES-era soundtracks. 140 BPM,
     /// one chord per bar, with a lead on PU1, arp on PU2, bass on TRI, and a
     /// simple kick/snare/hat on NOI.
-    fn demo() -> Self {
+    pub(crate) fn demo() -> Self {
         let mut song = Song::default();
         song.bpm = 140;
         song.edit_step = 1;
@@ -232,21 +233,6 @@ impl Song {
         song
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("serializing song")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
-    }
-
-    fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let song: Song = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        Ok(song)
-    }
 }
 
 // ---------- Modal input ----------
@@ -324,6 +310,8 @@ struct App {
     last_action: Option<LastAction>,
     /// Path of the currently-loaded song file, if any.
     current_file: Option<PathBuf>,
+    /// Monotonic counter used to seed `:gen` so repeated calls vary.
+    gen_seed: u64,
     quit: bool,
 }
 
@@ -346,6 +334,7 @@ impl App {
             register: Register::default(),
             last_action: None,
             current_file: None,
+            gen_seed: 1,
             quit: false,
         }
     }
@@ -634,9 +623,14 @@ fn render_help(f: &mut Frame, area: Rect) {
         row(":set bpm=140",    "set tempo"),
         row(":set step=4",     "auto-advance N steps per inserted note"),
         row(":play / :stop",   "transport"),
-        row(":w [path]",       "save song to JSON (path required first time)"),
-        row(":e <path>",       "load song from JSON"),
+        row(":w [path]",       "save song as .vip (path required first time)"),
+        row(":e <path>",       "load song from .vip"),
         row(":wq [path]",      "save and quit"),
+        Line::from(""),
+        section("Generators"),
+        row(":gen four",       "kick/snare/hat on NOI"),
+        row(":gen euclid …",   "<ch> <k> <n> [off] — Euclidean rhythm"),
+        row(":gen scale …",    "<ch> <key> [mode] [density] — random in scale"),
         Line::from(""),
         Line::from(Span::styled(
             "  press q, Esc, or ? to close help",
@@ -656,15 +650,16 @@ fn render_splash(f: &mut Frame, area: Rect) {
         "╔══════════════════════════════════════════════════════════════════════════════╗",
         "║                                                                              ║",
         "║    ██╗   ██╗██╗██████╗ ███████╗██████╗                                       ║",
-        "║    ██║   ██║██║██╔══██╗██╔════╝██╔══██╗       .~\"~.~\"~.                      ║",
-        "║    ██║   ██║██║██████╔╝█████╗  ██████╔╝      /  ___   \\                      ║",
-        "║    ╚██╗ ██╔╝██║██╔═══╝ ██╔══╝  ██╔══██╗     | (o o)   |                      ║",
-        "║     ╚████╔╝ ██║██║     ███████╗██║  ██║      \\  >    /                       ║",
-        "║      ╚═══╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝       `-._.-'~\\_                     ║",
-        "║                                                  \\__    \\_                   ║",
-        "║     ┌──┐    ┌──┐    ┌──┐    ┌──┐    ┌──┐    ┌──┐   \\__   \\                   ║",
-        "║     │  │    │  │    │  │    │  │    │  │    │  │      \\   )                  ║",
-        "║  ───┘  └────┘  └────┘  └────┘  └────┘  └────┘  └──────_/__/                  ║",
+        "║    ██║   ██║██║██╔══██╗██╔════╝██╔══██╗                                      ║",
+        "║    ██║   ██║██║██████╔╝█████╗  ██████╔╝                                      ║",
+        "║    ╚██╗ ██╔╝██║██╔═══╝ ██╔══╝  ██╔══██╗                                      ║",
+        "║     ╚████╔╝ ██║██║     ███████╗██║  ██║                                      ║",
+        "║      ╚═══╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝                                      ║",
+        "║           ___                                                                ║",
+        "║      ___ /   \\___       ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐                ║",
+        "║    >(o o)     ( )──────┐│   │   │   │   │   │   │   │   │   │                ║",
+        "║      \\_/ \\___/ /       ││   │   │   │   │   │   │   │   │   │                ║",
+        "║                        └┘   └───┘   └───┘   └───┘   └───┘   └───┘            ║",
         "║                                                                              ║",
         "║                    ── vi keybinding audio stepper ──                         ║",
         "║                                                                              ║",
@@ -682,11 +677,11 @@ fn render_splash(f: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(i, s)| {
             let style = match i {
-                0 | 15 => cyan_bold,               // top / bottom border
-                2..=7 => cyan_bold,                // VIPER logo rows (with snake accents)
-                8 => green,                        // snake-only row
-                9..=11 => blue,                    // keyboard row
-                13 => dim,                         // tagline
+                0 | 16 => cyan_bold,               // top / bottom border
+                2..=7 => cyan_bold,                // VIPER logo rows
+                8..=11 => green,                   // snake head
+                12 => blue,                        // keyboard base (snake body)
+                14 => dim,                         // tagline
                 _ => cyan,                         // blank border rows
             };
             Line::from(Span::styled((*s).to_string(), style))
@@ -1056,6 +1051,14 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
+        ["gen", rest @ ..] => {
+            let seed = app.gen_seed;
+            app.gen_seed = app.gen_seed.wrapping_add(1);
+            match gen::dispatch(&mut app.song, rest, seed) {
+                Ok(msg) => { app.status = msg; }
+                Err(e) => { app.status = format!("gen: {}", e); }
+            }
+        }
         ["set", kv] => {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
@@ -1088,7 +1091,7 @@ fn write_current(app: &mut App) {
 }
 
 fn write_to(app: &mut App, path: &Path) {
-    match app.song.save(path) {
+    match vip::save(&app.song, path) {
         Ok(()) => {
             app.current_file = Some(path.to_path_buf());
             app.status = format!("wrote {}", path.display());
@@ -1098,7 +1101,7 @@ fn write_to(app: &mut App, path: &Path) {
 }
 
 fn edit_file(app: &mut App, path: &Path) {
-    match Song::load(path) {
+    match vip::load(path) {
         Ok(song) => {
             app.song = song;
             app.current_file = Some(path.to_path_buf());
