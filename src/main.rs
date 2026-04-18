@@ -6,9 +6,12 @@
 mod audio;
 
 use std::io;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -28,7 +31,7 @@ use ratatui::{
 pub(crate) const STEPS_PER_PHRASE: usize = 16;
 pub(crate) const CHANNELS: usize = 4;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Cell {
     /// MIDI note number; None = empty ("---").
     pub note: Option<u8>,
@@ -40,7 +43,7 @@ pub(crate) struct Cell {
     pub fx: Option<(u8, u8)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Phrase {
     pub cells: [[Cell; CHANNELS]; STEPS_PER_PHRASE],
 }
@@ -53,7 +56,7 @@ impl Default for Phrase {
 
 pub(crate) const INSTRUMENTS: usize = 16;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct Instrument {
     /// Attack time in ms (0 = instant).
     pub attack_ms: u16,
@@ -112,7 +115,7 @@ impl Instrument {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Song {
     bpm: u16,
     /// How far to advance the cursor after inserting a note in insert mode.
@@ -135,6 +138,24 @@ impl Default for Song {
     }
 }
 
+impl Song {
+    fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .context("serializing song")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let song: Song = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        Ok(song)
+    }
+}
+
 // ---------- Modal input ----------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,13 +168,50 @@ enum Mode {
     Instrument,
 }
 
+/// Pending multi-key sequence in normal mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pending {
+    None,
+    Z,                        // pressed `Z`, waiting for second `Z` to quit
+    Op(char),                 // pressed `d` or `y`, waiting for motion / object prefix
+    OpScope(char, char),      // pressed `da`, `di`, `ya`, or `yi`, waiting for object letter
+}
+
+impl Pending {
+    fn display(&self) -> String {
+        match self {
+            Pending::None => String::new(),
+            Pending::Z => "Z".into(),
+            Pending::Op(c) => c.to_string(),
+            Pending::OpScope(a, b) => format!("{}{}", a, b),
+        }
+    }
+}
+
+/// Clipboard from yank / delete. `rows[i][j]` is the j-th channel of row i.
+#[derive(Clone, Debug, Default)]
+struct Register {
+    rows: Vec<Vec<Cell>>,
+    /// True if the register holds a column-sized slice (width 1); false = full row width.
+    is_column: bool,
+}
+
+/// Recorded destructive action, replayable via `.`.
+#[derive(Clone, Copy, Debug)]
+enum LastAction {
+    DeleteRow,
+    DeleteBar,
+    DeletePhrase,
+    DeleteChannel,
+}
+
 struct App {
     song: Song,
     mode: Mode,
     cursor_step: usize,
     cursor_ch: usize,
-    /// Pending operator (e.g. user pressed `d`, awaiting motion).
-    pending_op: Option<char>,
+    /// Pending multi-key sequence (Z chord, operator, operator+scope).
+    pending: Pending,
     /// Pending count prefix (e.g. `4j`).
     count: u32,
     command_buf: String,
@@ -167,6 +225,12 @@ struct App {
     instr_param: usize,
     /// True until the user presses a key on the splash screen.
     show_splash: bool,
+    /// Unnamed register holding the last yank/delete contents.
+    register: Register,
+    /// Last destructive action, replayable via `.`.
+    last_action: Option<LastAction>,
+    /// Path of the currently-loaded song file, if any.
+    current_file: Option<PathBuf>,
     quit: bool,
 }
 
@@ -177,7 +241,7 @@ impl App {
             mode: Mode::Normal,
             cursor_step: 0,
             cursor_ch: 0,
-            pending_op: None,
+            pending: Pending::None,
             count: 0,
             command_buf: String::new(),
             status: "welcome to viper — press : for commands, i to insert".into(),
@@ -186,6 +250,9 @@ impl App {
             selected_instr: 0,
             instr_param: 0,
             show_splash: true,
+            register: Register::default(),
+            last_action: None,
+            current_file: None,
             quit: false,
         }
     }
@@ -224,7 +291,116 @@ impl App {
     fn op_delete_cell(&mut self) {
         let (s, c) = (self.cursor_step, self.cursor_ch);
         self.phrase_mut().cells[s][c] = Cell::default();
-        self.status = format!("deleted [{:02x},ch{}]", s, c + 1);
+        self.status = format!("deleted [{:02X},ch{}]", s, c + 1);
+    }
+
+    // ---------- Yank / delete / paste ----------
+
+    fn yank_range(&mut self, steps: Range<usize>, chs: Range<usize>, is_column: bool) {
+        let mut rows = Vec::with_capacity(steps.len());
+        for s in steps.clone() {
+            let mut row = Vec::with_capacity(chs.len());
+            for c in chs.clone() {
+                row.push(self.phrase().cells[s][c]);
+            }
+            rows.push(row);
+        }
+        self.register = Register { rows, is_column };
+    }
+
+    fn clear_range(&mut self, steps: Range<usize>, chs: Range<usize>) {
+        for s in steps {
+            for c in chs.clone() {
+                self.phrase_mut().cells[s][c] = Cell::default();
+            }
+        }
+    }
+
+    fn op_row(&mut self, op: char) {
+        let steps = self.cursor_step..self.cursor_step + 1;
+        let chs = 0..CHANNELS;
+        self.yank_range(steps.clone(), chs.clone(), false);
+        if op == 'd' {
+            self.clear_range(steps, chs);
+            self.last_action = Some(LastAction::DeleteRow);
+            self.status = "deleted row".into();
+        } else {
+            self.status = "yanked row".into();
+        }
+    }
+
+    fn op_object(&mut self, op: char, scope: char, obj: char) {
+        let (steps, chs, is_column, action) = match obj {
+            'b' => {
+                let bar = self.cursor_step / 4;
+                (bar * 4..bar * 4 + 4, 0..CHANNELS, false, LastAction::DeleteBar)
+            }
+            'p' => (0..STEPS_PER_PHRASE, 0..CHANNELS, false, LastAction::DeletePhrase),
+            'v' => (
+                0..STEPS_PER_PHRASE,
+                self.cursor_ch..self.cursor_ch + 1,
+                true,
+                LastAction::DeleteChannel,
+            ),
+            _ => {
+                self.status = format!("unknown text object: {}{}", scope, obj);
+                return;
+            }
+        };
+        self.yank_range(steps.clone(), chs.clone(), is_column);
+        if op == 'd' {
+            self.clear_range(steps, chs);
+            self.last_action = Some(action);
+            self.status = format!("deleted {}{}", scope, obj);
+        } else {
+            self.status = format!("yanked {}{}", scope, obj);
+        }
+    }
+
+    fn paste(&mut self, after: bool) {
+        if self.register.rows.is_empty() {
+            self.status = "register empty".into();
+            return;
+        }
+        let start_step = if after {
+            (self.cursor_step + 1).min(STEPS_PER_PHRASE)
+        } else {
+            self.cursor_step
+        };
+        let start_ch = if self.register.is_column {
+            self.cursor_ch
+        } else {
+            0
+        };
+        let rows = self.register.rows.clone();
+        let n_rows = rows.len();
+        for (i, row) in rows.iter().enumerate() {
+            let s = start_step + i;
+            if s >= STEPS_PER_PHRASE {
+                break;
+            }
+            for (j, cell) in row.iter().enumerate() {
+                let c = start_ch + j;
+                if c >= CHANNELS {
+                    break;
+                }
+                self.phrase_mut().cells[s][c] = *cell;
+            }
+        }
+        self.status = format!("pasted {} row(s)", n_rows);
+    }
+
+    fn replay_last_action(&mut self) {
+        let Some(action) = self.last_action else {
+            self.status = "nothing to repeat".into();
+            return;
+        };
+        match action {
+            LastAction::DeleteRow => self.op_row('d'),
+            LastAction::DeleteBar => self.op_object('d', 'a', 'b'),
+            LastAction::DeletePhrase => self.op_object('d', 'i', 'p'),
+            LastAction::DeleteChannel => self.op_object('d', 'i', 'v'),
+        }
     }
 
     // ---------- Insert-mode piano row ----------
@@ -337,10 +513,16 @@ fn render_help(f: &mut Frame, area: Rect) {
         row("0 / $",           "start / end of phrase"),
         row("g / G",           "top / bottom of phrase"),
         row("x",               "clear cell"),
+        row("dd / yy",         "delete / yank current step row"),
+        row("dab / yab",       "delete / yank current bar (4 steps)"),
+        row("dip / yip",       "delete / yank whole phrase"),
+        row("div / yiv",       "delete / yank current channel column"),
+        row("p / P",           "paste after / at cursor"),
+        row(".",               "repeat last delete"),
         row("i",               "insert mode"),
         row("a",               "append (move down, then insert)"),
         row(":",               "command mode"),
-        row("space",           "toggle play (stub)"),
+        row("space",           "toggle play"),
         row("? / F1",          "toggle this help"),
         row("F2 / :inst",      "instrument editor"),
         row("ZZ / Ctrl-q",     "quit"),
@@ -359,6 +541,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         row(":set bpm=140",    "set tempo"),
         row(":set step=4",     "auto-advance N steps per inserted note"),
         row(":play / :stop",   "transport"),
+        row(":w [path]",       "save song to JSON (path required first time)"),
+        row(":e <path>",       "load song from JSON"),
+        row(":wq [path]",      "save and quit"),
         Line::from(""),
         Line::from(Span::styled(
             "  press q, Esc, or ? to close help",
@@ -500,10 +685,10 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     ]);
     let right = if app.mode == Mode::Command {
         format!(":{}", app.command_buf)
-    } else if app.count > 0 || app.pending_op.is_some() {
+    } else if app.count > 0 || app.pending != Pending::None {
         format!("{}{}",
             if app.count > 0 { app.count.to_string() } else { String::new() },
-            app.pending_op.map(|c| c.to_string()).unwrap_or_default())
+            app.pending.display())
     } else {
         String::new()
     };
@@ -588,6 +773,29 @@ fn handle_help(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
+    // Resolve any in-progress multi-key sequence first.
+    match app.pending {
+        Pending::Op(op) => {
+            handle_pending_op(app, op, key);
+            return;
+        }
+        Pending::OpScope(op, scope) => {
+            handle_pending_op_scope(app, op, scope, key);
+            return;
+        }
+        Pending::Z => {
+            // Only a second `Z` completes the chord; anything else cancels and
+            // re-interprets the key normally.
+            if matches!(key.code, KeyCode::Char('Z')) {
+                app.pending = Pending::None;
+                app.quit = true;
+                return;
+            }
+            app.pending = Pending::None;
+        }
+        Pending::None => {}
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && app.count == 0) => {
@@ -599,15 +807,18 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('l') | KeyCode::Right => { let n = app.take_count(); app.motion_l(n); }
         KeyCode::Char('0') => { app.cursor_step = 0; app.count = 0; }
         KeyCode::Char('$') => { app.cursor_step = STEPS_PER_PHRASE - 1; }
-        KeyCode::Char('g') => {
-            // Simplified: treat `g` alone as `gg` for the skeleton.
-            app.cursor_step = 0;
-        }
+        KeyCode::Char('g') => { app.cursor_step = 0; }
         KeyCode::Char('G') => { app.cursor_step = STEPS_PER_PHRASE - 1; }
-        KeyCode::Char('w') => { app.motion_j(4); } // next bar
-        KeyCode::Char('b') => { app.motion_k(4); } // prev bar
+        KeyCode::Char('w') => { app.motion_j(4); }
+        KeyCode::Char('b') => { app.motion_k(4); }
 
         KeyCode::Char('x') => { app.op_delete_cell(); }
+        KeyCode::Char('d') => { app.pending = Pending::Op('d'); }
+        KeyCode::Char('y') => { app.pending = Pending::Op('y'); }
+        KeyCode::Char('p') => { app.paste(true); }
+        KeyCode::Char('P') => { app.paste(false); }
+        KeyCode::Char('.') => { app.replay_last_action(); }
+
         KeyCode::Char('i') => { app.mode = Mode::Insert; app.status = "-- INSERT --".into(); }
         KeyCode::Char('a') => {
             app.motion_j(1);
@@ -632,15 +843,39 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Instrument;
             app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
         }
-        KeyCode::Char('Z') => {
-            if app.pending_op == Some('Z') {
-                app.pending_op = None;
-                app.quit = true;
-            } else {
-                app.pending_op = Some('Z');
-            }
+        KeyCode::Char('Z') => { app.pending = Pending::Z; }
+        _ => {}
+    }
+}
+
+fn handle_pending_op(app: &mut App, op: char, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) if c == op => {
+            app.pending = Pending::None;
+            app.op_row(op);
         }
-        _ => { app.pending_op = None; }
+        KeyCode::Char('a') => { app.pending = Pending::OpScope(op, 'a'); }
+        KeyCode::Char('i') => { app.pending = Pending::OpScope(op, 'i'); }
+        KeyCode::Esc => { app.pending = Pending::None; }
+        _ => {
+            app.pending = Pending::None;
+            app.status = "cancelled".into();
+        }
+    }
+}
+
+fn handle_pending_op_scope(app: &mut App, op: char, scope: char, key: KeyEvent) {
+    let obj = match key.code {
+        KeyCode::Char('b') => Some('b'),
+        KeyCode::Char('p') => Some('p'),
+        KeyCode::Char('v') => Some('v'),
+        _ => None,
+    };
+    app.pending = Pending::None;
+    if let Some(o) = obj {
+        app.op_object(op, scope, o);
+    } else {
+        app.status = "unknown object".into();
     }
 }
 
@@ -711,7 +946,21 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.mode = Mode::Instrument;
             app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
         }
-        ["w", path] => { app.status = format!("TODO: write to {}", path); }
+        ["w"] => { write_current(app); }
+        ["w", path] => { write_to(app, Path::new(path)); }
+        ["wq"] => { write_current(app); if !app.status.starts_with("error") { app.quit = true; } }
+        ["wq", path] => {
+            write_to(app, Path::new(path));
+            if !app.status.starts_with("error") { app.quit = true; }
+        }
+        ["e", path] => { edit_file(app, Path::new(path)); }
+        ["e!"] | ["edit!"] => {
+            if let Some(p) = app.current_file.clone() {
+                edit_file(app, &p);
+            } else {
+                app.status = "error: no file loaded".into();
+            }
+        }
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
         ["set", kv] => {
@@ -732,6 +981,40 @@ fn execute_command(app: &mut App, cmd: &str) {
             }
         }
         _ => { app.status = format!("unknown command: {}", cmd); }
+    }
+}
+
+// ---------- File I/O helpers ----------
+
+fn write_current(app: &mut App) {
+    let Some(path) = app.current_file.clone() else {
+        app.status = "error: no filename (use :w <path>)".into();
+        return;
+    };
+    write_to(app, &path);
+}
+
+fn write_to(app: &mut App, path: &Path) {
+    match app.song.save(path) {
+        Ok(()) => {
+            app.current_file = Some(path.to_path_buf());
+            app.status = format!("wrote {}", path.display());
+        }
+        Err(e) => { app.status = format!("error: {}", e); }
+    }
+}
+
+fn edit_file(app: &mut App, path: &Path) {
+    match Song::load(path) {
+        Ok(song) => {
+            app.song = song;
+            app.current_file = Some(path.to_path_buf());
+            app.cursor_step = 0;
+            app.cursor_ch = 0;
+            app.play_step = 0;
+            app.status = format!("loaded {}", path.display());
+        }
+        Err(e) => { app.status = format!("error: {}", e); }
     }
 }
 

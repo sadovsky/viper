@@ -16,6 +16,12 @@ Normal mode:
 - `0` / `$` — start / end of phrase
 - `g` / `G` — top / bottom of phrase
 - `x` — clear cell
+- `dd` / `yy` — delete / yank current step row
+- `dab` / `yab` — delete / yank current bar (4-step block around cursor)
+- `dip` / `yip` — delete / yank whole phrase
+- `div` / `yiv` — delete / yank current channel column
+- `p` / `P` — paste after / at cursor (overwrite)
+- `.` — repeat last delete
 - `i` — insert mode
 - `a` — append (move down one, then insert)
 - `:` — command mode
@@ -37,6 +43,9 @@ Command mode:
 - `:set bpm=140`
 - `:set step=4` — auto-advance N steps per inserted note (edit step)
 - `:play` / `:stop`
+- `:w [path]` — save song as JSON (path required the first time)
+- `:e <path>` — load song from JSON
+- `:wq [path]` — save and quit
 
 Instrument editor mode:
 - `j` / `k` (arrows) — select parameter
@@ -53,7 +62,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 - **Stage 1** ✅ — data model, modal input, phrase editor UI
 - **Stage 2** ✅ — cpal audio thread, pulse oscillator, sample-accurate step playback
 - **Stage 3** ✅ — 4 voices (PU1/PU2/TRI/NOI), ADSR, instrument editor mode
-- **Stage 4** — operators (`d y p`), text objects (`ip ab iv`), registers, `.` repeat
+- **Stage 4** ✅ — operators (`d y p`), text objects (`ip ab iv`), unnamed register, `.` repeat
 
 ### Live play
 
