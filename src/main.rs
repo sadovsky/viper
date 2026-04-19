@@ -357,6 +357,16 @@ struct App {
     /// mode write the played note into the cell under the playhead (when
     /// transport is playing) or under the cursor (when stopped).
     recording: [bool; CHANNELS],
+    /// Stage 7: scene slots. `scenes[i] = Some(phrase_idx)` means number key
+    /// `i+1` launches that phrase. `None` = unbound slot.
+    scenes: [Option<usize>; 9],
+    /// Slot index (0..9) queued to launch on the next bar boundary while
+    /// playing. `None` = no pending launch.
+    queued_scene: Option<usize>,
+    /// `play_step` observed on the previous UI frame. We fire a queued
+    /// launch only on the frame the audio thread actually crosses a bar,
+    /// so scene changes land crisply on the downbeat.
+    prev_play_step: usize,
     quit: bool,
 }
 
@@ -392,6 +402,9 @@ impl App {
             live_events: VecDeque::new(),
             live_last_note: [None; CHANNELS],
             recording: [false; CHANNELS],
+            scenes: [None; 9],
+            queued_scene: None,
+            prev_play_step: usize::MAX,
             quit: false,
         }
     }
@@ -1081,6 +1094,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("Backspace",       "release current channel"),
         row("Esc",             "all notes off, back to normal"),
         row("(while armed)",   "piano keys write cell at playhead (playing) or cursor (stopped)"),
+        row("1 … 9",           "launch scene N (queued at next bar while playing, immediate when stopped)"),
         Line::from(""),
         section("Insert mode — bottom row = chromatic, base octave shiftable"),
         row("z s x d c v",     "C  C# D  D# E  F"),
@@ -1100,6 +1114,9 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
+        row(":scene N save",    "bind current phrase to slot N (1-9)"),
+        row(":scene N",         "queue / launch scene N (clears slot with :scene N clear)"),
+        row(":scene off",       "cancel queued scene launch"),
         row(":w [path]",       "save song as .vip (path required first time)"),
         row(":e <path>",       "load .vip (or start new file at path if missing)"),
         row(":new",            "start a new empty song (unsets filename)"),
@@ -1158,10 +1175,10 @@ fn render_splash(
         "║     ╚████╔╝ ██║██║     ███████╗██║  ██║                                      ║",
         "║      ╚═══╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝                                      ║",
         "║           ___                                                                ║",
-        "║      ___ /   \\___       ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐                ║",
-        "║    >(o o)     ( )──────┐│   │   │   │   │   │   │   │   │   │                ║",
-        "║      \\_/ \\___/ /       ││   │   │   │   │   │   │   │   │   │                ║",
-        "║                        └┘   └───┘   └───┘   └───┘   └───┘   └───┘            ║",
+        "║      ___ /   \\          ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐                ║",
+        "║     (o o)     \\--──────┐│   │   │   │   │   │   │   │   │   │                ║",
+        "║      \\_/               ││   │   │   │   │   │   │   │   │   │                ║",
+        "║       ^                └┘   └───┘   └───┘   └───┘   └───┘   └───┘            ║",
         "║                                                                              ║",
         "║               ── a VIm-keybound chiptune stepPER sequencer ──                ║",
         "║                                                                              ║",
@@ -1318,6 +1335,16 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         left_spans.push(Span::styled(
             format!(" ● REC {} ", armed.join(" ")),
             Style::default().bg(theme.mode_live).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Stage 7: queued-scene badge with live step countdown.
+    if let Some(slot) = app.queued_scene {
+        let wait = steps_to_next_bar(app.play_step);
+        let target = app.scenes[slot].map_or("??".into(), |p| format!("{:02X}", p));
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" ▸ {} → {} ({}) ", slot + 1, target, wait),
+            Style::default().bg(theme.accent).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
         ));
     }
     left_spans.push(Span::raw("  "));
@@ -1855,6 +1882,28 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.disarm_all();
             app.status = "rec: all channels disarmed".into();
         }
+        ["scene"] => {
+            // `:scene` with no args lists current bindings.
+            let bound: Vec<String> = (0..9)
+                .filter_map(|i| app.scenes[i].map(|p| format!("{}→{:02X}", i + 1, p)))
+                .collect();
+            app.status = if bound.is_empty() {
+                "scenes: (none saved) — :scene N save to bind slot N".into()
+            } else {
+                format!("scenes: {}", bound.join(" "))
+            };
+        }
+        ["scene", "off"] | ["scene", "cancel"] => {
+            if app.queued_scene.is_some() {
+                app.queued_scene = None;
+                app.status = "scene queue cancelled".into();
+            } else {
+                app.status = "no scene queued".into();
+            }
+        }
+        ["scene", n, "save"] => scene_save(app, n),
+        ["scene", n, "clear"] | ["scene", n, "del"] => scene_clear(app, n),
+        ["scene", n] => scene_launch_by_name(app, n),
         ["phrase"] | ["p"] => {
             app.status = format!(
                 "phrase {:02X}/{:02X}",
@@ -2000,6 +2049,72 @@ fn channel_name(ch: usize) -> &'static str {
     }
 }
 
+// ---------- Stage 7: scene launching ----------
+
+/// Parse a `1`..`9` scene slot label from the user and run `f` with the 0-based
+/// index. Factored out because `:scene <n> save/clear/launch` all share it.
+fn with_scene_slot(app: &mut App, n: &str, f: impl FnOnce(&mut App, usize)) {
+    match n.parse::<usize>() {
+        Ok(i) if (1..=9).contains(&i) => f(app, i - 1),
+        _ => app.status = format!("bad scene slot: {} (expected 1..9)", n),
+    }
+}
+
+fn scene_save(app: &mut App, n: &str) {
+    with_scene_slot(app, n, |a, i| {
+        a.scenes[i] = Some(a.song.current_phrase);
+        a.status = format!("scene {} saved → phrase {:02X}", i + 1, a.song.current_phrase);
+    });
+}
+
+fn scene_clear(app: &mut App, n: &str) {
+    with_scene_slot(app, n, |a, i| {
+        a.scenes[i] = None;
+        if a.queued_scene == Some(i) {
+            a.queued_scene = None;
+        }
+        a.status = format!("scene {} cleared", i + 1);
+    });
+}
+
+fn scene_launch_by_name(app: &mut App, n: &str) {
+    with_scene_slot(app, n, |a, i| queue_or_launch_scene(a, i));
+}
+
+/// Queue a scene for the next bar boundary while playing; jump immediately
+/// while stopped. Idempotent — calling with the same slot just re-announces.
+fn queue_or_launch_scene(app: &mut App, slot: usize) {
+    let Some(phrase_idx) = app.scenes[slot] else {
+        app.status = format!("scene {} is empty — :scene {} save to bind it", slot + 1, slot + 1);
+        return;
+    };
+    if phrase_idx >= app.song.phrases.len() {
+        app.status = format!("scene {} points at phrase {:02X} (no longer exists)", slot + 1, phrase_idx);
+        return;
+    }
+    if !app.playing {
+        app.song.current_phrase = phrase_idx;
+        app.cursor_step = 0;
+        app.queued_scene = None;
+        app.status = format!("scene {} → phrase {:02X} (launched)", slot + 1, phrase_idx);
+        return;
+    }
+    app.queued_scene = Some(slot);
+    let wait = steps_to_next_bar(app.play_step);
+    app.status = format!(
+        "scene {} queued → phrase {:02X} (launch in {} step{})",
+        slot + 1, phrase_idx, wait, if wait == 1 { "" } else { "s" },
+    );
+}
+
+/// Count of steps between `step` and the next bar boundary (step % 4 == 0).
+/// Used for the countdown in the status line. A step that IS a bar boundary
+/// returns 4, not 0 — "0 steps to launch" would lie.
+fn steps_to_next_bar(step: usize) -> usize {
+    let r = step % 4;
+    if r == 0 { 4 } else { 4 - r }
+}
+
 /// Stage 5: live keyboard monitor.
 /// Piano row triggers notes on the current channel through the audio engine;
 /// no pattern writes, so `dirty` is never set here.
@@ -2041,6 +2156,12 @@ fn handle_live(app: &mut App, key: KeyEvent) {
             app.status = format!("live: octave {}", app.insert_octave);
         }
         KeyCode::Char('R') => { toggle_record_arm(app); }
+        KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+            // Stage 7: scene launch from Live mode. Digits in Live never
+            // double as counts, so this is an unambiguous hotkey.
+            let slot = c.to_digit(10).unwrap() as usize - 1;
+            queue_or_launch_scene(app, slot);
+        }
         KeyCode::Char(c) => {
             if let Some(note) = App::piano_row_note(c, app.insert_octave) {
                 let ch = app.cursor_ch;
@@ -2357,6 +2478,25 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tr.live_events.extend(app.live_events.drain(..));
         app.play_step = tr.step;
     }
+    // Stage 7: fire any queued scene launch at the next bar boundary. We
+    // detect the boundary by comparing to `prev_play_step` so we fire once
+    // per crossing, not once per frame.
+    if app.playing
+        && app.queued_scene.is_some()
+        && app.play_step != app.prev_play_step
+        && app.play_step % 4 == 0
+    {
+        if let Some(slot) = app.queued_scene.take() {
+            if let Some(phrase_idx) = app.scenes[slot] {
+                if phrase_idx < app.song.phrases.len() {
+                    app.song.current_phrase = phrase_idx;
+                    app.status = format!("scene {} launched → phrase {:02X}",
+                        slot + 1, phrase_idx);
+                }
+            }
+        }
+    }
+    app.prev_play_step = app.play_step;
 }
 
 fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine>) -> Result<()> {

@@ -57,6 +57,8 @@ Command mode:
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
 - `:play` / `:stop`
 - `:rec` / `:rec off` — toggle record-arm on cursor channel / disarm all
+- `:scene N save` — bind current phrase to scene slot N (1–9)
+- `:scene N` — queue/launch scene N (clear with `:scene N clear`, cancel queue with `:scene off`)
 - `:w [path]` — save song as `.vip` (path required the first time)
 - `:e <path>` — load `.vip`, or start a new song at `<path>` if it doesn't exist
 - `:new` — start a new empty song (unsets the current filename)
@@ -90,7 +92,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 
 - **Stage 5** ✅ — Live keyboard monitor. `K` enters `LIVE` mode; piano-row keys trigger notes in realtime on the current channel while transport is stopped or playing. Each keypress hits the audio engine directly (via a `live_events` queue on `Transport`), no pattern write. Tab / arrows switch channel, `</>` shift octave, `Backspace` releases, `Esc` all-notes-off.
 - **Stage 6** ✅ — Live overdub mode. `R` (or `:rec`) toggles record-arm on the cursor channel. While armed, piano-row keys in Live mode write the played note to the cell under the playhead (while playing) or the cursor (while stopped), in addition to triggering the audio pluck. Mode-line grows a red `● REC <channels>` badge. `Esc` in Normal disarms all armed channels. No sub-step quantize yet — always snaps to the current 16th.
-- **Stage 7 — Scene launching.** A `scene` is a saved chain state. `:scene 01 save`, then bind scenes to number keys in live mode. Tap `1`…`9` to queue the next scene to launch on the next bar boundary — Ableton Session-view in a TUI.
+- **Stage 7** ✅ — Scene launching. Scene slots `1`–`9` bind to phrase indices (`:scene N save` captures the current phrase). In Live mode, tapping a digit queues that scene for launch on the next bar boundary while playing, or launches immediately when stopped. Modeline shows a `▸ N → PP (Y)` badge with a per-step countdown while queued. `:scene`, `:scene N`, `:scene N clear`, `:scene off`. Per-channel mutes and drain-animation bar are deferred; launch preserves song step position (Ableton-style continuity).
 - **Stage 8 — Performance macros.** Reuse the `q`/`@` machinery but for live: record a sequence of transport commands (mute ch2, launch scene 3, transpose +5, unmute ch2) and fire the whole thing with one key.
 
 ### Visualizer
