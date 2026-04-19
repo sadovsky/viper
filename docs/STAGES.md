@@ -37,6 +37,9 @@ Normal mode:
 - `F2` — instrument editor
 - `K` — live keyboard monitor (piano row plays through audio, no pattern write)
 - `R` — toggle record-arm on current channel (`● REC` badge shows armed channels; Esc in normal disarms all)
+- `M` — mute / unmute current channel (muted header renders dim; audio silences within one buffer)
+- `q<letter>` — record performance macro into register `<letter>` (press `q` again to stop)
+- `@<letter>` / `@@` — play back macro / replay last
 - `ZZ` — save and quit (errors out if no filename is set)
 - `ZQ` / `Ctrl-q` — quit without saving
 
@@ -55,8 +58,15 @@ Command mode:
 - `:set octave=4` — base octave for insert-mode piano row (0–8)
 - `:set theme=nes` / `:set theme=phosphor` — switch color theme
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
+- `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`); `:viz off` hides it
+- `:sprite load <path> [WxH]` — load a PNG sprite sheet (≤4 opaque colors; cell size defaults to the whole image)
+- `:sprite place <sheet> <idx> <x> <y>` — paint a tile into the viz pane (pane coords are half-block pixels)
+- `:sprite palette <name> <c0> <c1> <c2> <c3>` — define a 4-color palette (hex `#rrggbb` or `transparent`)
+- `:sprite repalette <sheet> <palette>` — swap a sheet's palette
+- `:sprite list` / `:sprite clear` — inspect loaded sheets / drop all placements
 - `:play` / `:stop`
 - `:rec` / `:rec off` — toggle record-arm on cursor channel / disarm all
+- `:mute [N]` / `:unmute [N]` — toggle / clear mute (N = 1-4 or pu1/pu2/tri/noi); `:mute off` unmutes all
 - `:scene N save` — bind current phrase to scene slot N (1–9)
 - `:scene N` — queue/launch scene N (clear with `:scene N clear`, cancel queue with `:scene off`)
 - `:w [path]` — save song as `.vip` (path required the first time)
@@ -93,20 +103,18 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 - **Stage 5** ✅ — Live keyboard monitor. `K` enters `LIVE` mode; piano-row keys trigger notes in realtime on the current channel while transport is stopped or playing. Each keypress hits the audio engine directly (via a `live_events` queue on `Transport`), no pattern write. Tab / arrows switch channel, `</>` shift octave, `Backspace` releases, `Esc` all-notes-off.
 - **Stage 6** ✅ — Live overdub mode. `R` (or `:rec`) toggles record-arm on the cursor channel. While armed, piano-row keys in Live mode write the played note to the cell under the playhead (while playing) or the cursor (while stopped), in addition to triggering the audio pluck. Mode-line grows a red `● REC <channels>` badge. `Esc` in Normal disarms all armed channels. No sub-step quantize yet — always snaps to the current 16th.
 - **Stage 7** ✅ — Scene launching. Scene slots `1`–`9` bind to phrase indices (`:scene N save` captures the current phrase). In Live mode, tapping a digit queues that scene for launch on the next bar boundary while playing, or launches immediately when stopped. Modeline shows a `▸ N → PP (Y)` badge with a per-step countdown while queued. `:scene`, `:scene N`, `:scene N clear`, `:scene off`. Per-channel mutes and drain-animation bar are deferred; launch preserves song step position (Ableton-style continuity).
-- **Stage 8 — Performance macros.** Reuse the `q`/`@` machinery but for live: record a sequence of transport commands (mute ch2, launch scene 3, transpose +5, unmute ch2) and fire the whole thing with one key.
+- **Stage 8** ✅ — Performance macros + channel mutes. `M` toggles per-channel mute (pattern steps skipped, live gates suppressed, audio voice killed on the next callback; muted header renders dim with a `MUTE` tag). `:mute [ch]` / `:unmute [ch]` / `:mute off` cover the same from command mode. On top of that, vim's macro machinery: `q<letter>` records a sequence of performance ops (scene launch, mute toggle, transpose, play toggle) captured at the hotkey layer via a `perform()` indirection; a second `q` saves the buffer. `@<letter>` replays, `@@` re-runs the last one. Scene launches inside macros still respect the bar-boundary queue so replays stay groove-locked. Macro recording shows a `◉ q<letter> (count)` badge in the modeline next to `● REC`; Esc in Normal cancels an in-progress recording (falls through to rec-disarm when neither is active).
 
 ### Visualizer
 
-- **Stage 9 — VizFrame bus.** Audio thread writes per-voice state (gate, env level, pitch, current step, beat phase) into a lock-free SPSC queue at ~60Hz. UI thread drains for rendering. This is the foundation for everything visual.
-- **Stage 10 — Built-in viz (ASCII/Unicode).** `:viz` toggles a visualizer pane. Uses Unicode half-blocks (`▀`) for 2x vertical resolution with 24-bit color. Default visualizations:
-  - **bars** — per-voice envelope levels as vertical bars
-  - **scope** — synthesized waveform trace
-  - **grid** — 16-step playhead pulsing in sync
-  - **orbit** — pitch as radius, envelope as brightness, one body per voice
-- **Stage 11 — Sprite engine.** Load PNG sprite sheets via `:sprites load mario.png 16x16`. Sheets are grids of cells addressed by index. Viz pane can render any sprite at any position. Core primitives:
-  - `sprite place <sheet> <idx> <x> <y>` — static placement
-  - `sprite palette <n> <4 hex colors>` — define NES-style 4-color palettes
-  - `sprite repalette <sheet> <src_palette> <dst_palette>` — recolor at runtime
+- **Stage 9** ✅ — VizFrame bus. Audio thread writes a `VizFrame { playing, step, step_phase, voices: [VoiceFrame {gate, env_level, freq, vel}; 4] }` slot on `Transport` at the end of every audio callback. UI reads it inside the existing `sync_audio` lock — one slot, newest-wins (we're not accumulating, 60Hz UI never catches up to kHz audio anyway). First consumer: channel-header LEDs now flash off real ADSR level, so live-mode notes light them up too and release decays the glow. Deferred a real lock-free SPSC queue (`rtrb`/`ringbuf`) until Stage 10+ actually needs history.
+- **Stage 10** ✅ — Built-in viz (ASCII/Unicode). `:viz` toggles a right-side viz pane; `:viz <kind>` picks a renderer and shows it. Four renderers all use `▀`/`▄`/`█` half-blocks for 2× vertical resolution + 24-bit color, reading the Stage-9 `VizFrame` on every UI tick:
+  - **bars** — per-voice envelope bars (env×vel), labelled by channel name
+  - **scope** — synthesized waveform trace summed across voices; tint follows the loudest voice so you can tell which channel is singing
+  - **grid** — 4×4 step grid with the playhead diamond pulsing on `step_phase`
+  - **orbit** — one body per voice on a shared ring; pitch class → angle, velocity → radius, env → brightness
+  Viz is a side pane (≈26 cols) alongside the phrase editor, hidden when Help or Instrument take over the screen or when the terminal is too narrow (<40 cols of phrase).
+- **Stage 11** ✅ — Sprite engine. PNG sprite sheets load via `:sprite load <path> [WxH]` using the `image` crate (PNG-only feature). Each sheet is decoded to indexed 4-color pixels (slot 0 = transparent, 1–3 = opaque); sheets that use more than 4 opaque colors are rejected rather than quantized so the NES-palette discipline is explicit. Relative paths resolve from the current `.vip` file's directory so songs and assets ship together. `:sprite place <sheet> <idx> <x> <y>` pushes a placement onto an ordered list (later placements win pixel conflicts); `:sprite palette <n> <c0> <c1> <c2> <c3>` defines a named palette and `:sprite repalette <sheet> <n>` swaps a sheet's colors at runtime. A new `:viz sprites` renderer draws placements into the same half-block pixel grid as the other viz kinds (2× vertical via `▀`/`▄`/`█`), with transparent pixels leaving the underlying buffer intact so sheets overlap cleanly. Modulation bindings (tie sprite position / palette / frame to voice env, pitch, gate, scene index) land in Stage 12.
 - **Stage 12 — Modulation bindings.** The fun part. A small declarative binding language:
   ```
   bind sprite mario.0 scale = tri.env * 0.5 + 1.0

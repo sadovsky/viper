@@ -10,3 +10,4 @@ crossterm = "0.28"
 cpal = "0.15"
 ringbuf = "0.4"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }

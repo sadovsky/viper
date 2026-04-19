@@ -5,9 +5,11 @@
 
 mod audio;
 mod gen;
+mod sprite;
 mod vip;
+mod viz;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -259,6 +261,8 @@ enum Pending {
     Op(char),                 // pressed `d` or `y`, waiting for motion / object prefix
     OpScope(char, char),      // pressed `da`, `di`, `ya`, or `yi`, waiting for object letter
     Replace,                  // pressed `r`, waiting for the replacement piano-row key
+    MacroRecord,              // pressed `q`, waiting for register letter to record into
+    MacroPlay,                // pressed `@`, waiting for register letter to play back
 }
 
 impl Pending {
@@ -269,8 +273,26 @@ impl Pending {
             Pending::Op(c) => c.to_string(),
             Pending::OpScope(a, b) => format!("{}{}", a, b),
             Pending::Replace => "r".into(),
+            Pending::MacroRecord => "q".into(),
+            Pending::MacroPlay => "@".into(),
         }
     }
+}
+
+/// Stage 8: a single atomic action recordable into a performance macro.
+/// We capture transport/mix-level ops, not cell edits — macros are for
+/// live play, not composition.
+#[derive(Clone, Copy, Debug)]
+enum MacroOp {
+    /// Launch scene slot (0..9). Respects the same bar-boundary queue as a
+    /// manual launch, so replaying a macro stays groove-locked.
+    SceneLaunch(usize),
+    /// Transpose the current phrase by N semitones (can go negative).
+    Transpose(i32),
+    /// Flip mute state on a channel.
+    ToggleMute(usize),
+    /// Flip transport play/stop.
+    TogglePlay,
 }
 
 /// Clipboard from yank / delete. `rows[i][j]` is the j-th channel of row i.
@@ -357,6 +379,9 @@ struct App {
     /// mode write the played note into the cell under the playhead (when
     /// transport is playing) or under the cursor (when stopped).
     recording: [bool; CHANNELS],
+    /// Stage 8: per-channel mutes. A muted channel's voice goes silent
+    /// immediately — pattern steps skip it and live notes are suppressed.
+    muted: [bool; CHANNELS],
     /// Stage 7: scene slots. `scenes[i] = Some(phrase_idx)` means number key
     /// `i+1` launches that phrase. `None` = unbound slot.
     scenes: [Option<usize>; 9],
@@ -367,6 +392,32 @@ struct App {
     /// launch only on the frame the audio thread actually crosses a bar,
     /// so scene changes land crisply on the downbeat.
     prev_play_step: usize,
+    /// Stage 8: saved performance macros keyed by register letter. A macro
+    /// is a short sequence of transport/mix ops recorded during live play.
+    macros: HashMap<char, Vec<MacroOp>>,
+    /// Register letter and buffer currently being recorded into, if any.
+    recording_macro: Option<(char, Vec<MacroOp>)>,
+    /// Last register letter played with `@` — `@@` replays this.
+    last_macro: Option<char>,
+    /// Stage 9: latest per-voice snapshot from the audio thread. Single slot;
+    /// `sync_audio` copies it out of the Transport mutex each UI tick.
+    viz_frame: audio::VizFrame,
+    /// Stage 10: visualizer pane toggle + selected viz kind. Hidden by
+    /// default; `:viz` toggles, `:viz <kind>` picks and shows.
+    show_viz: bool,
+    viz_kind: viz::VizKind,
+    /// Free-running counter bumped every UI tick. Scope uses it to animate
+    /// phase so waveforms scroll instead of snapshot-freezing at rest.
+    viz_tick: u32,
+    /// Stage 11: loaded sprite sheets, keyed by their `name` (file stem
+    /// by default, overrideable at load time).
+    sprite_sheets: HashMap<String, sprite::SpriteSheet>,
+    /// Active sprite placements drawn in order — later placements win
+    /// pixel conflicts. Stage 12 will make placements mutable.
+    sprite_placements: Vec<sprite::Placement>,
+    /// User-defined 4-color palettes keyed by name. Used to recolor
+    /// sheets without reloading the source PNG.
+    sprite_palettes: HashMap<String, [ratatui::style::Color; sprite::PALETTE_SIZE]>,
     quit: bool,
 }
 
@@ -402,9 +453,20 @@ impl App {
             live_events: VecDeque::new(),
             live_last_note: [None; CHANNELS],
             recording: [false; CHANNELS],
+            muted: [false; CHANNELS],
             scenes: [None; 9],
             queued_scene: None,
             prev_play_step: usize::MAX,
+            macros: HashMap::new(),
+            recording_macro: None,
+            last_macro: None,
+            viz_frame: audio::VizFrame::default(),
+            show_viz: false,
+            viz_kind: viz::VizKind::Bars,
+            viz_tick: 0,
+            sprite_sheets: HashMap::new(),
+            sprite_placements: Vec::new(),
+            sprite_palettes: HashMap::new(),
             quit: false,
         }
     }
@@ -924,11 +986,21 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     // based highlighting reads as a ~one-step LED blink per hit.
     let mut header = vec![Span::raw("     ")];
     for ch in 0..CHANNELS {
-        let label = match ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
-        let triggered = app.playing && p.cells[app.play_step][ch].note.is_some();
+        let base = match ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
+        let muted = app.muted[ch];
+        let label = if muted { format!("{} MUTE", base) } else { base.to_string() };
+        // Stage 9: LED flash now reads the actual ADSR level published by the
+        // audio thread — lights up for pattern *and* live gates, fades with
+        // release. The 0.05 floor kills flicker from deep-release voices.
+        let triggered = !muted && app.viz_frame.voices[ch].env_level > 0.05;
         let mut style = Style::default().add_modifier(Modifier::BOLD);
         if triggered {
             style = style.fg(theme.mode_fg).bg(theme.label);
+        } else if muted {
+            style = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
+            if ch == app.cursor_ch {
+                style = style.bg(theme.column_bg);
+            }
         } else {
             style = style.fg(theme.label);
             if ch == app.cursor_ch {
@@ -1081,7 +1153,10 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("F2 / :inst",      "instrument editor"),
         row("K",               "live keyboard monitor (piano row plays through audio)"),
         row("R",               "toggle record-arm on current channel (● REC badge appears)"),
-        row("Esc (normal)",    "also disarms all armed channels"),
+        row("M",               "mute / unmute current channel"),
+        row("q<letter>",       "record performance macro into register (q again to stop)"),
+        row("@<letter> / @@",  "play back macro / replay last"),
+        row("Esc (normal)",    "also disarms recording / cancels macro record"),
         row("ZZ",              "save and quit"),
         row("ZQ / Ctrl-q",     "quit without saving"),
         Line::from(""),
@@ -1090,11 +1165,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("Tab / ← →",       "switch channel"),
         row("< / >",           "octave down / up"),
         row("R",               "arm / disarm recording on current channel"),
+        row("M",               "mute / unmute current channel"),
         row("space",           "toggle transport playback"),
         row("Backspace",       "release current channel"),
         row("Esc",             "all notes off, back to normal"),
         row("(while armed)",   "piano keys write cell at playhead (playing) or cursor (stopped)"),
         row("1 … 9",           "launch scene N (queued at next bar while playing, immediate when stopped)"),
+        row("q / @",           "record / replay performance macro (mutes, scenes, transpose, play)"),
         Line::from(""),
         section("Insert mode — bottom row = chromatic, base octave shiftable"),
         row("z s x d c v",     "C  C# D  D# E  F"),
@@ -1114,6 +1191,14 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
+        row(":mute [N]",        "toggle mute on cursor channel (or N: 1-4 / pu1..noi)"),
+        row(":unmute [N|off]",  "unmute specific / all channels"),
+        row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites)"),
+        row(":sprite load P WxH", "load PNG sheet from P, cells W×H (≤4 colors)"),
+        row(":sprite place N I x y", "place sheet N's tile I at viz pixel (x,y)"),
+        row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
+        row(":sprite repalette N P", "apply palette P to sheet N"),
+        row(":sprite list / clear", "list loaded sheets / remove placements"),
         row(":scene N save",    "bind current phrase to slot N (1-9)"),
         row(":scene N",         "queue / launch scene N (clears slot with :scene N clear)"),
         row(":scene off",       "cancel queued scene launch"),
@@ -1337,6 +1422,14 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
             Style::default().bg(theme.mode_live).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
         ));
     }
+    // Stage 8: macro-recording badge. `q<letter>` is on, captured op count ticks up.
+    if let Some((letter, ops)) = app.recording_macro.as_ref() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" ◉ q{} ({}) ", letter, ops.len()),
+            Style::default().bg(theme.mode_live).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
+        ));
+    }
     // Stage 7: queued-scene badge with live step countdown.
     if let Some(slot) = app.queued_scene {
         let wait = steps_to_next_bar(app.play_step);
@@ -1372,10 +1465,35 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(2)])
         .split(f.area());
+    // Stage 10: when the viz pane is on, split the main area horizontally.
+    // Help and Instrument full-screens skip the split — those modes are
+    // modal takeovers of the whole working surface.
+    let is_fullscreen_mode = matches!(app.mode, Mode::Help | Mode::Instrument);
+    // Phrase needs ~65 cols to render without truncating; give the viz pane
+    // the rest. On a typical 120-col terminal that yields ≈55 cols of viz.
+    let (main_area, viz_area) = if app.show_viz && !is_fullscreen_mode && chunks[0].width >= 115 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(65), Constraint::Length(50)])
+            .split(chunks[0]);
+        (split[0], Some(split[1]))
+    } else {
+        (chunks[0], None)
+    };
     match app.mode {
         Mode::Help => render_help(f, chunks[0], &app.theme),
         Mode::Instrument => render_instrument(f, chunks[0], app),
-        _ => render_phrase(f, chunks[0], app),
+        _ => render_phrase(f, main_area, app),
+    }
+    if let Some(area) = viz_area {
+        let ctx = viz::VizCtx {
+            frame: &app.viz_frame,
+            tick: app.viz_tick,
+            sheets: &app.sprite_sheets,
+            placements: &app.sprite_placements,
+            palettes: &app.sprite_palettes,
+        };
+        viz::render(f, area, app.viz_kind, &ctx);
     }
     render_status(f, chunks[1], app);
 }
@@ -1532,6 +1650,33 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             }
             return;
         }
+        Pending::MacroRecord => {
+            app.pending = Pending::None;
+            match key.code {
+                KeyCode::Esc => { app.status = "cancelled".into(); }
+                KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                    let letter = c.to_ascii_lowercase();
+                    app.recording_macro = Some((letter, Vec::new()));
+                    app.status = format!("q{}: recording macro (press q to stop)", letter);
+                }
+                _ => { app.status = "q: expected register letter (a-z)".into(); }
+            }
+            return;
+        }
+        Pending::MacroPlay => {
+            app.pending = Pending::None;
+            let letter = match key.code {
+                KeyCode::Esc => { app.status = "cancelled".into(); return; }
+                KeyCode::Char('@') => match app.last_macro {
+                    Some(l) => l,
+                    None => { app.status = "@@: no previous macro".into(); return; }
+                },
+                KeyCode::Char(c) if c.is_ascii_alphabetic() => c.to_ascii_lowercase(),
+                _ => { app.status = "@: expected register letter (a-z)".into(); return; }
+            };
+            play_macro(app, letter);
+            return;
+        }
         Pending::None => {}
     }
 
@@ -1601,10 +1746,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Command;
             app.command_buf.clear();
         }
-        KeyCode::Char(' ') => {
-            app.playing = !app.playing;
-            app.status = if app.playing { "playing...".into() } else { "stopped".into() };
-        }
+        KeyCode::Char(' ') => { perform(app, MacroOp::TogglePlay); }
         KeyCode::Char('q') if ctrl => { app.quit = true; }
         KeyCode::Char('?') | KeyCode::F(1) => {
             app.mode = Mode::Help;
@@ -1613,6 +1755,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::F(2) => { enter_instrument_mode(app); }
         KeyCode::Char('K') => { enter_live_mode(app); }
         KeyCode::Char('R') => { toggle_record_arm(app); }
+        KeyCode::Char('M') => { perform(app, MacroOp::ToggleMute(app.cursor_ch)); }
+        KeyCode::Char('q') => { toggle_macro_record(app); }
+        KeyCode::Char('@') => { app.pending = Pending::MacroPlay; }
         KeyCode::Char('Z') => { app.pending = Pending::Z; }
         KeyCode::Esc => {
             // Esc cancels any pending count and clears transient status.
@@ -1620,7 +1765,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             // "stop everything" escape hatch from Normal.
             app.pending = Pending::None;
             app.count = 0;
-            if app.any_recording() {
+            if app.recording_macro.is_some() {
+                let (letter, _) = app.recording_macro.take().unwrap();
+                app.status = format!("q{}: recording cancelled", letter);
+            } else if app.any_recording() {
                 app.disarm_all();
                 app.status = "rec disarmed".into();
             } else {
@@ -1882,6 +2030,58 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.disarm_all();
             app.status = "rec: all channels disarmed".into();
         }
+        ["viz"] => {
+            app.show_viz = !app.show_viz;
+            app.status = if app.show_viz {
+                format!("viz: {} (bars / scope / grid / orbit)", app.viz_kind.name())
+            } else {
+                "viz: off".into()
+            };
+        }
+        ["viz", "off"] => {
+            app.show_viz = false;
+            app.status = "viz: off".into();
+        }
+        ["sprite"] | ["sprites"] => sprite_list(app),
+        ["sprite", "list"] | ["sprites", "list"] => sprite_list(app),
+        ["sprite", "clear"] | ["sprites", "clear"] => {
+            let n = app.sprite_placements.len();
+            app.sprite_placements.clear();
+            app.status = format!("sprite: cleared {} placement{}",
+                n, if n == 1 { "" } else { "s" });
+        }
+        ["sprite", "load", path] => sprite_load_cmd(app, path, None),
+        ["sprite", "load", path, cell] => sprite_load_cmd(app, path, Some(cell)),
+        ["sprites", "load", path] => sprite_load_cmd(app, path, None),
+        ["sprites", "load", path, cell] => sprite_load_cmd(app, path, Some(cell)),
+        ["sprite", "place", name, idx, x, y] => sprite_place_cmd(app, name, idx, x, y),
+        ["sprite", "palette", pname, c0, c1, c2, c3] =>
+            sprite_palette_cmd(app, pname, &[c0, c1, c2, c3]),
+        ["sprite", "repalette", sheet, pname] => sprite_repalette_cmd(app, sheet, pname),
+        ["viz", kind] => match viz::VizKind::parse(kind) {
+            Some(k) => {
+                app.viz_kind = k;
+                app.show_viz = true;
+                app.status = format!("viz: {}", k.name());
+            }
+            None => app.status = format!("viz: unknown kind '{}' (bars/scope/grid/orbit)", kind),
+        },
+        ["mute"] => { toggle_mute(app, app.cursor_ch); }
+        ["mute", "off"] | ["unmute"] => { unmute_all(app); }
+        ["mute", tok] => match parse_channel_token(tok) {
+            Some(ch) => toggle_mute(app, ch),
+            None => app.status = format!("mute: bad channel '{}'", tok),
+        },
+        ["unmute", tok] => match parse_channel_token(tok) {
+            Some(ch) => {
+                if app.muted[ch] {
+                    toggle_mute(app, ch);
+                } else {
+                    app.status = format!("unmute: {} already live", channel_name(ch));
+                }
+            }
+            None => app.status = format!("unmute: bad channel '{}'", tok),
+        },
         ["scene"] => {
             // `:scene` with no args lists current bindings.
             let bound: Vec<String> = (0..9)
@@ -2039,6 +2239,117 @@ fn toggle_record_arm(app: &mut App) {
     };
 }
 
+/// `q` top-level key: if a recording is underway, stop it and save the
+/// captured ops. Otherwise arm Pending::MacroRecord so the next keypress
+/// is interpreted as the register letter to record into.
+fn toggle_macro_record(app: &mut App) {
+    if let Some((letter, ops)) = app.recording_macro.take() {
+        let count = ops.len();
+        if count == 0 {
+            app.macros.remove(&letter);
+            app.status = format!("q{}: empty — nothing saved", letter);
+        } else {
+            app.macros.insert(letter, ops);
+            app.status = format!("q{}: saved ({} op{})",
+                letter, count, if count == 1 { "" } else { "s" });
+        }
+    } else {
+        app.pending = Pending::MacroRecord;
+        app.status = "q: register letter to record into".into();
+    }
+}
+
+/// Replay a saved macro. Each op runs through `perform` exactly the way
+/// it would from a live keypress — scene launches respect the bar queue,
+/// so replayed macros groove-lock instead of firing instantly.
+fn play_macro(app: &mut App, letter: char) {
+    let ops = match app.macros.get(&letter) {
+        Some(v) => v.clone(),
+        None => { app.status = format!("@{}: no macro saved", letter); return; }
+    };
+    app.last_macro = Some(letter);
+    let count = ops.len();
+    for op in ops {
+        perform(app, op);
+    }
+    app.status = format!("@{}: ran {} op{}",
+        letter, count, if count == 1 { "" } else { "s" });
+}
+
+/// Execute a single macro op against the app, and capture it into the
+/// active recording buffer if one is live. All macro-recordable live
+/// actions should route through this function so `q<letter>` catches them.
+fn perform(app: &mut App, op: MacroOp) {
+    if let Some((_, buf)) = app.recording_macro.as_mut() {
+        buf.push(op);
+    }
+    match op {
+        MacroOp::SceneLaunch(slot) => {
+            if slot < 9 {
+                queue_or_launch_scene(app, slot);
+            }
+        }
+        MacroOp::Transpose(delta) => {
+            transpose_delta(app, delta);
+        }
+        MacroOp::ToggleMute(ch) => {
+            toggle_mute(app, ch);
+        }
+        MacroOp::TogglePlay => {
+            app.playing = !app.playing;
+            app.status = if app.playing { "playing...".into() } else { "stopped".into() };
+        }
+    }
+}
+
+/// Toggle mute on channel `ch`. The audio thread kills the voice on the
+/// next callback, so a muted channel goes silent within ~one buffer.
+fn toggle_mute(app: &mut App, ch: usize) {
+    if ch >= CHANNELS {
+        app.status = format!("mute: bad channel {}", ch);
+        return;
+    }
+    app.muted[ch] = !app.muted[ch];
+    let live: Vec<&'static str> = (0..CHANNELS)
+        .filter(|&i| app.muted[i])
+        .map(channel_name)
+        .collect();
+    app.status = if live.is_empty() {
+        format!("mute: {} unmuted (all live)", channel_name(ch))
+    } else {
+        format!("mute: {} {} (muted: {})",
+            channel_name(ch),
+            if app.muted[ch] { "muted" } else { "unmuted" },
+            live.join(" "))
+    };
+}
+
+fn unmute_all(app: &mut App) {
+    let any = app.muted.iter().any(|&b| b);
+    app.muted = [false; CHANNELS];
+    app.status = if any {
+        "mute: all channels unmuted".into()
+    } else {
+        "mute: nothing was muted".into()
+    };
+}
+
+/// Parse "1".."4" or "pu1/pu2/tri/noi" into a channel index.
+fn parse_channel_token(tok: &str) -> Option<usize> {
+    if let Ok(n) = tok.parse::<usize>() {
+        if (1..=CHANNELS).contains(&n) {
+            return Some(n - 1);
+        }
+    }
+    match tok.to_ascii_lowercase().as_str() {
+        "pu1" => Some(0),
+        "pu2" => Some(1),
+        "tri" => Some(2),
+        "noi" => Some(3),
+        _ => None,
+    }
+}
+
 fn channel_name(ch: usize) -> &'static str {
     match ch {
         0 => "PU1",
@@ -2047,6 +2358,139 @@ fn channel_name(ch: usize) -> &'static str {
         3 => "NOI",
         _ => "???",
     }
+}
+
+// ---------- Stage 11: sprite commands ----------
+
+fn sprite_list(app: &mut App) {
+    if app.sprite_sheets.is_empty() && app.sprite_placements.is_empty() {
+        app.status = "sprite: no sheets loaded (use :sprite load <path> [WxH])".into();
+        return;
+    }
+    let sheets: Vec<String> = app.sprite_sheets.values()
+        .map(|s| format!("{}({}×{}, {} tiles, {})",
+            s.name, s.cell_w, s.cell_h, s.cell_count(),
+            s.source.file_name().and_then(|n| n.to_str()).unwrap_or("?")))
+        .collect();
+    app.status = format!(
+        "sprite: sheets[{}] placements={}",
+        sheets.join(","), app.sprite_placements.len(),
+    );
+}
+
+/// Parse "WxH" (e.g. "16x16"). Missing = treat the whole image as one cell.
+fn parse_cell_dim(tok: &str) -> Option<(u32, u32)> {
+    let lower = tok.to_ascii_lowercase();
+    let (w, h) = lower.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>) {
+    let path = resolve_sprite_path(app, Path::new(path_str));
+    // Default cell dimension: the full image — auto-derived after load.
+    let (cw, ch) = match cell {
+        Some(c) => match parse_cell_dim(c) {
+            Some(d) => d,
+            None => {
+                app.status = format!("sprite: bad cell dim '{}' (want WxH, e.g. 16x16)", c);
+                return;
+            }
+        },
+        None => (0, 0),
+    };
+    let stem = path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "sheet".into());
+    // If no cell dim given, we need to peek at the image dims first.
+    let (cw, ch) = if cw == 0 || ch == 0 {
+        match image::image_dimensions(&path) {
+            Ok((w, h)) => (w, h),
+            Err(e) => {
+                app.status = format!("sprite: load failed: {}", e);
+                return;
+            }
+        }
+    } else {
+        (cw, ch)
+    };
+    match sprite::load_sheet(stem.clone(), &path, cw, ch) {
+        Ok(sheet) => {
+            app.status = format!(
+                "sprite: loaded {} ({}×{}, cells {}×{}, {} tiles)",
+                stem, sheet.width, sheet.height, cw, ch, sheet.cell_count(),
+            );
+            app.sprite_sheets.insert(stem, sheet);
+        }
+        Err(e) => {
+            app.status = format!("sprite: load failed: {}", e);
+        }
+    }
+}
+
+/// Resolve a sprite path: relative paths are anchored to the current song
+/// file's directory if one is loaded, so `.vip` files and their assets
+/// ship together naturally.
+fn resolve_sprite_path(app: &App, path: &Path) -> PathBuf {
+    if path.is_absolute() { return path.to_path_buf(); }
+    if let Some(vip) = &app.current_file {
+        if let Some(dir) = vip.parent() {
+            return dir.join(path);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn sprite_place_cmd(app: &mut App, name: &str, idx: &str, x: &str, y: &str) {
+    let Ok(idx) = idx.parse::<u32>() else {
+        app.status = format!("sprite: bad index '{}'", idx); return;
+    };
+    let Ok(x) = x.parse::<i32>() else {
+        app.status = format!("sprite: bad x '{}'", x); return;
+    };
+    let Ok(y) = y.parse::<i32>() else {
+        app.status = format!("sprite: bad y '{}'", y); return;
+    };
+    let Some(sheet) = app.sprite_sheets.get(name) else {
+        app.status = format!("sprite: no sheet named '{}'", name); return;
+    };
+    if idx >= sheet.cell_count() {
+        app.status = format!("sprite: {} has {} tiles (idx {} out of range)",
+            name, sheet.cell_count(), idx);
+        return;
+    }
+    app.sprite_placements.push(sprite::Placement {
+        sheet: name.to_string(),
+        idx, x, y,
+        palette: None,
+    });
+    app.status = format!("sprite: placed {}.{} at ({},{})", name, idx, x, y);
+}
+
+fn sprite_palette_cmd(app: &mut App, name: &str, hex: &[&&str]) {
+    let mut colors = [ratatui::style::Color::Rgb(0, 0, 0); sprite::PALETTE_SIZE];
+    for (i, tok) in hex.iter().enumerate() {
+        match sprite::parse_hex(tok) {
+            Some(c) => colors[i] = c,
+            None => {
+                app.status = format!("sprite: bad hex '{}' (want #rrggbb or 'transparent')", tok);
+                return;
+            }
+        }
+    }
+    app.sprite_palettes.insert(name.to_string(), colors);
+    app.status = format!("sprite: palette '{}' defined", name);
+}
+
+fn sprite_repalette_cmd(app: &mut App, sheet: &str, pname: &str) {
+    let Some(palette) = app.sprite_palettes.get(pname).copied() else {
+        app.status = format!("sprite: no palette '{}'", pname); return;
+    };
+    let Some(s) = app.sprite_sheets.get_mut(sheet) else {
+        app.status = format!("sprite: no sheet '{}'", sheet); return;
+    };
+    s.palette = palette;
+    app.status = format!("sprite: {} repainted with palette '{}'", sheet, pname);
 }
 
 // ---------- Stage 7: scene launching ----------
@@ -2128,7 +2572,7 @@ fn handle_live(app: &mut App, key: KeyEvent) {
         KeyCode::Char(' ') => {
             // Transport toggle keeps working from Live — pattern playback over the
             // live voice is the whole point of jamming along with the track.
-            app.playing = !app.playing;
+            perform(app, MacroOp::TogglePlay);
             app.status = format!(
                 "{}  ({} i{:02X} oct{})",
                 if app.playing { "playing..." } else { "stopped" },
@@ -2156,11 +2600,14 @@ fn handle_live(app: &mut App, key: KeyEvent) {
             app.status = format!("live: octave {}", app.insert_octave);
         }
         KeyCode::Char('R') => { toggle_record_arm(app); }
+        KeyCode::Char('M') => { perform(app, MacroOp::ToggleMute(app.cursor_ch)); }
+        KeyCode::Char('q') => { toggle_macro_record(app); }
+        KeyCode::Char('@') => { app.pending = Pending::MacroPlay; }
         KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             // Stage 7: scene launch from Live mode. Digits in Live never
             // double as counts, so this is an unambiguous hotkey.
             let slot = c.to_digit(10).unwrap() as usize - 1;
-            queue_or_launch_scene(app, slot);
+            perform(app, MacroOp::SceneLaunch(slot));
         }
         KeyCode::Char(c) => {
             if let Some(note) = App::piano_row_note(c, app.insert_octave) {
@@ -2418,6 +2865,10 @@ fn transpose_phrase(app: &mut App, tok: &str) {
             return;
         }
     };
+    perform(app, MacroOp::Transpose(delta));
+}
+
+fn transpose_delta(app: &mut App, delta: i32) {
     if delta == 0 {
         app.status = "transpose: 0 semitones (no-op)".into();
         return;
@@ -2474,10 +2925,14 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tr.playing = app.playing;
         tr.phrase = app.phrase().clone();
         tr.instruments = app.song.instruments;
+        tr.muted = app.muted;
         // Forward any live gate events queued since the last frame.
         tr.live_events.extend(app.live_events.drain(..));
         app.play_step = tr.step;
+        // Stage 9: snapshot the viz state while we're inside the lock.
+        app.viz_frame = tr.frame;
     }
+    app.viz_tick = app.viz_tick.wrapping_add(1);
     // Stage 7: fire any queued scene launch at the next bar boundary. We
     // detect the boundary by comparing to `prev_play_step` so we fire once
     // per crossing, not once per frame.
@@ -2513,7 +2968,9 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine
             app.splash_particles.clear();
         }
         terminal.draw(|f| ui(f, &app))?;
-        if event::poll(Duration::from_millis(50))? {
+        // 16ms poll ≈ 60Hz UI refresh — needed for the viz pane to animate
+        // smoothly and for the DESIGN.md "breath / pulse" aesthetic.
+        if event::poll(Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 handle_key(&mut app, key);
             }

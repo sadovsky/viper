@@ -31,6 +31,39 @@ pub struct Transport {
     pub instruments: [Instrument; INSTRUMENTS],
     /// Queue of live-monitor events applied on the next audio callback.
     pub live_events: VecDeque<LiveEvent>,
+    /// Per-channel mute. A muted channel's voice is killed instantly on
+    /// mute and suppressed for pattern-driven and live-driven gate-ons.
+    pub muted: [bool; CHANNELS],
+    /// Stage 9: latest per-voice state snapshot, overwritten by the audio
+    /// thread at the end of every callback. UI reads this on each tick to
+    /// drive the visualizer. Single slot — newest sample wins; we don't
+    /// accumulate history because the UI runs at ~60Hz and never catches up.
+    pub frame: VizFrame,
+}
+
+/// One voice's state at the end of an audio callback. `env_level` is the
+/// ADSR amplitude (0..1); `gate` is true while the voice is not Idle.
+/// `freq` is the oscillator frequency in Hz (0 when idle), `vel` is the
+/// per-note velocity captured at gate-on.
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // fields are the bus contract; Stage 10+ consumes them
+pub struct VoiceFrame {
+    pub gate: bool,
+    pub env_level: f32,
+    pub freq: f32,
+    pub vel: f32,
+}
+
+/// Full snapshot the audio thread publishes for the UI to render.
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // fields are the bus contract; Stage 10+ consumes them
+pub struct VizFrame {
+    pub playing: bool,
+    pub step: usize,
+    /// 0..1 position within the current 16th-note step, from the audio
+    /// thread's sample counter. Lets the UI interpolate sub-step motion.
+    pub step_phase: f32,
+    pub voices: [VoiceFrame; CHANNELS],
 }
 
 impl Default for Transport {
@@ -42,6 +75,8 @@ impl Default for Transport {
             phrase: Phrase::default(),
             instruments: [Instrument::default(); INSTRUMENTS],
             live_events: VecDeque::new(),
+            muted: [false; CHANNELS],
+            frame: VizFrame::default(),
         }
     }
 }
@@ -257,10 +292,20 @@ where
                     return;
                 }
             };
+            // Kill any voice that just got muted this frame. Checked before
+            // draining events so a mute-then-gate pair ends silent.
+            for (ch, v) in voices.iter_mut().enumerate() {
+                if tr.muted[ch] && !matches!(v.env, EnvPhase::Idle) {
+                    v.kill();
+                }
+            }
             // Drain any pending live-monitor events before rendering this buffer.
             while let Some(ev) = tr.live_events.pop_front() {
                 match ev {
                     LiveEvent::GateOn { ch, note, instr, vel, hold_ms } => {
+                        if tr.muted[ch as usize] {
+                            continue;
+                        }
                         if let Some(v) = voices.get_mut(ch as usize) {
                             let idx = (instr as usize).min(INSTRUMENTS - 1);
                             v.gate_on(midi_to_hz(note), tr.instruments[idx], vel);
@@ -300,6 +345,10 @@ where
                 if tr.playing && tr.step != last_step {
                     last_step = tr.step;
                     for (ch, v) in voices.iter_mut().enumerate() {
+                        if tr.muted[ch] {
+                            v.gate_off();
+                            continue;
+                        }
                         let cell = tr.phrase.cells[tr.step][ch];
                         if let Some(n) = cell.note {
                             let idx = (cell.instr as usize).min(INSTRUMENTS - 1);
@@ -334,6 +383,24 @@ where
                     }
                 }
             }
+            // Stage 9: publish the latest state so the UI visualizer has
+            // something to read on its next tick. One write per callback
+            // (≈hundreds of Hz at 512-frame buffers) is plenty for 60Hz UI.
+            let mut voices_out = [VoiceFrame::default(); CHANNELS];
+            for (i, v) in voices.iter().enumerate() {
+                voices_out[i] = VoiceFrame {
+                    gate: !matches!(v.env, EnvPhase::Idle),
+                    env_level: v.level,
+                    freq: v.freq,
+                    vel: v.vel,
+                };
+            }
+            tr.frame = VizFrame {
+                playing: tr.playing,
+                step: tr.step,
+                step_phase: (sample_in_step as f32 / spb as f32).min(1.0),
+                voices: voices_out,
+            };
         },
         err_fn,
         None,
