@@ -142,12 +142,12 @@ impl Default for Song {
 
 impl Song {
     /// Default startup song: a 16-step Am–F–G–Am loop ("i–VI–VII–i"), a
-    /// progression you'll recognize from plenty of NES-era soundtracks. 140 BPM,
+    /// progression you'll recognize from plenty of NES-era soundtracks. 80 BPM,
     /// one chord per bar, with a lead on PU1, arp on PU2, bass on TRI, and a
     /// simple kick/snare/hat on NOI.
     pub(crate) fn demo() -> Self {
         let mut song = Song::default();
-        song.bpm = 140;
+        song.bpm = 80;
         song.edit_step = 1;
 
         // Instrument 00 — lead pulse: medium attack, punchy.
@@ -324,6 +324,10 @@ struct App {
     instr_param: usize,
     /// True until the user presses a key on the splash screen.
     show_splash: bool,
+    /// Floating music notes animated on the splash screen.
+    splash_particles: Vec<SplashParticle>,
+    /// Dedicated RNG for splash particles so it doesn't perturb `:gen` seeding.
+    splash_rng: gen::Rng,
     /// Unnamed register holding the last yank/delete contents.
     register: Register,
     /// Last destructive action, replayable via `.`.
@@ -349,6 +353,10 @@ struct App {
     live_events: VecDeque<audio::LiveEvent>,
     /// Last note played live, per channel. Displayed in the Live-mode status.
     live_last_note: [Option<u8>; CHANNELS],
+    /// Stage 6: per-channel record arm. While armed, piano-row keys in Live
+    /// mode write the played note into the cell under the playhead (when
+    /// transport is playing) or under the cursor (when stopped).
+    recording: [bool; CHANNELS],
     quit: bool,
 }
 
@@ -363,12 +371,14 @@ impl App {
             count: 0,
             command_buf: String::new(),
             status: "demo loaded — space: play   ?: help   :new blank   :e <file.vip> open".into(),
-            playing: false,
+            playing: true,
             play_step: 0,
             selected_instr: 0,
             insert_octave: 4,
             instr_param: 0,
             show_splash: true,
+            splash_particles: Vec::new(),
+            splash_rng: gen::Rng::new(0xD15C_0D1C_FACE_5EED),
             register: Register::default(),
             last_action: None,
             visual_anchor: None,
@@ -381,7 +391,38 @@ impl App {
             dirty: false,
             live_events: VecDeque::new(),
             live_last_note: [None; CHANNELS],
+            recording: [false; CHANNELS],
             quit: false,
+        }
+    }
+
+    /// Advance splash-screen particles one frame. Called while `show_splash`
+    /// is true, ~20 times per second (event-loop poll cadence).
+    fn tick_splash(&mut self, area_w: u16, area_h: u16) {
+        for p in &mut self.splash_particles {
+            p.y -= p.vy;
+            p.age += 1;
+        }
+        self.splash_particles
+            .retain(|p| p.age < p.lifetime && p.y > -1.0);
+
+        if area_w < 4 || area_h < 4 {
+            return;
+        }
+        if self.splash_particles.len() < 40 && self.splash_rng.chance(0.22) {
+            let glyph = SPLASH_GLYPHS[self.splash_rng.range(0, 4) as usize];
+            let x = self.splash_rng.range(0, area_w as u32) as f32;
+            let y = (area_h - 1) as f32;
+            let vy = 0.15 + (self.splash_rng.range(0, 200) as f32) / 1000.0;
+            let lifetime = 40 + self.splash_rng.range(0, 40);
+            self.splash_particles.push(SplashParticle {
+                x,
+                y,
+                vy,
+                age: 0,
+                lifetime,
+                glyph,
+            });
         }
     }
 
@@ -670,6 +711,28 @@ impl App {
         // Auto-advance by edit_step (1 = classic tracker, 4 = one note per beat).
         let step = self.song.edit_step.max(1);
         self.cursor_step = (self.cursor_step + step).min(STEPS_PER_PHRASE - 1);
+    }
+
+    // ---------- Stage 6: overdub recording ----------
+
+    fn any_recording(&self) -> bool {
+        self.recording.iter().any(|&b| b)
+    }
+
+    fn disarm_all(&mut self) {
+        self.recording = [false; CHANNELS];
+    }
+
+    /// Write a note cell at the current record target step on `ch`. Returns
+    /// the step that was written so the caller can report it.
+    fn record_note(&mut self, ch: usize, note: u8) -> usize {
+        let step = if self.playing { self.play_step } else { self.cursor_step };
+        let instr = self.selected_instr;
+        self.snapshot();
+        let cell = &mut self.phrase_mut().cells[step][ch];
+        cell.note = Some(note);
+        cell.instr = instr;
+        step
     }
 }
 
@@ -1004,16 +1067,20 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("? / F1",          "toggle this help"),
         row("F2 / :inst",      "instrument editor"),
         row("K",               "live keyboard monitor (piano row plays through audio)"),
+        row("R",               "toggle record-arm on current channel (● REC badge appears)"),
+        row("Esc (normal)",    "also disarms all armed channels"),
         row("ZZ",              "save and quit"),
         row("ZQ / Ctrl-q",     "quit without saving"),
         Line::from(""),
-        section("Live mode (K) — play notes in realtime without writing"),
+        section("Live mode (K) — play notes in realtime, optionally recording"),
         row("z s x d c v …",   "piano row triggers notes on current channel"),
         row("Tab / ← →",       "switch channel"),
         row("< / >",           "octave down / up"),
+        row("R",               "arm / disarm recording on current channel"),
         row("space",           "toggle transport playback"),
         row("Backspace",       "release current channel"),
         row("Esc",             "all notes off, back to normal"),
+        row("(while armed)",   "piano keys write cell at playhead (playing) or cursor (stopped)"),
         Line::from(""),
         section("Insert mode — bottom row = chromatic, base octave shiftable"),
         row("z s x d c v",     "C  C# D  D# E  F"),
@@ -1032,6 +1099,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set octave=4",   "base octave for insert-mode piano row (0–8)"),
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":play / :stop",   "transport"),
+        row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
         row(":w [path]",       "save song as .vip (path required first time)"),
         row(":e <path>",       "load .vip (or start new file at path if missing)"),
         row(":new",            "start a new empty song (unsets filename)"),
@@ -1061,7 +1129,24 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_splash(f: &mut Frame, area: Rect, theme: &Theme) {
+#[derive(Clone, Copy)]
+struct SplashParticle {
+    x: f32,
+    y: f32,
+    vy: f32,
+    age: u32,
+    lifetime: u32,
+    glyph: char,
+}
+
+const SPLASH_GLYPHS: [char; 4] = ['♪', '♫', '♩', '♬'];
+
+fn render_splash(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    particles: &[SplashParticle],
+) {
     // Keep each line exactly 80 cells wide so the right border lines up.
     const ART: &[&str] = &[
         "╔══════════════════════════════════════════════════════════════════════════════╗",
@@ -1078,7 +1163,7 @@ fn render_splash(f: &mut Frame, area: Rect, theme: &Theme) {
         "║      \\_/ \\___/ /       ││   │   │   │   │   │   │   │   │   │                ║",
         "║                        └┘   └───┘   └───┘   └───┘   └───┘   └───┘            ║",
         "║                                                                              ║",
-        "║                    ── vi keybinding audio stepper ──                         ║",
+        "║               ── a VIm-keybound chiptune stepPER sequencer ──                ║",
         "║                                                                              ║",
         "╚══════════════════════════════════════════════════════════════════════════════╝",
     ];
@@ -1108,7 +1193,7 @@ fn render_splash(f: &mut Frame, area: Rect, theme: &Theme) {
     let mut lines = styled;
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "                            press any key to begin",
+        "                             press any key to begin",
         dim,
     )));
 
@@ -1123,6 +1208,39 @@ fn render_splash(f: &mut Frame, area: Rect, theme: &Theme) {
         height: text_h.min(area.height.saturating_sub(vpad)),
     };
     f.render_widget(Paragraph::new(lines), inner);
+
+    // Overlay floating music notes — drawn after the box, but we skip cells
+    // covered by `inner` so they only appear in the margin around the splash.
+    let buf = f.buffer_mut();
+    let ax = area.x as i32;
+    let ay = area.y as i32;
+    let ax_end = ax + area.width as i32;
+    let ay_end = ay + area.height as i32;
+    let ix = inner.x as i32;
+    let iy = inner.y as i32;
+    let ix_end = ix + inner.width as i32;
+    let iy_end = iy + inner.height as i32;
+    for p in particles {
+        let cx = ax + p.x as i32;
+        let cy = ay + p.y.round() as i32;
+        if cx < ax || cx >= ax_end || cy < ay || cy >= ay_end {
+            continue;
+        }
+        if cx >= ix && cx < ix_end && cy >= iy && cy < iy_end {
+            continue;
+        }
+        let t = (p.age as f32 / p.lifetime.max(1) as f32).clamp(0.0, 1.0);
+        let k = 1.0 - t;
+        let r = (255.0 * k) as u8;
+        let g = (200.0 * k) as u8;
+        let b = (90.0 * k) as u8;
+        buf.set_string(
+            cx as u16,
+            cy as u16,
+            p.glyph.to_string(),
+            Style::default().fg(Color::Rgb(r, g, b)),
+        );
+    }
 }
 
 fn render_instrument(f: &mut Frame, area: Rect, app: &App) {
@@ -1186,12 +1304,25 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Live => theme.mode_live,
     };
 
-    let left = Line::from(vec![
+    let mut left_spans = vec![
         Span::styled(format!(" {} ", mode_str),
             Style::default().bg(mode_color).fg(theme.mode_fg).add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::raw(&app.status),
-    ]);
+    ];
+    // Stage 6: ● REC badge listing armed channels, pulsing red while playing.
+    if app.any_recording() {
+        let armed: Vec<&'static str> = (0..CHANNELS)
+            .filter(|&i| app.recording[i])
+            .map(channel_name)
+            .collect();
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" ● REC {} ", armed.join(" ")),
+            Style::default().bg(theme.mode_live).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    left_spans.push(Span::raw("  "));
+    left_spans.push(Span::raw(&app.status));
+    let left = Line::from(left_spans);
     let right = if app.mode == Mode::Command {
         format!(":{}", app.command_buf)
     } else if app.count > 0 || app.pending != Pending::None {
@@ -1207,7 +1338,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn ui(f: &mut Frame, app: &App) {
     if app.show_splash {
-        render_splash(f, f.area(), &app.theme);
+        render_splash(f, f.area(), &app.theme, &app.splash_particles);
         return;
     }
     let chunks = Layout::default()
@@ -1227,6 +1358,7 @@ fn ui(f: &mut Frame, app: &App) {
 fn handle_key(app: &mut App, key: KeyEvent) {
     if app.show_splash {
         app.show_splash = false;
+        app.playing = false;
         return;
     }
     match app.mode {
@@ -1453,12 +1585,20 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         }
         KeyCode::F(2) => { enter_instrument_mode(app); }
         KeyCode::Char('K') => { enter_live_mode(app); }
+        KeyCode::Char('R') => { toggle_record_arm(app); }
         KeyCode::Char('Z') => { app.pending = Pending::Z; }
         KeyCode::Esc => {
             // Esc cancels any pending count and clears transient status.
+            // It also disarms any record-armed channels so there's a cheap
+            // "stop everything" escape hatch from Normal.
             app.pending = Pending::None;
             app.count = 0;
-            app.status = "".into();
+            if app.any_recording() {
+                app.disarm_all();
+                app.status = "rec disarmed".into();
+            } else {
+                app.status = "".into();
+            }
         }
         _ => {}
     }
@@ -1710,6 +1850,11 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
+        ["rec"] => { toggle_record_arm(app); }
+        ["rec", "off"] => {
+            app.disarm_all();
+            app.status = "rec: all channels disarmed".into();
+        }
         ["phrase"] | ["p"] => {
             app.status = format!(
                 "phrase {:02X}/{:02X}",
@@ -1819,11 +1964,30 @@ fn enter_live_mode(app: &mut App) {
     app.mode = Mode::Live;
     app.live_last_note = [None; CHANNELS];
     app.status = format!(
-        "-- LIVE -- {} i{:02X} oct{} · z s x d c v g b h n j m plays · Tab/←→ channel · </> octave · Esc exit",
+        "-- LIVE -- {} i{:02X} oct{} · z s x d c v g b h n j m plays · Tab/←→ channel · </> octave · R arm · Esc exit",
         channel_name(app.cursor_ch),
         app.selected_instr,
         app.insert_octave,
     );
+}
+
+/// Toggle record-arm on the cursor channel. Arming is purely a flag — the
+/// actual cell writes happen inside the Live-mode piano-row handler.
+fn toggle_record_arm(app: &mut App) {
+    let ch = app.cursor_ch;
+    app.recording[ch] = !app.recording[ch];
+    let armed: Vec<&'static str> = (0..CHANNELS)
+        .filter(|&i| app.recording[i])
+        .map(channel_name)
+        .collect();
+    app.status = if armed.is_empty() {
+        format!("rec: {} disarmed", channel_name(ch))
+    } else {
+        format!("rec: {} {} (armed: {})",
+            channel_name(ch),
+            if app.recording[ch] { "armed" } else { "disarmed" },
+            armed.join(" "))
+    };
 }
 
 fn channel_name(ch: usize) -> &'static str {
@@ -1876,6 +2040,7 @@ fn handle_live(app: &mut App, key: KeyEvent) {
             app.insert_octave = (app.insert_octave + 1).min(8);
             app.status = format!("live: octave {}", app.insert_octave);
         }
+        KeyCode::Char('R') => { toggle_record_arm(app); }
         KeyCode::Char(c) => {
             if let Some(note) = App::piano_row_note(c, app.insert_octave) {
                 let ch = app.cursor_ch;
@@ -1894,8 +2059,16 @@ fn handle_live(app: &mut App, key: KeyEvent) {
                     hold_ms: Some(180),
                 });
                 app.live_last_note[ch] = Some(note);
-                app.status = format!("live: {} {} (i{:02X})",
-                    channel_name(ch), note_name(Some(note)), app.selected_instr);
+                // Stage 6: if this channel is armed, commit the note to the
+                // pattern at the current record target step.
+                if app.recording[ch] {
+                    let step = app.record_note(ch, note);
+                    app.status = format!("● REC {} {} → step {:02X} (i{:02X})",
+                        channel_name(ch), note_name(Some(note)), step, app.selected_instr);
+                } else {
+                    app.status = format!("live: {} {} (i{:02X})",
+                        channel_name(ch), note_name(Some(note)), app.selected_instr);
+                }
             }
         }
         KeyCode::Backspace => {
@@ -2193,6 +2366,12 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine
     }
     loop {
         sync_audio(&mut app, audio);
+        if app.show_splash {
+            let size = terminal.size()?;
+            app.tick_splash(size.width, size.height);
+        } else if !app.splash_particles.is_empty() {
+            app.splash_particles.clear();
+        }
         terminal.draw(|f| ui(f, &app))?;
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
