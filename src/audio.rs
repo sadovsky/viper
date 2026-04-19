@@ -1,7 +1,9 @@
 //! Stage 2-3: cpal audio thread with a tiny chip synth.
 //! One voice per channel: PU1/PU2 = pulse, TRI = triangle, NOI = xorshift noise.
 //! Each voice runs an ADSR envelope sourced from the cell's instrument.
+//! Stage 5: live gate events — UI can push realtime gate_on/off while stopped.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -10,12 +12,25 @@ use cpal::{FromSample, SizedSample};
 
 use crate::{Instrument, Phrase, CHANNELS, INSTRUMENTS, STEPS_PER_PHRASE};
 
+/// Out-of-band gate event pushed by the UI thread (Stage 5 live monitor).
+#[derive(Clone, Copy, Debug)]
+pub enum LiveEvent {
+    /// Gate a voice on. `hold_ms = Some(t)` auto-releases after t ms so the
+    /// instrument's ADSR release segment fires — terminals don't emit KeyUp,
+    /// so without this the voice would sustain forever.
+    GateOn { ch: u8, note: u8, instr: u8, vel: f32, hold_ms: Option<u32> },
+    GateOff { ch: u8 },
+    AllOff,
+}
+
 pub struct Transport {
     pub playing: bool,
     pub bpm: u16,
     pub step: usize,
     pub phrase: Phrase,
     pub instruments: [Instrument; INSTRUMENTS],
+    /// Queue of live-monitor events applied on the next audio callback.
+    pub live_events: VecDeque<LiveEvent>,
 }
 
 impl Default for Transport {
@@ -26,6 +41,7 @@ impl Default for Transport {
             step: 0,
             phrase: Phrase::default(),
             instruments: [Instrument::default(); INSTRUMENTS],
+            live_events: VecDeque::new(),
         }
     }
 }
@@ -50,6 +66,9 @@ struct Voice {
     env: EnvPhase,
     instrument: Instrument,
     noise_state: u32,
+    /// Samples remaining before an auto-release fires. Set by live GateOn
+    /// with `hold_ms`; zero means "no auto-release pending".
+    auto_release: u32,
 }
 
 impl Voice {
@@ -63,6 +82,7 @@ impl Voice {
             env: EnvPhase::Idle,
             instrument: Instrument::default(),
             noise_state: 0xACE1u32.wrapping_add((kind as u32).wrapping_mul(0x9E3779B9)),
+            auto_release: 0,
         }
     }
 
@@ -71,6 +91,9 @@ impl Voice {
         self.instrument = instr;
         self.vel = vel.clamp(0.0, 1.0);
         self.env = EnvPhase::Attack;
+        // Pattern-driven gate cancels any live auto-release: the step grid
+        // is authoritative while playing.
+        self.auto_release = 0;
         // Don't hard-reset level: retriggers ramp smoothly from the current level.
     }
 
@@ -78,15 +101,25 @@ impl Voice {
         if !matches!(self.env, EnvPhase::Idle) {
             self.env = EnvPhase::Release;
         }
+        self.auto_release = 0;
     }
 
     fn kill(&mut self) {
         self.env = EnvPhase::Idle;
         self.level = 0.0;
+        self.auto_release = 0;
     }
 
     /// Advance the ADSR envelope by one sample.
     fn advance_env(&mut self, sr: f32) {
+        // Live auto-release countdown: once the hold timer expires, drop into
+        // the instrument's Release segment so the note fades naturally.
+        if self.auto_release > 0 {
+            self.auto_release -= 1;
+            if self.auto_release == 0 && !matches!(self.env, EnvPhase::Idle | EnvPhase::Release) {
+                self.env = EnvPhase::Release;
+            }
+        }
         let inst = self.instrument;
         let per_ms = sr * 0.001;
         // Linear slope per sample for each segment, with a 1-sample floor so
@@ -209,6 +242,7 @@ where
     ];
     let mut sample_in_step: u32 = 0;
     let mut last_step: usize = usize::MAX;
+    let mut was_playing = false;
 
     let err_fn = |e| eprintln!("audio stream error: {}", e);
     let stream = device.build_output_stream::<T, _, _>(
@@ -223,21 +257,47 @@ where
                     return;
                 }
             };
+            // Drain any pending live-monitor events before rendering this buffer.
+            while let Some(ev) = tr.live_events.pop_front() {
+                match ev {
+                    LiveEvent::GateOn { ch, note, instr, vel, hold_ms } => {
+                        if let Some(v) = voices.get_mut(ch as usize) {
+                            let idx = (instr as usize).min(INSTRUMENTS - 1);
+                            v.gate_on(midi_to_hz(note), tr.instruments[idx], vel);
+                            if let Some(ms) = hold_ms {
+                                v.auto_release = ((ms as f32) * sample_rate * 0.001) as u32;
+                            }
+                        }
+                    }
+                    LiveEvent::GateOff { ch } => {
+                        if let Some(v) = voices.get_mut(ch as usize) {
+                            v.gate_off();
+                        }
+                    }
+                    LiveEvent::AllOff => {
+                        for v in &mut voices {
+                            v.kill();
+                        }
+                    }
+                }
+            }
+
+            // Transitions: on stop, silence hanging voices; on start, reset step timer
+            // so step 0 re-gates cleanly on the next tick.
+            if tr.playing && !was_playing {
+                last_step = usize::MAX;
+                sample_in_step = 0;
+                tr.step = 0;
+            } else if !tr.playing && was_playing {
+                for v in &mut voices {
+                    v.kill();
+                }
+            }
+            was_playing = tr.playing;
+
             let spb = (sample_rate * 60.0 / tr.bpm.max(1) as f32 / 4.0).max(1.0) as u32;
             for frame in data.chunks_mut(out_channels) {
-                if !tr.playing {
-                    last_step = usize::MAX;
-                    sample_in_step = 0;
-                    tr.step = 0;
-                    for v in &mut voices {
-                        v.kill();
-                    }
-                    for s in frame.iter_mut() {
-                        *s = T::from_sample(0.0);
-                    }
-                    continue;
-                }
-                if tr.step != last_step {
+                if tr.playing && tr.step != last_step {
                     last_step = tr.step;
                     for (ch, v) in voices.iter_mut().enumerate() {
                         let cell = tr.phrase.cells[tr.step][ch];
@@ -266,10 +326,12 @@ where
                 for o in frame.iter_mut() {
                     *o = out;
                 }
-                sample_in_step += 1;
-                if sample_in_step >= spb {
-                    sample_in_step = 0;
-                    tr.step = (tr.step + 1) % STEPS_PER_PHRASE;
+                if tr.playing {
+                    sample_in_step += 1;
+                    if sample_in_step >= spb {
+                        sample_in_step = 0;
+                        tr.step = (tr.step + 1) % STEPS_PER_PHRASE;
+                    }
                 }
             }
         },

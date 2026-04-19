@@ -7,6 +7,7 @@ mod audio;
 mod gen;
 mod vip;
 
+use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -245,6 +246,9 @@ enum Mode {
     Command,
     Help,
     Instrument,
+    /// Stage 5: live keyboard monitor. Piano row triggers notes on the current
+    /// channel through the audio engine; no pattern writes.
+    Live,
 }
 
 /// Pending multi-key sequence in normal mode.
@@ -341,6 +345,10 @@ struct App {
     /// True when the song has unsaved changes since the last write / load.
     /// Shown in the title bar as `[+]`.
     dirty: bool,
+    /// Stage 5: pending gate events flushed to the audio engine each frame.
+    live_events: VecDeque<audio::LiveEvent>,
+    /// Last note played live, per channel. Displayed in the Live-mode status.
+    live_last_note: [Option<u8>; CHANNELS],
     quit: bool,
 }
 
@@ -371,6 +379,8 @@ impl App {
             redo_stack: Vec::new(),
             theme: Theme::NES,
             dirty: false,
+            live_events: VecDeque::new(),
+            live_last_note: [None; CHANNELS],
             quit: false,
         }
     }
@@ -703,6 +713,7 @@ struct Theme {
     mode_command: Color,
     mode_help: Color,
     mode_instr: Color,
+    mode_live: Color,
 
     // Splash
     splash_logo: Color,
@@ -740,6 +751,7 @@ impl Theme {
         mode_command: Color::Yellow,
         mode_help: Color::Blue,
         mode_instr: Color::LightRed,
+        mode_live: Color::Red,
         splash_logo: Color::Cyan,
         splash_snake: Color::Green,
         splash_base: Color::LightBlue,
@@ -773,6 +785,7 @@ impl Theme {
         mode_command: Color::Rgb(255, 200, 60),
         mode_help: Color::Rgb(200, 130, 0),
         mode_instr: Color::Rgb(255, 100, 40),
+        mode_live: Color::Rgb(255, 80, 20),
         splash_logo: Color::Rgb(255, 176, 0),
         splash_snake: Color::Rgb(200, 130, 0),
         splash_base: Color::Rgb(140, 80, 0),
@@ -990,8 +1003,17 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("Esc",             "cancel pending count / operator"),
         row("? / F1",          "toggle this help"),
         row("F2 / :inst",      "instrument editor"),
+        row("K",               "live keyboard monitor (piano row plays through audio)"),
         row("ZZ",              "save and quit"),
         row("ZQ / Ctrl-q",     "quit without saving"),
+        Line::from(""),
+        section("Live mode (K) — play notes in realtime without writing"),
+        row("z s x d c v …",   "piano row triggers notes on current channel"),
+        row("Tab / ← →",       "switch channel"),
+        row("< / >",           "octave down / up"),
+        row("space",           "toggle transport playback"),
+        row("Backspace",       "release current channel"),
+        row("Esc",             "all notes off, back to normal"),
         Line::from(""),
         section("Insert mode — bottom row = chromatic, base octave shiftable"),
         row("z s x d c v",     "C  C# D  D# E  F"),
@@ -1151,6 +1173,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Command => "COMMAND",
         Mode::Help => "HELP",
         Mode::Instrument => "INSTR",
+        Mode::Live => "LIVE",
     };
     let theme = &app.theme;
     let mode_color = match app.mode {
@@ -1160,6 +1183,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Command => theme.mode_command,
         Mode::Help => theme.mode_help,
         Mode::Instrument => theme.mode_instr,
+        Mode::Live => theme.mode_live,
     };
 
     let left = Line::from(vec![
@@ -1208,6 +1232,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
         Mode::Normal => handle_normal(app, key),
         Mode::Insert => handle_insert(app, key),
+        Mode::Live => handle_live(app, key),
         Mode::Command => handle_command(app, key),
         Mode::Visual => handle_visual(app, key),
         Mode::Help => handle_help(app, key),
@@ -1427,6 +1452,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.status = "help — q/Esc/? to close".into();
         }
         KeyCode::F(2) => { enter_instrument_mode(app); }
+        KeyCode::Char('K') => { enter_live_mode(app); }
         KeyCode::Char('Z') => { app.pending = Pending::Z; }
         KeyCode::Esc => {
             // Esc cancels any pending count and clears transient status.
@@ -1789,6 +1815,99 @@ fn enter_instrument_mode(app: &mut App) {
     app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
 }
 
+fn enter_live_mode(app: &mut App) {
+    app.mode = Mode::Live;
+    app.live_last_note = [None; CHANNELS];
+    app.status = format!(
+        "-- LIVE -- {} i{:02X} oct{} · z s x d c v g b h n j m plays · Tab/←→ channel · </> octave · Esc exit",
+        channel_name(app.cursor_ch),
+        app.selected_instr,
+        app.insert_octave,
+    );
+}
+
+fn channel_name(ch: usize) -> &'static str {
+    match ch {
+        0 => "PU1",
+        1 => "PU2",
+        2 => "TRI",
+        3 => "NOI",
+        _ => "???",
+    }
+}
+
+/// Stage 5: live keyboard monitor.
+/// Piano row triggers notes on the current channel through the audio engine;
+/// no pattern writes, so `dirty` is never set here.
+fn handle_live(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.live_events.push_back(audio::LiveEvent::AllOff);
+            app.mode = Mode::Normal;
+            app.status = "".into();
+        }
+        KeyCode::Char(' ') => {
+            // Transport toggle keeps working from Live — pattern playback over the
+            // live voice is the whole point of jamming along with the track.
+            app.playing = !app.playing;
+            app.status = format!(
+                "{}  ({} i{:02X} oct{})",
+                if app.playing { "playing..." } else { "stopped" },
+                channel_name(app.cursor_ch),
+                app.selected_instr,
+                app.insert_octave,
+            );
+        }
+        KeyCode::Tab | KeyCode::Right => {
+            app.cursor_ch = (app.cursor_ch + 1) % CHANNELS;
+            app.status = format!("live: {} i{:02X} oct{}",
+                channel_name(app.cursor_ch), app.selected_instr, app.insert_octave);
+        }
+        KeyCode::BackTab | KeyCode::Left => {
+            app.cursor_ch = (app.cursor_ch + CHANNELS - 1) % CHANNELS;
+            app.status = format!("live: {} i{:02X} oct{}",
+                channel_name(app.cursor_ch), app.selected_instr, app.insert_octave);
+        }
+        KeyCode::Char('<') => {
+            app.insert_octave = app.insert_octave.saturating_sub(1);
+            app.status = format!("live: octave {}", app.insert_octave);
+        }
+        KeyCode::Char('>') => {
+            app.insert_octave = (app.insert_octave + 1).min(8);
+            app.status = format!("live: octave {}", app.insert_octave);
+        }
+        KeyCode::Char(c) => {
+            if let Some(note) = App::piano_row_note(c, app.insert_octave) {
+                let ch = app.cursor_ch;
+                // Silence whatever was previously held on this channel so retriggers
+                // sound like an instrument, not a stack of overlapping envelopes.
+                app.live_events.push_back(audio::LiveEvent::GateOff { ch: ch as u8 });
+                app.live_events.push_back(audio::LiveEvent::GateOn {
+                    ch: ch as u8,
+                    note,
+                    instr: app.selected_instr,
+                    vel: 1.0,
+                    // ~180ms hold. Terminals don't emit KeyUp, so each press is
+                    // a short pluck — the instrument's Release segment handles
+                    // the tail. Hold long enough to be audible, short enough
+                    // to retrigger freely.
+                    hold_ms: Some(180),
+                });
+                app.live_last_note[ch] = Some(note);
+                app.status = format!("live: {} {} (i{:02X})",
+                    channel_name(ch), note_name(Some(note)), app.selected_instr);
+            }
+        }
+        KeyCode::Backspace => {
+            let ch = app.cursor_ch;
+            app.live_events.push_back(audio::LiveEvent::GateOff { ch: ch as u8 });
+            app.live_last_note[ch] = None;
+            app.status = format!("live: {} off", channel_name(ch));
+        }
+        _ => {}
+    }
+}
+
 // ---------- Phrase navigation ----------
 
 fn next_phrase(app: &mut App) {
@@ -2051,12 +2170,18 @@ fn new_song(app: &mut App) {
 // ---------- Main loop ----------
 
 fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
-    let Some(engine) = engine else { return };
+    let Some(engine) = engine else {
+        // No audio — don't let the queue grow forever if the user stays in Live.
+        app.live_events.clear();
+        return;
+    };
     if let Ok(mut tr) = engine.transport.lock() {
         tr.bpm = app.song.bpm;
         tr.playing = app.playing;
         tr.phrase = app.phrase().clone();
         tr.instruments = app.song.instruments;
+        // Forward any live gate events queued since the last frame.
+        tr.live_events.extend(app.live_events.drain(..));
         app.play_step = tr.step;
     }
 }

@@ -35,6 +35,7 @@ Normal mode:
 - `Esc` — cancel pending count / operator
 - `?` / `F1` — toggle help screen
 - `F2` — instrument editor
+- `K` — live keyboard monitor (piano row plays through audio, no pattern write)
 - `ZZ` — save and quit (errors out if no filename is set)
 - `ZQ` / `Ctrl-q` — quit without saving
 
@@ -85,7 +86,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 
 ### Live play
 
-- **Stage 5 — Live keyboard monitor.** Piano-row keys trigger notes in realtime on the current channel while transport is stopped. Each keypress hits the audio engine directly, no pattern write.
+- **Stage 5** ✅ — Live keyboard monitor. `K` enters `LIVE` mode; piano-row keys trigger notes in realtime on the current channel while transport is stopped or playing. Each keypress hits the audio engine directly (via a `live_events` queue on `Transport`), no pattern write. Tab / arrows switch channel, `</>` shift octave, `Backspace` releases, `Esc` all-notes-off.
 - **Stage 6 — Live overdub mode (`PLAY` mode).** `:rec` or `R` arms the current channel. While the song plays, piano-row keys write notes into the active step under the playhead (with optional quantize to nearest step/16th). Modeline turns red when armed. `R` again disarms.
 - **Stage 7 — Scene launching.** A `scene` is a saved chain state. `:scene 01 save`, then bind scenes to number keys in live mode. Tap `1`…`9` to queue the next scene to launch on the next bar boundary — Ableton Session-view in a TUI.
 - **Stage 8 — Performance macros.** Reuse the `q`/`@` machinery but for live: record a sequence of transport commands (mute ch2, launch scene 3, transpose +5, unmute ch2) and fire the whole thing with one key.
