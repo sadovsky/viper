@@ -1,0 +1,97 @@
+# stress_melodeath.vip
+#
+# Original melodic-death-metal pastiche in E minor.
+# Written as an audio-engine stress test: 220 BPM, dense 16th-note
+# tremolo on PU1, harmonized thirds on PU2, driving root-fifth on TRI,
+# blast-beat-ish pattern on NOI.
+#
+# Not a transcription. Not based on any specific song. The genre
+# conventions (fast tremolo, minor-key harmony, blast beats, gallop
+# rhythms) are not copyrightable — specific melodies are. This riff
+# is original to viper's test suite.
+#
+# What this exercises:
+#   - High BPM (220) — catches step-timing drift
+#   - All 4 channels active every step — catches mix-thread contention
+#   - Rapid pitch changes on PU1 — catches oscillator phase reset
+#   - Sustained NOI gates — catches envelope release handling
+#   - Harmonized thirds — catches beating/detune artifacts
+#
+# Load:  :e projects/stress_melodeath.vip
+# Play:  <space>
+# For a different vibe, try :set bpm=180 (more "groove metal") or
+# :set bpm=260 ("blackened").
+
+@meta  title="stress test: melodic death"  composer="viper test suite"
+@meta  license="MIT"  key="E minor"
+
+@song  bpm=220  edit_step=1  current=00
+
+# Instruments — attack/decay/release are milliseconds, sustain/duty/vol
+# are 0.0–1.0 floats.
+@instr 00  a=0   d=20   s=0.90  r=60   duty=0.25  vol=0.70   # lead tremolo
+@instr 01  a=0   d=30   s=0.85  r=80   duty=0.50  vol=0.50   # harmony
+@instr 02  a=0   d=10   s=0.95  r=100  duty=0.50  vol=0.90   # bass gallop
+@instr 03  a=0   d=10   s=0.00  r=20   duty=0.50  vol=0.60   # blast noise
+
+# ---------------- Phrase 00 — main riff ----------------
+# Tremolo lead traces E minor: E F# G A B C B A
+# Harmony a diatonic third below: C D E F G A G F
+# Bass: E pedal with octave punches (E2 / E3 alternating)
+# Noise: constant 16ths (blast beat)
+# Cell format is NOTE[:INSTR] — no instr specifier defaults to 00.
+@phrase 00
+  # step   PU1        PU2         TRI         NOI
+  00       E-5        C-5:01      E-2:02      G-2:03
+  01       E-5        C-5:01      E-3:02      G-2:03
+  02       F#5        D-5:01      E-2:02      G-2:03
+  03       F#5        D-5:01      E-3:02      G-2:03
+  04       G-5        E-5:01      E-2:02      G-2:03
+  05       G-5        E-5:01      E-3:02      G-2:03
+  06       A-5        F-5:01      E-2:02      G-2:03
+  07       A-5        F-5:01      E-3:02      G-2:03
+  08       B-5        G-5:01      E-2:02      G-2:03
+  09       B-5        G-5:01      E-3:02      G-2:03
+  0a       C-6        A-5:01      E-2:02      G-2:03
+  0b       C-6        A-5:01      E-3:02      G-2:03
+  0c       B-5        G-5:01      E-2:02      G-2:03
+  0d       B-5        G-5:01      E-3:02      G-2:03
+  0e       A-5        F-5:01      E-2:02      G-2:03
+  0f       A-5        F-5:01      E-3:02      G-2:03
+
+# ---------------- Phrase 01 — half-time breakdown ----------------
+# Same harmonic motion but slower; bass drops out on every other hit
+# to let the lead breathe. Good for testing envelope release on sparse notes.
+@phrase 01
+  # step   PU1        PU2         TRI         NOI
+  00       E-5        C-5:01      E-2:02      ---
+  02       ---        ---         ---         ---
+  04       G-5        E-5:01      E-2:02      G-2:03
+  06       ---        ---         ---         ---
+  08       B-5        G-5:01      A-2:02      ---
+  0a       ---        ---         ---         ---
+  0c       C-6        A-5:01      A-2:02      G-2:03
+  0e       ---        ---         ---         ---
+
+# ---------------- Phrase 02 — tritone shift + double-kick gallop ----------------
+# Shift toward Bb (tritone from E) for dramatic contrast, classic metal trope.
+# Gallop rhythm on bass: 8th-16th-16th pattern (A#2 on beat, A#3 on offbeats).
+# Noise doubles up into 32nd-note feel via alternating G2/C3 snare+kick.
+@phrase 02
+  # step   PU1        PU2         TRI         NOI
+  00       F-5        D-5:01      A#2:02      G-2:03
+  01       F-5        D-5:01      ---         C-3:03
+  02       F-5        D-5:01      A#3:02      G-2:03
+  03       G-5        E-5:01      A#3:02      C-3:03
+  04       G#5        E-5:01      A#2:02      G-2:03
+  05       G#5        E-5:01      ---         C-3:03
+  06       G-5        E-5:01      A#3:02      G-2:03
+  07       F-5        D-5:01      A#3:02      C-3:03
+  08       E-5        C-5:01      E-2:02      G-2:03
+  09       E-5        C-5:01      ---         C-3:03
+  0a       D-5        B-4:01      E-3:02      G-2:03
+  0b       D-5        B-4:01      E-3:02      C-3:03
+  0c       E-5        C-5:01      E-2:02      G-2:03
+  0d       F#5        D-5:01      ---         C-3:03
+  0e       G-5        E-5:01      E-3:02      G-2:03
+  0f       A-5        F-5:01      E-3:02      C-3:03

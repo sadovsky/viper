@@ -270,22 +270,57 @@ pub fn random_in_scale(
 
 /// Parse and run a `:gen` subcommand. Returns a status line describing what
 /// was done.
+///
+/// Accepts both positional and `key=value` forms for optional params:
+///   :gen euclid pu1 5 16 2
+///   :gen euclid pu1 5 16 offset=2
+///   :gen scale pu2 A minor 0.4
+///   :gen scale pu2 A mode=minor density=0.4
 pub fn dispatch(song: &mut Song, args: &[&str], seed: u64) -> Result<String> {
-    match args {
+    let (pos, kv) = split_args(args);
+    match pos.as_slice() {
         [] => bail!("usage: :gen <algo> ...  (four | euclid | scale)"),
         ["four"] | ["four_on_floor"] => {
             four_on_floor(song);
             Ok("generated four-on-floor drums on NOI".into())
         }
-        ["euclid", ch, k, n] => run_euclid(song, ch, k, n, "0"),
+        ["euclid", ch, k, n] => {
+            let off = kv_get(&kv, "offset").unwrap_or("0");
+            run_euclid(song, ch, k, n, off)
+        }
         ["euclid", ch, k, n, off] => run_euclid(song, ch, k, n, off),
-        ["scale", ch, key] => run_scale(song, ch, key, "minor", "0.5", seed),
-        ["scale", ch, key, mode] => run_scale(song, ch, key, mode, "0.5", seed),
+        ["scale", ch, key] => {
+            let mode = kv_get(&kv, "mode").unwrap_or("minor");
+            let density = kv_get(&kv, "density").unwrap_or("0.5");
+            run_scale(song, ch, key, mode, density, seed)
+        }
+        ["scale", ch, key, mode] => {
+            let density = kv_get(&kv, "density").unwrap_or("0.5");
+            run_scale(song, ch, key, mode, density, seed)
+        }
         ["scale", ch, key, mode, density] => run_scale(song, ch, key, mode, density, seed),
         _ => bail!(
             "usage: :gen four | :gen euclid <ch> <k> <n> [off] | :gen scale <ch> <key> [mode] [density]"
         ),
     }
+}
+
+/// Split args into positional tokens and `key=value` pairs.
+fn split_args<'a>(args: &'a [&'a str]) -> (Vec<&'a str>, Vec<(&'a str, &'a str)>) {
+    let mut pos = Vec::new();
+    let mut kv = Vec::new();
+    for a in args {
+        if let Some((k, v)) = a.split_once('=') {
+            kv.push((k, v));
+        } else {
+            pos.push(*a);
+        }
+    }
+    (pos, kv)
+}
+
+fn kv_get<'a>(kv: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    kv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
 fn run_euclid(song: &mut Song, ch: &str, k: &str, n: &str, off: &str) -> Result<String> {

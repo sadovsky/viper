@@ -51,7 +51,15 @@ fn decode_note(s: &str) -> Option<u8> {
 fn encode_cell(c: Cell) -> String {
     match c.note {
         None => "---".to_string(),
-        Some(n) => format!("{}:{:02X}:{:02X}", encode_note(n), c.instr, c.vol),
+        Some(n) => {
+            let mut s = format!("{}:{:02X}:{:02X}", encode_note(n), c.instr, c.vol);
+            if let Some((cmd, param)) = c.fx {
+                s.push(':');
+                s.push(cmd as char);
+                s.push_str(&format!("{:02X}", param));
+            }
+            s
+        }
     }
 }
 
@@ -75,7 +83,30 @@ fn decode_cell(s: &str) -> Result<Cell> {
         .transpose()
         .context("vol field")?
         .unwrap_or(0);
-    Ok(Cell { note: Some(note), instr, vol, fx: None })
+    let fx = parts
+        .next()
+        .map(decode_fx)
+        .transpose()?
+        .flatten();
+    Ok(Cell { note: Some(note), instr, vol, fx })
+}
+
+/// FORMAT.md effect column is `CPP`: a single-char command (letter or digit)
+/// followed by two hex-digit parameters. `---` (or an empty field) = no fx.
+fn decode_fx(s: &str) -> Result<Option<(u8, u8)>> {
+    if s == "---" || s.is_empty() {
+        return Ok(None);
+    }
+    if s.len() != 3 {
+        bail!("fx field must be 3 chars, got {:?}", s);
+    }
+    let b = s.as_bytes();
+    let cmd = b[0];
+    if !(cmd.is_ascii_alphanumeric()) {
+        bail!("fx command must be A-Z or 0-9, got {:?}", cmd as char);
+    }
+    let param = u8::from_str_radix(&s[1..], 16).context("fx param")?;
+    Ok(Some((cmd, param)))
 }
 
 // ---------- Writer ----------
@@ -93,12 +124,12 @@ pub fn to_vip(song: &Song) -> String {
 
     for (pi, phrase) in song.phrases.iter().enumerate() {
         writeln!(out, "@phrase {:02X}", pi).unwrap();
-        writeln!(out, "  # step   PU1        PU2        TRI        NOI").unwrap();
+        writeln!(out, "  # step   PU1             PU2             TRI             NOI").unwrap();
         for (s, row) in phrase.cells.iter().enumerate() {
             let cells: Vec<String> = row.iter().map(|c| encode_cell(*c)).collect();
             writeln!(
                 out,
-                "  {:02X}       {:<9}  {:<9}  {:<9}  {:<9}",
+                "  {:02X}       {:<14}  {:<14}  {:<14}  {:<14}",
                 s, cells[0], cells[1], cells[2], cells[3]
             )
             .unwrap();
@@ -119,10 +150,18 @@ pub fn to_vip(song: &Song) -> String {
 
 // ---------- Parser ----------
 
-pub fn from_vip(text: &str) -> Result<Song> {
+pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
     let mut song = Song::default();
     song.phrases.clear();
     let mut current_phrase: Option<usize> = None;
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Directives reserved in FORMAT.md but not yet implemented; parsing them
+    // shouldn't error, but silently dropping them has burned us in hand-edited
+    // files, so warn.
+    const RESERVED: &[&str] = &[
+        "chain", "scene", "bind", "sprite", "groove", "meta",
+    ];
 
     for (line_no, raw) in text.lines().enumerate() {
         let line_num = line_no + 1;
@@ -146,7 +185,18 @@ pub fn from_vip(text: &str) -> Result<Song> {
                 }
                 "instr" => parse_instr(&mut song, args)
                     .with_context(|| format!("line {}: @instr", line_num))?,
-                _ => {} // unknown directive: skip silently
+                d if RESERVED.contains(&d) => {
+                    warnings.push(format!(
+                        "line {}: @{} reserved but not implemented — ignored",
+                        line_num, d
+                    ));
+                }
+                _ => {
+                    warnings.push(format!(
+                        "line {}: unknown @{} directive — ignored",
+                        line_num, dir
+                    ));
+                }
             }
         } else {
             let pi = current_phrase.ok_or_else(|| {
@@ -163,14 +213,23 @@ pub fn from_vip(text: &str) -> Result<Song> {
     if song.current_phrase >= song.phrases.len() {
         song.current_phrase = 0;
     }
-    Ok(song)
+    Ok((song, warnings))
 }
 
+/// A `#` starts a comment only when it begins a whitespace-separated token.
+/// A `#` inside a token (e.g. the sharp in `F#5`) is literal.
 fn strip_comment(s: &str) -> &str {
-    match s.find('#') {
-        Some(i) => &s[..i],
-        None => s,
+    let mut in_token = false;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            in_token = false;
+        } else if c == '#' && !in_token {
+            return &s[..i];
+        } else {
+            in_token = true;
+        }
     }
+    s
 }
 
 fn split_once_ws(s: &str) -> (&str, &str) {
@@ -248,7 +307,7 @@ fn parse_data_row(phrase: &mut Phrase, line: &str) -> Result<()> {
 
 // ---------- File I/O ----------
 
-pub fn load(path: &Path) -> Result<Song> {
+pub fn load(path: &Path) -> Result<(Song, Vec<String>)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
     from_vip(&text).with_context(|| format!("parsing {}", path.display()))
@@ -277,7 +336,8 @@ mod tests {
     fn round_trip_default_song() {
         let song = Song::default();
         let text = to_vip(&song);
-        let back = from_vip(&text).unwrap();
+        let (back, warns) = from_vip(&text).unwrap();
+        assert!(warns.is_empty());
         assert_eq!(song.bpm, back.bpm);
         assert_eq!(song.edit_step, back.edit_step);
         assert_eq!(song.phrases.len(), back.phrases.len());
@@ -291,7 +351,7 @@ mod tests {
     fn round_trip_demo_song() {
         let song = Song::demo();
         let text = to_vip(&song);
-        let back = from_vip(&text).unwrap();
+        let (back, _) = from_vip(&text).unwrap();
         assert_eq!(song.bpm, back.bpm);
         for (a, b) in song.phrases[0].cells.iter().zip(back.phrases[0].cells.iter()) {
             for (ca, cb) in a.iter().zip(b.iter()) {
@@ -311,8 +371,54 @@ mod tests {
     #[test]
     fn comment_lines_ignored() {
         let text = "# comment only\n@song bpm=123\n@phrase 00\n  00 A-4 --- --- ---\n";
-        let song = from_vip(text).unwrap();
+        let (song, _) = from_vip(text).unwrap();
         assert_eq!(song.bpm, 123);
         assert_eq!(song.phrases[0].cells[0][0].note, Some(69));
+    }
+
+    #[test]
+    fn fx_round_trip() {
+        let cell = Cell { note: Some(60), instr: 1, vol: 0x0F, fx: Some((b'A', 0x42)) };
+        let s = encode_cell(cell);
+        assert_eq!(s, "C-4:01:0F:A42");
+        let back = decode_cell(&s).unwrap();
+        assert_eq!(back.fx, Some((b'A', 0x42)));
+        // No fx field → round-trip without trailing :
+        let bare = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        assert_eq!(encode_cell(bare), "C-4:00:00");
+    }
+
+    #[test]
+    fn fx_rejects_bad_form() {
+        assert!(decode_cell("C-4:00:00:AB").is_err());       // too short
+        assert!(decode_cell("C-4:00:00:ABCD").is_err());     // too long
+        assert!(decode_cell("C-4:00:00:!42").is_err());      // bad cmd char
+    }
+
+    #[test]
+    fn reserved_directive_warns() {
+        let text = "@song bpm=120\n@phrase 00\n@meta author=alex\n@bogus foo=bar\n";
+        let (_, warns) = from_vip(text).unwrap();
+        assert_eq!(warns.len(), 2);
+        assert!(warns[0].contains("@meta"));
+        assert!(warns[1].contains("@bogus"));
+    }
+
+    #[test]
+    fn projects_stress_melodeath_parses() {
+        // Round-trip the bundled stress test so format drift fails CI early.
+        let text = include_str!("../projects/stress_melodeath.vip");
+        let (song, _) = from_vip(text).expect("stress_melodeath parses");
+        assert_eq!(song.bpm, 220);
+        assert_eq!(song.phrases.len(), 3);
+        // Phrase 00 row 00 should have all four voices active with the
+        // designated instruments.
+        let row = &song.phrases[0].cells[0];
+        assert!(row[0].note.is_some(), "PU1 should have a note");
+        assert_eq!(row[1].instr, 0x01, "PU2 should use instr 01 (harmony)");
+        assert_eq!(row[2].instr, 0x02, "TRI should use instr 02 (bass)");
+        assert_eq!(row[3].instr, 0x03, "NOI should use instr 03 (blast)");
+        // Instrument sustain values parsed as floats, not hex slots.
+        assert!((song.instruments[0].sustain - 0.90).abs() < 0.01);
     }
 }

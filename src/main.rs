@@ -44,7 +44,7 @@ pub(crate) struct Cell {
     pub fx: Option<(u8, u8)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Phrase {
     pub cells: [[Cell; CHANNELS]; STEPS_PER_PHRASE],
 }
@@ -57,7 +57,7 @@ impl Default for Phrase {
 
 pub(crate) const INSTRUMENTS: usize = 16;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Instrument {
     /// Attack time in ms (0 = instant).
     pub attack_ms: u16,
@@ -116,7 +116,7 @@ impl Instrument {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Song {
     pub bpm: u16,
     /// How far to advance the cursor after inserting a note in insert mode.
@@ -251,9 +251,10 @@ enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pending {
     None,
-    Z,                        // pressed `Z`, waiting for second `Z` to quit
+    Z,                        // pressed `Z`, waiting for second `Z` (save-quit) or `Q` (force-quit)
     Op(char),                 // pressed `d` or `y`, waiting for motion / object prefix
     OpScope(char, char),      // pressed `da`, `di`, `ya`, or `yi`, waiting for object letter
+    Replace,                  // pressed `r`, waiting for the replacement piano-row key
 }
 
 impl Pending {
@@ -263,25 +264,38 @@ impl Pending {
             Pending::Z => "Z".into(),
             Pending::Op(c) => c.to_string(),
             Pending::OpScope(a, b) => format!("{}{}", a, b),
+            Pending::Replace => "r".into(),
         }
     }
 }
 
 /// Clipboard from yank / delete. `rows[i][j]` is the j-th channel of row i.
+///
+/// Paste anchoring is derived from shape: a register exactly `CHANNELS` wide
+/// is treated as row-wise (pastes from channel 0 regardless of cursor); any
+/// narrower register is block-wise (pastes anchored at the cursor's channel).
 #[derive(Clone, Debug, Default)]
 struct Register {
     rows: Vec<Vec<Cell>>,
-    /// True if the register holds a column-sized slice (width 1); false = full row width.
-    is_column: bool,
+}
+
+impl Register {
+    /// True if the register spans all CHANNELS (came from a full-row yank like
+    /// `yy`, `yab`, `yip`). Row-wise pastes ignore cursor_ch.
+    fn is_full_row(&self) -> bool {
+        self.rows.first().map_or(false, |r| r.len() == CHANNELS)
+    }
 }
 
 /// Recorded destructive action, replayable via `.`.
 #[derive(Clone, Copy, Debug)]
 enum LastAction {
-    DeleteRow,
-    DeleteBar,
+    DeleteCell,
+    DeleteRow { count: u32 },
+    DeleteBar { count: u32 },
     DeletePhrase,
     DeleteChannel,
+    Paste { after: bool },
 }
 
 struct App {
@@ -300,6 +314,8 @@ struct App {
     play_step: usize,
     /// Which instrument new notes are tagged with and the editor is viewing.
     selected_instr: u8,
+    /// Base octave for the insert-mode piano row. Shifted with `<` / `>`.
+    insert_octave: u8,
     /// Cursor row in the instrument editor (0..NUM_INSTR_PARAMS).
     instr_param: usize,
     /// True until the user presses a key on the splash screen.
@@ -308,10 +324,23 @@ struct App {
     register: Register,
     /// Last destructive action, replayable via `.`.
     last_action: Option<LastAction>,
+    /// Anchor (step, channel) of a rectangular visual selection. Live while `mode == Visual`.
+    visual_anchor: Option<(usize, usize)>,
+    /// `V` linewise visual: force the selection to span all channels regardless of cursor_ch.
+    visual_linewise: bool,
     /// Path of the currently-loaded song file, if any.
     current_file: Option<PathBuf>,
     /// Monotonic counter used to seed `:gen` so repeated calls vary.
     gen_seed: u64,
+    /// Snapshots for `u`. Each entry is the song state *before* a destructive op.
+    undo_stack: Vec<Song>,
+    /// Snapshots popped by `u`, used by `Ctrl-r` to redo.
+    redo_stack: Vec<Song>,
+    /// Active UI theme. Swap via `:set theme=<name>`.
+    theme: Theme,
+    /// True when the song has unsaved changes since the last write / load.
+    /// Shown in the title bar as `[+]`.
+    dirty: bool,
     quit: bool,
 }
 
@@ -325,17 +354,73 @@ impl App {
             pending: Pending::None,
             count: 0,
             command_buf: String::new(),
-            status: "welcome — demo loaded; press space to play, ? for help".into(),
+            status: "demo loaded — space: play   ?: help   :new blank   :e <file.vip> open".into(),
             playing: false,
             play_step: 0,
             selected_instr: 0,
+            insert_octave: 4,
             instr_param: 0,
             show_splash: true,
             register: Register::default(),
             last_action: None,
+            visual_anchor: None,
+            visual_linewise: false,
             current_file: None,
             gen_seed: 1,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            theme: Theme::NES,
+            dirty: false,
             quit: false,
+        }
+    }
+
+    /// Snapshot the current song into the undo stack and clear the redo stack.
+    /// Call this *before* mutating. Cap the stack so edits over a long session
+    /// don't grow the heap without bound.
+    fn snapshot(&mut self) {
+        const UNDO_LIMIT: usize = 200;
+        if self.undo_stack.len() == UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.song.clone());
+        self.redo_stack.clear();
+        self.dirty = true;
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.status = "already at oldest change".into();
+            return;
+        };
+        let current = std::mem::replace(&mut self.song, prev);
+        self.redo_stack.push(current);
+        self.clamp_cursor_to_song();
+        self.status = format!("undo ({} remaining)", self.undo_stack.len());
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "already at newest change".into();
+            return;
+        };
+        let current = std::mem::replace(&mut self.song, next);
+        self.undo_stack.push(current);
+        self.clamp_cursor_to_song();
+        self.status = format!("redo ({} remaining)", self.redo_stack.len());
+    }
+
+    /// After restoring a prior Song (from undo/redo or `:e`), make sure the
+    /// editor cursor and phrase index still point at valid cells.
+    fn clamp_cursor_to_song(&mut self) {
+        if self.song.current_phrase >= self.song.phrases.len() {
+            self.song.current_phrase = self.song.phrases.len().saturating_sub(1);
+        }
+        if self.cursor_step >= STEPS_PER_PHRASE {
+            self.cursor_step = STEPS_PER_PHRASE - 1;
+        }
+        if self.cursor_ch >= CHANNELS {
+            self.cursor_ch = CHANNELS - 1;
         }
     }
 
@@ -371,14 +456,16 @@ impl App {
     // ---------- Operators ----------
 
     fn op_delete_cell(&mut self) {
+        self.snapshot();
         let (s, c) = (self.cursor_step, self.cursor_ch);
         self.phrase_mut().cells[s][c] = Cell::default();
+        self.last_action = Some(LastAction::DeleteCell);
         self.status = format!("deleted [{:02X},ch{}]", s, c + 1);
     }
 
     // ---------- Yank / delete / paste ----------
 
-    fn yank_range(&mut self, steps: Range<usize>, chs: Range<usize>, is_column: bool) {
+    fn yank_range(&mut self, steps: Range<usize>, chs: Range<usize>) {
         let mut rows = Vec::with_capacity(steps.len());
         for s in steps.clone() {
             let mut row = Vec::with_capacity(chs.len());
@@ -387,7 +474,7 @@ impl App {
             }
             rows.push(row);
         }
-        self.register = Register { rows, is_column };
+        self.register = Register { rows };
     }
 
     fn clear_range(&mut self, steps: Range<usize>, chs: Range<usize>) {
@@ -398,44 +485,104 @@ impl App {
         }
     }
 
-    fn op_row(&mut self, op: char) {
-        let steps = self.cursor_step..self.cursor_step + 1;
+    fn op_row(&mut self, op: char, count: u32) {
+        let n = count.max(1) as usize;
+        let start = self.cursor_step;
+        let end = (start + n).min(STEPS_PER_PHRASE);
+        let steps = start..end;
         let chs = 0..CHANNELS;
-        self.yank_range(steps.clone(), chs.clone(), false);
-        if op == 'd' {
+        let rows = steps.len();
+        self.yank_range(steps.clone(), chs.clone());
+        if op == 'd' || op == 'c' {
+            self.snapshot();
             self.clear_range(steps, chs);
-            self.last_action = Some(LastAction::DeleteRow);
-            self.status = "deleted row".into();
+            self.last_action = Some(LastAction::DeleteRow { count: count.max(1) });
+            let verb = if op == 'c' { "changed" } else { "deleted" };
+            self.status = if rows == 1 { format!("{} row", verb) } else { format!("{} {} rows", verb, rows) };
+            if op == 'c' {
+                self.cursor_step = start;
+                self.cursor_ch = 0;
+                self.mode = Mode::Insert;
+                self.status = "-- INSERT (change) --".into();
+            }
         } else {
-            self.status = "yanked row".into();
+            self.status = if rows == 1 { "yanked row".into() } else { format!("yanked {} rows", rows) };
         }
     }
 
-    fn op_object(&mut self, op: char, scope: char, obj: char) {
-        let (steps, chs, is_column, action) = match obj {
+    fn op_object(&mut self, op: char, scope: char, obj: char, count: u32) {
+        let n = count.max(1) as usize;
+        let (steps, chs, action, label) = match obj {
             'b' => {
                 let bar = self.cursor_step / 4;
-                (bar * 4..bar * 4 + 4, 0..CHANNELS, false, LastAction::DeleteBar)
+                let start = bar * 4;
+                let end = (start + 4 * n).min(STEPS_PER_PHRASE);
+                (start..end, 0..CHANNELS, LastAction::DeleteBar { count: count.max(1) },
+                 if n == 1 { "bar".to_string() } else { format!("{} bars", n) })
             }
-            'p' => (0..STEPS_PER_PHRASE, 0..CHANNELS, false, LastAction::DeletePhrase),
+            'p' => (0..STEPS_PER_PHRASE, 0..CHANNELS, LastAction::DeletePhrase, "phrase".into()),
             'v' => (
                 0..STEPS_PER_PHRASE,
                 self.cursor_ch..self.cursor_ch + 1,
-                true,
                 LastAction::DeleteChannel,
+                "channel".into(),
             ),
             _ => {
                 self.status = format!("unknown text object: {}{}", scope, obj);
                 return;
             }
         };
-        self.yank_range(steps.clone(), chs.clone(), is_column);
-        if op == 'd' {
+        let start_step = steps.start;
+        let start_ch = chs.start;
+        self.yank_range(steps.clone(), chs.clone());
+        if op == 'd' || op == 'c' {
+            self.snapshot();
             self.clear_range(steps, chs);
             self.last_action = Some(action);
-            self.status = format!("deleted {}{}", scope, obj);
+            let verb = if op == 'c' { "changed" } else { "deleted" };
+            self.status = format!("{} {}", verb, label);
+            if op == 'c' {
+                self.cursor_step = start_step;
+                self.cursor_ch = start_ch;
+                self.mode = Mode::Insert;
+                self.status = "-- INSERT (change) --".into();
+            }
         } else {
-            self.status = format!("yanked {}{}", scope, obj);
+            self.status = format!("yanked {}", label);
+        }
+    }
+
+    /// Delete or yank the current rectangular Visual selection. Returns to Normal on completion.
+    fn op_visual(&mut self, op: char) {
+        let Some((as_step, as_ch)) = self.visual_anchor else {
+            return;
+        };
+        let s0 = as_step.min(self.cursor_step);
+        let s1 = as_step.max(self.cursor_step) + 1;
+        let (c0, c1) = if self.visual_linewise {
+            (0, CHANNELS)
+        } else {
+            (as_ch.min(self.cursor_ch), as_ch.max(self.cursor_ch) + 1)
+        };
+        self.yank_range(s0..s1, c0..c1);
+        if op == 'd' || op == 'c' {
+            self.snapshot();
+            self.clear_range(s0..s1, c0..c1);
+            let verb = if op == 'c' { "changed" } else { "deleted" };
+            self.status = format!("{} {}×{} block", verb, s1 - s0, c1 - c0);
+        } else {
+            self.status = format!("yanked {}×{} block", s1 - s0, c1 - c0);
+        }
+        // Move cursor to top-left of the selection so paste targets the expected spot.
+        self.cursor_step = s0;
+        self.cursor_ch = c0;
+        self.visual_anchor = None;
+        self.visual_linewise = false;
+        if op == 'c' {
+            self.mode = Mode::Insert;
+            self.status = "-- INSERT (change) --".into();
+        } else {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -444,15 +591,16 @@ impl App {
             self.status = "register empty".into();
             return;
         }
+        self.snapshot();
         let start_step = if after {
             (self.cursor_step + 1).min(STEPS_PER_PHRASE)
         } else {
             self.cursor_step
         };
-        let start_ch = if self.register.is_column {
-            self.cursor_ch
-        } else {
+        let start_ch = if self.register.is_full_row() {
             0
+        } else {
+            self.cursor_ch
         };
         let rows = self.register.rows.clone();
         let n_rows = rows.len();
@@ -469,6 +617,7 @@ impl App {
                 self.phrase_mut().cells[s][c] = *cell;
             }
         }
+        self.last_action = Some(LastAction::Paste { after });
         self.status = format!("pasted {} row(s)", n_rows);
     }
 
@@ -478,10 +627,12 @@ impl App {
             return;
         };
         match action {
-            LastAction::DeleteRow => self.op_row('d'),
-            LastAction::DeleteBar => self.op_object('d', 'a', 'b'),
-            LastAction::DeletePhrase => self.op_object('d', 'i', 'p'),
-            LastAction::DeleteChannel => self.op_object('d', 'i', 'v'),
+            LastAction::DeleteCell => self.op_delete_cell(),
+            LastAction::DeleteRow { count } => self.op_row('d', count),
+            LastAction::DeleteBar { count } => self.op_object('d', 'a', 'b', count),
+            LastAction::DeletePhrase => self.op_object('d', 'i', 'p', 1),
+            LastAction::DeleteChannel => self.op_object('d', 'i', 'v', 1),
+            LastAction::Paste { after } => self.paste(after),
         }
     }
 
@@ -512,6 +663,135 @@ impl App {
     }
 }
 
+// ---------- Theme ----------
+
+/// Named colors used across the UI. Swap via `:set theme=<name>`.
+///
+/// NES is the default: a curated fantasy-console palette where each channel
+/// and each cell field gets its own hue, so the eye can parse the grid in
+/// peripheral vision. PHOSPHOR is the alt: amber on black, near-monochrome;
+/// channel differentiation comes from position and glyph, not color.
+#[derive(Clone, Copy, Debug)]
+struct Theme {
+    name: &'static str,
+
+    // Generic roles
+    accent: Color,       // section headers, program title
+    dim: Color,          // empty cells, faint hints
+    label: Color,        // column headers, pane titles
+    hint: Color,         // trailing italic hints
+
+    // Cell field colors
+    note: Color,
+    instr: Color,
+    vol: Color,
+    fx: Color,
+
+    // Cell highlights
+    cursor_bg: Color,
+    selection_bg: Color,
+    playhead_bg: Color,
+    playhead_label: Color,
+    /// Faint tint applied to the entire column under the cursor channel.
+    column_bg: Color,
+
+    // Mode chip
+    mode_fg: Color,
+    mode_normal: Color,
+    mode_insert: Color,
+    mode_visual: Color,
+    mode_command: Color,
+    mode_help: Color,
+    mode_instr: Color,
+
+    // Splash
+    splash_logo: Color,
+    splash_snake: Color,
+    splash_base: Color,
+
+    // Instrument editor
+    instr_title: Color,
+    instr_row_bg: Color,
+    instr_row_fg: Color,
+    instr_value: Color,
+    instr_label: Color,
+}
+
+impl Theme {
+    const NES: Self = Self {
+        name: "nes",
+        accent: Color::Yellow,
+        dim: Color::DarkGray,
+        label: Color::Yellow,
+        hint: Color::DarkGray,
+        note: Color::Green,
+        instr: Color::Cyan,
+        vol: Color::Magenta,
+        fx: Color::LightYellow,
+        cursor_bg: Color::Rgb(40, 40, 80),
+        selection_bg: Color::Rgb(70, 40, 90),
+        playhead_bg: Color::Rgb(60, 20, 20),
+        playhead_label: Color::Red,
+        column_bg: Color::Rgb(22, 22, 40),
+        mode_fg: Color::Black,
+        mode_normal: Color::Cyan,
+        mode_insert: Color::Green,
+        mode_visual: Color::Magenta,
+        mode_command: Color::Yellow,
+        mode_help: Color::Blue,
+        mode_instr: Color::LightRed,
+        splash_logo: Color::Cyan,
+        splash_snake: Color::Green,
+        splash_base: Color::LightBlue,
+        instr_title: Color::Yellow,
+        instr_row_bg: Color::Cyan,
+        instr_row_fg: Color::Black,
+        instr_value: Color::Green,
+        instr_label: Color::Gray,
+    };
+
+    // Amber-on-black CRT. Three tiers of amber (bright/mid/dark) + black.
+    const PHOSPHOR: Self = Self {
+        name: "phosphor",
+        accent: Color::Rgb(255, 176, 0),
+        dim: Color::Rgb(90, 50, 0),
+        label: Color::Rgb(255, 176, 0),
+        hint: Color::Rgb(140, 80, 0),
+        note: Color::Rgb(255, 176, 0),
+        instr: Color::Rgb(200, 130, 0),
+        vol: Color::Rgb(200, 130, 0),
+        fx: Color::Rgb(255, 200, 60),
+        cursor_bg: Color::Rgb(80, 45, 0),
+        selection_bg: Color::Rgb(120, 70, 0),
+        playhead_bg: Color::Rgb(50, 28, 0),
+        playhead_label: Color::Rgb(255, 220, 120),
+        column_bg: Color::Rgb(30, 18, 0),
+        mode_fg: Color::Black,
+        mode_normal: Color::Rgb(255, 176, 0),
+        mode_insert: Color::Rgb(255, 220, 120),
+        mode_visual: Color::Rgb(255, 140, 40),
+        mode_command: Color::Rgb(255, 200, 60),
+        mode_help: Color::Rgb(200, 130, 0),
+        mode_instr: Color::Rgb(255, 100, 40),
+        splash_logo: Color::Rgb(255, 176, 0),
+        splash_snake: Color::Rgb(200, 130, 0),
+        splash_base: Color::Rgb(140, 80, 0),
+        instr_title: Color::Rgb(255, 176, 0),
+        instr_row_bg: Color::Rgb(255, 176, 0),
+        instr_row_fg: Color::Black,
+        instr_value: Color::Rgb(255, 220, 120),
+        instr_label: Color::Rgb(200, 130, 0),
+    };
+
+    fn by_name(n: &str) -> Option<Self> {
+        match n {
+            "nes" => Some(Self::NES),
+            "phosphor" => Some(Self::PHOSPHOR),
+            _ => None,
+        }
+    }
+}
+
 // ---------- Rendering ----------
 
 fn note_name(n: Option<u8>) -> String {
@@ -529,62 +809,160 @@ fn note_name(n: Option<u8>) -> String {
 
 fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     let p = app.phrase();
+    let theme = &app.theme;
     let mut lines: Vec<Line> = Vec::with_capacity(STEPS_PER_PHRASE + 2);
 
-    // Header
+    // Visual-mode rectangle (inclusive on both axes).
+    let selection = if app.mode == Mode::Visual {
+        app.visual_anchor.map(|(as_step, as_ch)| {
+            let s0 = as_step.min(app.cursor_step);
+            let s1 = as_step.max(app.cursor_step);
+            let (c0, c1) = if app.visual_linewise {
+                (0, CHANNELS - 1)
+            } else {
+                (as_ch.min(app.cursor_ch), as_ch.max(app.cursor_ch))
+            };
+            (s0, s1, c0, c1)
+        })
+    } else {
+        None
+    };
+
+    // Header. Each column is `NOTE II VV FFF ` = 14 chars + trailing space.
+    // LED flash: while playing, any channel that gates on the current step
+    // renders its header as a lit chip — DESIGN.md's "channel header letter
+    // lights up on trigger." At typical tempos a step is ~100ms, so presence-
+    // based highlighting reads as a ~one-step LED blink per hit.
     let mut header = vec![Span::raw("     ")];
     for ch in 0..CHANNELS {
         let label = match ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
-        header.push(Span::styled(format!(" {}  ", label),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        let triggered = app.playing && p.cells[app.play_step][ch].note.is_some();
+        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        if triggered {
+            style = style.fg(theme.mode_fg).bg(theme.label);
+        } else {
+            style = style.fg(theme.label);
+            if ch == app.cursor_ch {
+                style = style.bg(theme.column_bg);
+            }
+        }
+        header.push(Span::styled(format!(" {:<15}", label), style));
     }
     lines.push(Line::from(header));
     lines.push(Line::from(""));
 
     for (i, row) in p.cells.iter().enumerate() {
         let is_playhead = app.playing && i == app.play_step;
-        let row_bg = if is_playhead { Some(Color::Rgb(60, 20, 20)) } else { None };
+        let row_bg = if is_playhead { Some(theme.playhead_bg) } else { None };
         let label_style = if is_playhead {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.playhead_label).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.dim)
         };
         let mut spans = vec![Span::styled(format!(" {:02X}  ", i), label_style)];
         for (c, cell) in row.iter().enumerate() {
-            let text = note_name(cell.note);
-            let mut style = Style::default();
-            if cell.note.is_some() {
-                style = style.fg(Color::Green);
+            let has_note = cell.note.is_some();
+            let note_text = note_name(cell.note);
+            let instr_text = if has_note {
+                format!("{:02X}", cell.instr)
+            } else { "--".into() };
+            let vol_text = if has_note && cell.vol > 0 {
+                format!("{:02X}", cell.vol)
+            } else { "--".into() };
+            let fx_text = match cell.fx {
+                Some((cmd, param)) => format!("{}{:02X}", cmd as char, param),
+                None => "---".into(),
+            };
+
+            let note_color = if has_note { theme.note } else { theme.dim };
+            let instr_color = if has_note { theme.instr } else { theme.dim };
+            let vol_color = if has_note && cell.vol > 0 { theme.vol } else { theme.dim };
+            let fx_color = if cell.fx.is_some() { theme.fx } else { theme.dim };
+
+            let in_selection = selection
+                .map(|(s0, s1, c0, c1)| i >= s0 && i <= s1 && c >= c0 && c <= c1)
+                .unwrap_or(false);
+            let is_cursor = i == app.cursor_step && c == app.cursor_ch;
+            let in_cursor_col = c == app.cursor_ch;
+
+            // Background precedence: cursor > selection > playhead row > column tint.
+            let bg = if is_cursor {
+                Some(theme.cursor_bg)
+            } else if in_selection {
+                Some(theme.selection_bg)
+            } else if let Some(r) = row_bg {
+                Some(r)
+            } else if in_cursor_col {
+                Some(theme.column_bg)
             } else {
-                style = style.fg(Color::DarkGray);
-            }
-            if let Some(bg) = row_bg {
-                style = style.bg(bg);
-            }
-            if i == app.cursor_step && c == app.cursor_ch {
-                style = style.bg(Color::Rgb(40, 40, 80)).add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!(" {} ", text), style));
-            spans.push(Span::raw(" "));
+                None
+            };
+
+            let apply = |fg: Color| {
+                let mut s = Style::default().fg(fg);
+                if let Some(b) = bg { s = s.bg(b); }
+                if is_cursor { s = s.add_modifier(Modifier::BOLD); }
+                s
+            };
+
+            spans.push(Span::styled(format!(" {} ", note_text), apply(note_color)));
+            spans.push(Span::styled(instr_text, apply(instr_color)));
+            spans.push(Span::styled(" ".to_string(), apply(theme.dim)));
+            spans.push(Span::styled(vol_text, apply(vol_color)));
+            spans.push(Span::styled(" ".to_string(), apply(theme.dim)));
+            spans.push(Span::styled(fx_text, apply(fx_color)));
+            // Trailing spacer between channel columns. Keep the cursor column's
+            // tint continuous across it so the "you are here" bar is unbroken.
+            let trail_style = if in_cursor_col && !is_cursor {
+                let mut s = Style::default();
+                if let Some(b) = bg { s = s.bg(b); }
+                s
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(" ".to_string(), trail_style));
         }
         lines.push(Line::from(spans));
     }
 
-    let title = format!(" PHRASE {:02X}   {} BPM   {} ",
+    let file_label = match &app.current_file {
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
+        None => "[no name]".into(),
+    };
+    let dirty = if app.dirty { " [+]" } else { "" };
+    let ch_name = match app.cursor_ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
+    let cursor_cell = app.phrase().cells[app.cursor_step][app.cursor_ch];
+    let (instr_txt, vol_txt) = match cursor_cell.note {
+        Some(_) => (
+            format!("i{:02X}", cursor_cell.instr),
+            format!("v{:02X}", cursor_cell.vol),
+        ),
+        None => ("i--".to_string(), "v--".to_string()),
+    };
+    let title = format!(
+        " {}{}   PHRASE {:02X}/{:02X}   {} {} {}   {} BPM   {} ",
+        file_label,
+        dirty,
         app.song.current_phrase,
+        app.song.phrases.len().saturating_sub(1),
+        ch_name, instr_txt, vol_txt,
         app.song.bpm,
-        if app.playing { "● PLAY" } else { "■ STOP" });
+        if app.playing { "● PLAY" } else { "■ STOP" },
+    );
     let block = Block::default().title(title).borders(Borders::ALL);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let section = |title: &str| Line::from(Span::styled(
         title.to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
     ));
     let row = |keys: &str, desc: &str| Line::from(vec![
-        Span::styled(format!("  {:<14}", keys), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("  {:<14}", keys), Style::default().fg(theme.instr)),
         Span::raw(desc.to_string()),
     ]);
 
@@ -592,27 +970,34 @@ fn render_help(f: &mut Frame, area: Rect) {
         section("Normal mode"),
         row("h j k l / ←↓↑→", "move cursor (prefix count, e.g. 4j)"),
         row("w / b",          "next / prev bar (4 steps)"),
-        row("0 / $",           "start / end of phrase"),
-        row("g / G",           "top / bottom of phrase"),
-        row("x",               "clear cell"),
-        row("dd / yy",         "delete / yank current step row"),
-        row("dab / yab",       "delete / yank current bar (4 steps)"),
-        row("dip / yip",       "delete / yank whole phrase"),
-        row("div / yiv",       "delete / yank current channel column"),
+        row("0 / $",           "first / last channel (PU1 ↔ NOI)"),
+        row("g / G",            "top / bottom of phrase"),
+        row("x",                "clear cell (count: Nx clears N cells down column)"),
+        row("dd / yy / cc",     "delete / yank / change current step row"),
+        row("dab / yab / cab",  "delete / yank / change current bar (4 steps)"),
+        row("dip / yip / cip",  "delete / yank / change whole phrase"),
+        row("div / yiv / civ",  "delete / yank / change current channel column"),
         row("p / P",           "paste after / at cursor"),
-        row(".",               "repeat last delete"),
+        row(".",                "repeat last delete / paste / x"),
+        row("u / Ctrl-r",       "undo / redo (200-step history)"),
+        row("r<key>",           "replace cell's note with next piano-row key"),
+        row("v / V",            "visual block / linewise selection (d/y/c/x apply)"),
+        row("{ / }",           "previous / next phrase"),
         row("i",               "insert mode"),
         row("a",               "append (move down, then insert)"),
         row(":",               "command mode"),
         row("space",           "toggle play"),
+        row("Esc",             "cancel pending count / operator"),
         row("? / F1",          "toggle this help"),
         row("F2 / :inst",      "instrument editor"),
-        row("ZZ / Ctrl-q",     "quit"),
+        row("ZZ",              "save and quit"),
+        row("ZQ / Ctrl-q",     "quit without saving"),
         Line::from(""),
-        section("Insert mode — bottom row = chromatic octave 4"),
+        section("Insert mode — bottom row = chromatic, base octave shiftable"),
         row("z s x d c v",     "C  C# D  D# E  F"),
         row("g b h n j m",     "F# G  G# A  A# B"),
         row(", l . ; /",       "continue into next octave"),
+        row("< / >",           "octave down / up (0–8, default 4)"),
         row("Backspace",       "clear cell and move up"),
         row("Esc",             "back to normal"),
         Line::from(""),
@@ -622,10 +1007,20 @@ fn render_help(f: &mut Frame, area: Rect) {
         row(":inst [NN]",      "instrument editor (hex index 00-0F)"),
         row(":set bpm=140",    "set tempo"),
         row(":set step=4",     "auto-advance N steps per inserted note"),
+        row(":set octave=4",   "base octave for insert-mode piano row (0–8)"),
+        row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":play / :stop",   "transport"),
         row(":w [path]",       "save song as .vip (path required first time)"),
-        row(":e <path>",       "load song from .vip"),
+        row(":e <path>",       "load .vip (or start new file at path if missing)"),
+        row(":new",            "start a new empty song (unsets filename)"),
+        row("Tab in :w / :e",   "complete file path (longest common prefix)"),
+        row(":vol NN",          "set cursor cell velocity (hex 00–0F; 00 = default/full)"),
+        row(":fx CPP",          "set cursor cell effect (e.g. :fx A04) / :fx off clears"),
+        row(":transpose ±N",    "shift all pitched notes in phrase by N semitones (skips NOI)"),
         row(":wq [path]",      "save and quit"),
+        row(":phrase [NN]",    "show / switch phrase (hex index)"),
+        row(":phrase new",     "append a new empty phrase"),
+        row(":phrase del",     "delete current phrase"),
         Line::from(""),
         section("Generators"),
         row(":gen four",       "kick/snare/hat on NOI"),
@@ -634,7 +1029,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  press q, Esc, or ? to close help",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC),
         )),
     ];
 
@@ -644,7 +1039,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_splash(f: &mut Frame, area: Rect) {
+fn render_splash(f: &mut Frame, area: Rect, theme: &Theme) {
     // Keep each line exactly 80 cells wide so the right border lines up.
     const ART: &[&str] = &[
         "╔══════════════════════════════════════════════════════════════════════════════╗",
@@ -666,23 +1061,23 @@ fn render_splash(f: &mut Frame, area: Rect) {
         "╚══════════════════════════════════════════════════════════════════════════════╝",
     ];
 
-    let cyan = Style::default().fg(Color::Cyan);
-    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
-    let green = Style::default().fg(Color::Green);
-    let blue = Style::default().fg(Color::LightBlue);
-    let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+    let border = Style::default().fg(theme.splash_logo);
+    let logo = border.add_modifier(Modifier::BOLD);
+    let snake = Style::default().fg(theme.splash_snake);
+    let base = Style::default().fg(theme.splash_base);
+    let dim = Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC);
 
     let styled: Vec<Line> = ART
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let style = match i {
-                0 | 16 => cyan_bold,               // top / bottom border
-                2..=7 => cyan_bold,                // VIPER logo rows
-                8..=11 => green,                   // snake head
-                12 => blue,                        // keyboard base (snake body)
+                0 | 16 => logo,                    // top / bottom border
+                2..=7 => logo,                     // VIPER logo rows
+                8..=11 => snake,                   // snake head
+                12 => base,                        // keyboard base (snake body)
                 14 => dim,                         // tagline
-                _ => cyan,                         // blank border rows
+                _ => border,                       // blank border rows
             };
             Line::from(Span::styled((*s).to_string(), style))
         })
@@ -711,11 +1106,12 @@ fn render_splash(f: &mut Frame, area: Rect) {
 fn render_instrument(f: &mut Frame, area: Rect, app: &App) {
     let idx = app.selected_instr as usize;
     let inst = app.song.instruments[idx];
+    let theme = &app.theme;
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         format!("  INSTRUMENT {:02X}", idx),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.instr_title).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(""));
 
@@ -723,22 +1119,22 @@ fn render_instrument(f: &mut Frame, area: Rect, app: &App) {
         let sel = i == app.instr_param;
         let marker = if sel { ">" } else { " " };
         let style = if sel {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.instr_row_fg).bg(theme.instr_row_bg).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.instr_label)
         };
         lines.push(Line::from(vec![
             Span::raw(format!("  {} ", marker)),
             Span::styled(format!("{:<8}", name), style),
             Span::raw("  "),
-            Span::styled(inst.display(i), Style::default().fg(Color::Green)),
+            Span::styled(inst.display(i), Style::default().fg(theme.instr_value)),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j/k select · h/l or -/+ adjust · [ ] prev/next instr · Esc back",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC),
     )));
 
     let block = Block::default()
@@ -756,18 +1152,19 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Help => "HELP",
         Mode::Instrument => "INSTR",
     };
+    let theme = &app.theme;
     let mode_color = match app.mode {
-        Mode::Normal => Color::Cyan,
-        Mode::Insert => Color::Green,
-        Mode::Visual => Color::Magenta,
-        Mode::Command => Color::Yellow,
-        Mode::Help => Color::Blue,
-        Mode::Instrument => Color::LightRed,
+        Mode::Normal => theme.mode_normal,
+        Mode::Insert => theme.mode_insert,
+        Mode::Visual => theme.mode_visual,
+        Mode::Command => theme.mode_command,
+        Mode::Help => theme.mode_help,
+        Mode::Instrument => theme.mode_instr,
     };
 
     let left = Line::from(vec![
         Span::styled(format!(" {} ", mode_str),
-            Style::default().bg(mode_color).fg(Color::Black).add_modifier(Modifier::BOLD)),
+            Style::default().bg(mode_color).fg(theme.mode_fg).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::raw(&app.status),
     ]);
@@ -786,7 +1183,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn ui(f: &mut Frame, app: &App) {
     if app.show_splash {
-        render_splash(f, f.area());
+        render_splash(f, f.area(), &app.theme);
         return;
     }
     let chunks = Layout::default()
@@ -794,7 +1191,7 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(5), Constraint::Length(2)])
         .split(f.area());
     match app.mode {
-        Mode::Help => render_help(f, chunks[0]),
+        Mode::Help => render_help(f, chunks[0], &app.theme),
         Mode::Instrument => render_instrument(f, chunks[0], app),
         _ => render_phrase(f, chunks[0], app),
     }
@@ -812,9 +1209,44 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::Normal => handle_normal(app, key),
         Mode::Insert => handle_insert(app, key),
         Mode::Command => handle_command(app, key),
-        Mode::Visual => handle_normal(app, key), // TODO: real visual mode
+        Mode::Visual => handle_visual(app, key),
         Mode::Help => handle_help(app, key),
         Mode::Instrument => handle_instrument(app, key),
+    }
+}
+
+fn handle_visual(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('v') => {
+            app.mode = Mode::Normal;
+            app.visual_anchor = None;
+            app.visual_linewise = false;
+            app.count = 0;
+            app.status = "".into();
+        }
+        // Toggle linewise on/off without leaving visual mode.
+        KeyCode::Char('V') => {
+            app.visual_linewise = !app.visual_linewise;
+            app.status = if app.visual_linewise { "-- VISUAL LINE --".into() } else { "-- VISUAL --".into() };
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && app.count == 0) => {
+            app.count = app.count * 10 + c.to_digit(10).unwrap();
+        }
+        KeyCode::Char('j') | KeyCode::Down  => { let n = app.take_count(); app.motion_j(n); }
+        KeyCode::Char('k') | KeyCode::Up    => { let n = app.take_count(); app.motion_k(n); }
+        KeyCode::Char('h') | KeyCode::Left  => { let n = app.take_count(); app.motion_h(n); }
+        KeyCode::Char('l') | KeyCode::Right => { let n = app.take_count(); app.motion_l(n); }
+        KeyCode::Char('w') => { app.motion_j(4); }
+        KeyCode::Char('b') => { app.motion_k(4); }
+        KeyCode::Char('0') => { app.cursor_ch = 0; app.count = 0; }
+        KeyCode::Char('$') => { app.cursor_ch = CHANNELS - 1; }
+        KeyCode::Char('g') => { app.cursor_step = 0; }
+        KeyCode::Char('G') => { app.cursor_step = STEPS_PER_PHRASE - 1; }
+        // Operators act on the rectangle.
+        KeyCode::Char('d') | KeyCode::Char('x') => { app.op_visual('d'); }
+        KeyCode::Char('y') => { app.op_visual('y'); }
+        KeyCode::Char('c') => { app.op_visual('c'); }
+        _ => {}
     }
 }
 
@@ -832,11 +1264,13 @@ fn handle_instrument(app: &mut App, key: KeyEvent) {
                 % INSTR_PARAM_NAMES.len();
         }
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('-') => {
+            app.snapshot();
             let p = app.instr_param;
             app.song.instruments[app.selected_instr as usize].adjust(p, -1);
         }
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('+')
             | KeyCode::Char('=') => {
+            app.snapshot();
             let p = app.instr_param;
             app.song.instruments[app.selected_instr as usize].adjust(p, 1);
         }
@@ -872,14 +1306,47 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             return;
         }
         Pending::Z => {
-            // Only a second `Z` completes the chord; anything else cancels and
-            // re-interprets the key normally.
-            if matches!(key.code, KeyCode::Char('Z')) {
-                app.pending = Pending::None;
-                app.quit = true;
-                return;
+            // `ZZ` saves and quits; `ZQ` quits without saving. Anything else
+            // cancels and re-interprets the key normally.
+            match key.code {
+                KeyCode::Char('Z') => {
+                    app.pending = Pending::None;
+                    save_and_quit(app);
+                    return;
+                }
+                KeyCode::Char('Q') => {
+                    app.pending = Pending::None;
+                    app.quit = true;
+                    return;
+                }
+                _ => {
+                    app.pending = Pending::None;
+                }
             }
+        }
+        Pending::Replace => {
             app.pending = Pending::None;
+            match key.code {
+                KeyCode::Esc => { app.status = "cancelled".into(); }
+                KeyCode::Char(c) => {
+                    if let Some(note) = App::piano_row_note(c, app.insert_octave) {
+                        app.snapshot();
+                        let (s, ch) = (app.cursor_step, app.cursor_ch);
+                        let instr = app.selected_instr;
+                        let cell = &mut app.phrase_mut().cells[s][ch];
+                        cell.note = Some(note);
+                        cell.instr = instr;
+                        app.status = format!(
+                            "replaced [{:02X},ch{}] with {}",
+                            s, ch + 1, note_name(Some(note)),
+                        );
+                    } else {
+                        app.status = format!("r: not a piano-row key: {:?}", c);
+                    }
+                }
+                _ => { app.status = "r: expected piano-row key".into(); }
+            }
+            return;
         }
         Pending::None => {}
     }
@@ -893,27 +1360,59 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('k') | KeyCode::Up    => { let n = app.take_count(); app.motion_k(n); }
         KeyCode::Char('h') | KeyCode::Left  => { let n = app.take_count(); app.motion_h(n); }
         KeyCode::Char('l') | KeyCode::Right => { let n = app.take_count(); app.motion_l(n); }
-        KeyCode::Char('0') => { app.cursor_step = 0; app.count = 0; }
-        KeyCode::Char('$') => { app.cursor_step = STEPS_PER_PHRASE - 1; }
+        KeyCode::Char('0') => { app.cursor_ch = 0; app.count = 0; }
+        KeyCode::Char('$') => { app.cursor_ch = CHANNELS - 1; }
         KeyCode::Char('g') => { app.cursor_step = 0; }
         KeyCode::Char('G') => { app.cursor_step = STEPS_PER_PHRASE - 1; }
         KeyCode::Char('w') => { app.motion_j(4); }
         KeyCode::Char('b') => { app.motion_k(4); }
 
-        KeyCode::Char('x') => { app.op_delete_cell(); }
+        KeyCode::Char('x') => {
+            let n = app.take_count().max(1);
+            for _ in 0..n {
+                app.op_delete_cell();
+                if app.cursor_step + 1 >= STEPS_PER_PHRASE { break; }
+                app.motion_j(1);
+            }
+        }
         KeyCode::Char('d') => { app.pending = Pending::Op('d'); }
         KeyCode::Char('y') => { app.pending = Pending::Op('y'); }
+        KeyCode::Char('c') => { app.pending = Pending::Op('c'); }
         KeyCode::Char('p') => { app.paste(true); }
         KeyCode::Char('P') => { app.paste(false); }
         KeyCode::Char('.') => { app.replay_last_action(); }
 
-        KeyCode::Char('i') => { app.mode = Mode::Insert; app.status = "-- INSERT --".into(); }
+        KeyCode::Char('i') => {
+            app.snapshot();
+            app.mode = Mode::Insert;
+            app.status = "-- INSERT --".into();
+        }
         KeyCode::Char('a') => {
+            app.snapshot();
             app.motion_j(1);
             app.mode = Mode::Insert;
             app.status = "-- INSERT (append) --".into();
         }
-        KeyCode::Char('v') => { app.mode = Mode::Visual; }
+        KeyCode::Char('u') => { app.undo(); }
+        KeyCode::Char('r') if ctrl => { app.redo(); }
+        KeyCode::Char('r') => {
+            app.pending = Pending::Replace;
+            app.status = "r — press a piano-row key to replace the cell".into();
+        }
+        KeyCode::Char('v') => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some((app.cursor_step, app.cursor_ch));
+            app.visual_linewise = false;
+            app.status = "-- VISUAL --".into();
+        }
+        KeyCode::Char('V') => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some((app.cursor_step, app.cursor_ch));
+            app.visual_linewise = true;
+            app.status = "-- VISUAL LINE --".into();
+        }
+        KeyCode::Char('{') => { prev_phrase(app); }
+        KeyCode::Char('}') => { next_phrase(app); }
         KeyCode::Char(':') => {
             app.mode = Mode::Command;
             app.command_buf.clear();
@@ -927,26 +1426,39 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Help;
             app.status = "help — q/Esc/? to close".into();
         }
-        KeyCode::F(2) => {
-            app.mode = Mode::Instrument;
-            app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
-        }
+        KeyCode::F(2) => { enter_instrument_mode(app); }
         KeyCode::Char('Z') => { app.pending = Pending::Z; }
+        KeyCode::Esc => {
+            // Esc cancels any pending count and clears transient status.
+            app.pending = Pending::None;
+            app.count = 0;
+            app.status = "".into();
+        }
         _ => {}
     }
 }
 
 fn handle_pending_op(app: &mut App, op: char, key: KeyEvent) {
     match key.code {
+        // Extra digits after the operator extend the count (`d3d`, like vim's `3dd`).
+        KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && app.count == 0) => {
+            app.count = app.count * 10 + c.to_digit(10).unwrap();
+        }
         KeyCode::Char(c) if c == op => {
             app.pending = Pending::None;
-            app.op_row(op);
+            let n = app.take_count();
+            app.op_row(op, n);
         }
         KeyCode::Char('a') => { app.pending = Pending::OpScope(op, 'a'); }
         KeyCode::Char('i') => { app.pending = Pending::OpScope(op, 'i'); }
-        KeyCode::Esc => { app.pending = Pending::None; }
+        KeyCode::Esc => {
+            app.pending = Pending::None;
+            app.count = 0;
+            app.status = "".into();
+        }
         _ => {
             app.pending = Pending::None;
+            app.count = 0;
             app.status = "cancelled".into();
         }
     }
@@ -960,8 +1472,9 @@ fn handle_pending_op_scope(app: &mut App, op: char, scope: char, key: KeyEvent) 
         _ => None,
     };
     app.pending = Pending::None;
+    let n = app.take_count();
     if let Some(o) = obj {
-        app.op_object(op, scope, o);
+        app.op_object(op, scope, o, n);
     } else {
         app.status = "unknown object".into();
     }
@@ -977,9 +1490,16 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
         KeyCode::Up    => { app.motion_k(1); }
         KeyCode::Left  => { app.motion_h(1); }
         KeyCode::Right => { app.motion_l(1); }
+        KeyCode::Char('<') => {
+            app.insert_octave = app.insert_octave.saturating_sub(1);
+            app.status = format!("octave {}", app.insert_octave);
+        }
+        KeyCode::Char('>') => {
+            app.insert_octave = (app.insert_octave + 1).min(8);
+            app.status = format!("octave {}", app.insert_octave);
+        }
         KeyCode::Char(c) => {
-            // Default octave 4 for now; real impl tracks current octave.
-            if let Some(note) = App::piano_row_note(c, 4) {
+            if let Some(note) = App::piano_row_note(c, app.insert_octave) {
                 app.insert_note(note);
             }
         }
@@ -1010,9 +1530,123 @@ fn handle_command(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Backspace => { app.command_buf.pop(); }
+        KeyCode::Tab => { complete_path(app); }
         KeyCode::Char(c) => { app.command_buf.push(c); }
         _ => {}
     }
+}
+
+/// Single-shot prefix completion for `:w`, `:wq`, `:e` path args.
+/// Extends the path fragment to the longest common prefix of matching
+/// filesystem entries. Appends `/` when the unique match is a directory.
+fn complete_path(app: &mut App) {
+    let buf = app.command_buf.clone();
+    // Find the start of the path fragment: chars after the last whitespace.
+    let path_start = buf.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let head = &buf[..path_start];
+    let frag = &buf[path_start..];
+
+    // Only complete for file-taking commands.
+    let cmd = head.trim();
+    let want_vip = matches!(cmd, "e" | "edit");
+    if !matches!(cmd, "w" | "e" | "wq" | "edit" | "write") {
+        return;
+    }
+
+    // Expand leading `~` for directory lookup but keep the display form.
+    let (dir, name_prefix, display_dir) = split_path_fragment(frag);
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        app.status = format!("no such directory: {}", dir.display());
+        return;
+    };
+
+    let mut matches: Vec<(String, bool)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&name_prefix) { continue; }
+        if name.starts_with('.') && !name_prefix.starts_with('.') { continue; }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if want_vip && !is_dir && !name.ends_with(".vip") { continue; }
+        matches.push((name, is_dir));
+    }
+
+    if matches.is_empty() {
+        app.status = format!("no matches for '{}'", frag);
+        return;
+    }
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    let common = longest_common_prefix(matches.iter().map(|m| m.0.as_str()));
+    let completed = if matches.len() == 1 {
+        let (ref name, is_dir) = matches[0];
+        if is_dir { format!("{}/", name) } else { name.clone() }
+    } else {
+        common
+    };
+
+    let new_frag = format!("{}{}", display_dir, completed);
+    app.command_buf = format!("{}{}", head, new_frag);
+    if matches.len() > 1 {
+        let preview: Vec<String> = matches
+            .iter()
+            .take(6)
+            .map(|(n, is_dir)| if *is_dir { format!("{}/", n) } else { n.clone() })
+            .collect();
+        app.status = format!(
+            "{} matches: {}{}",
+            matches.len(),
+            preview.join(" "),
+            if matches.len() > 6 { " ..." } else { "" },
+        );
+    } else {
+        app.status = "".into();
+    }
+}
+
+fn split_path_fragment(frag: &str) -> (PathBuf, String, String) {
+    // Expand leading `~` / `~/` for filesystem lookup while preserving the
+    // original display form in the command buffer.
+    fn expand(s: &str) -> PathBuf {
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+        if s == "~" {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home);
+            }
+        }
+        PathBuf::from(s)
+    }
+
+    // Split into (display_dir_kept_verbatim, basename_prefix_to_match).
+    // `display_dir` always ends in `/` when present, so `frag` = "projects/"
+    // → display_dir = "projects/", basename = "" (list directory contents).
+    let (display_dir, basename) = match frag.rfind('/') {
+        Some(i) => (&frag[..=i], &frag[i + 1..]),
+        None    => ("", frag),
+    };
+    let dir = if display_dir.is_empty() {
+        PathBuf::from(".")
+    } else {
+        expand(display_dir)
+    };
+    (dir, basename.to_string(), display_dir.to_string())
+}
+
+fn longest_common_prefix<'a, I: IntoIterator<Item = &'a str>>(strs: I) -> String {
+    let mut iter = strs.into_iter();
+    let Some(first) = iter.next() else { return String::new() };
+    let mut prefix = first.to_string();
+    for s in iter {
+        while !s.starts_with(&prefix) {
+            prefix.pop();
+            if prefix.is_empty() { return String::new(); }
+        }
+    }
+    prefix
 }
 
 fn execute_command(app: &mut App, cmd: &str) {
@@ -1023,10 +1657,7 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.mode = Mode::Help;
             app.status = "help — q/Esc/? to close".into();
         }
-        ["inst"] | ["instrument"] => {
-            app.mode = Mode::Instrument;
-            app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
-        }
+        ["inst"] | ["instrument"] => { enter_instrument_mode(app); }
         ["inst", n] | ["instrument", n] => {
             if let Ok(i) = u8::from_str_radix(n, 16) {
                 app.selected_instr = i.min((INSTRUMENTS - 1) as u8);
@@ -1036,12 +1667,14 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["w"] => { write_current(app); }
         ["w", path] => { write_to(app, Path::new(path)); }
-        ["wq"] => { write_current(app); if !app.status.starts_with("error") { app.quit = true; } }
+        ["wq"] => { save_and_quit(app); }
         ["wq", path] => {
-            write_to(app, Path::new(path));
-            if !app.status.starts_with("error") { app.quit = true; }
+            if write_to(app, Path::new(path)) {
+                app.quit = true;
+            }
         }
         ["e", path] => { edit_file(app, Path::new(path)); }
+        ["new"] => { new_song(app); }
         ["e!"] | ["edit!"] => {
             if let Some(p) = app.current_file.clone() {
                 edit_file(app, &p);
@@ -1051,67 +1684,368 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
+        ["phrase"] | ["p"] => {
+            app.status = format!(
+                "phrase {:02X}/{:02X}",
+                app.song.current_phrase,
+                app.song.phrases.len().saturating_sub(1),
+            );
+        }
+        ["phrase", "new"] => { new_phrase(app); }
+        ["phrase", "del"] | ["phrase", "delete"] => { delete_phrase_cmd(app); }
+        ["phrase", n] => {
+            match u8::from_str_radix(n, 16) {
+                Ok(i) => goto_phrase(app, i as usize),
+                Err(_) => app.status = format!("bad phrase index: {}", n),
+            }
+        }
+        ["vol", tok] => { set_cursor_vol(app, tok); }
+        ["transpose", n] | ["tr", n] => { transpose_phrase(app, n); }
+        ["fx", "off"] | ["fx", "clear"] => { clear_cursor_fx(app); }
+        ["fx", tok] => { set_cursor_fx(app, tok); }
+        ["fx", cmd, param] => {
+            let joined = format!("{}{}", cmd, param);
+            set_cursor_fx(app, &joined);
+        }
         ["gen", rest @ ..] => {
+            app.snapshot();
             let seed = app.gen_seed;
             app.gen_seed = app.gen_seed.wrapping_add(1);
             match gen::dispatch(&mut app.song, rest, seed) {
                 Ok(msg) => { app.status = msg; }
-                Err(e) => { app.status = format!("gen: {}", e); }
+                Err(e) => {
+                    // Gen failed — our optimistic snapshot doesn't reflect
+                    // a real change, so drop it to keep the undo stack clean.
+                    app.undo_stack.pop();
+                    app.status = format!("gen: {}", e);
+                }
             }
         }
-        ["set", kv] => {
-            if let Some((k, v)) = kv.split_once('=') {
-                match k {
-                    "bpm" => {
-                        if let Ok(n) = v.parse::<u16>() { app.song.bpm = n; }
+        ["set", rest @ ..] => {
+            // Accept `bpm=140`, `bpm =140`, `bpm= 140`, `bpm = 140`, etc.
+            let joined = rest.join(" ");
+            let Some((k, v)) = joined.split_once('=') else {
+                app.status = "usage: :set key=value".into();
+                return;
+            };
+            let k = k.trim();
+            let v = v.trim();
+            match k {
+                "bpm" => match v.parse::<u16>() {
+                    Ok(n) if (20..=999).contains(&n) => {
+                        app.snapshot();
+                        app.song.bpm = n;
                         app.status = format!("bpm = {}", app.song.bpm);
                     }
-                    "step" => {
-                        if let Ok(n) = v.parse::<usize>() {
-                            app.song.edit_step = n.clamp(1, STEPS_PER_PHRASE);
-                        }
+                    Ok(n) => app.status = format!("bpm out of range (20–999): {}", n),
+                    Err(_) => app.status = format!("bad bpm value: {:?}", v),
+                },
+                "step" => match v.parse::<usize>() {
+                    Ok(n) if (1..=STEPS_PER_PHRASE).contains(&n) => {
+                        app.snapshot();
+                        app.song.edit_step = n;
                         app.status = format!("edit step = {}", app.song.edit_step);
                     }
-                    _ => { app.status = format!("unknown setting: {}", k); }
-                }
+                    Ok(n) => app.status = format!(
+                        "step out of range (1–{}): {}",
+                        STEPS_PER_PHRASE, n,
+                    ),
+                    Err(_) => app.status = format!("bad step value: {:?}", v),
+                },
+                "octave" => match v.parse::<u8>() {
+                    Ok(n) if n <= 8 => {
+                        app.insert_octave = n;
+                        app.status = format!("octave = {}", app.insert_octave);
+                    }
+                    Ok(n) => app.status = format!("octave out of range (0–8): {}", n),
+                    Err(_) => app.status = format!("bad octave value: {:?}", v),
+                },
+                "theme" => match Theme::by_name(v) {
+                    Some(t) => {
+                        app.theme = t;
+                        app.status = format!("theme = {}", t.name);
+                    }
+                    None => app.status = format!("unknown theme: {:?} (try nes or phosphor)", v),
+                },
+                _ => { app.status = format!("unknown setting: {}", k); }
             }
         }
         _ => { app.status = format!("unknown command: {}", cmd); }
     }
 }
 
-// ---------- File I/O helpers ----------
+// ---------- Instrument-editor entry ----------
 
-fn write_current(app: &mut App) {
-    let Some(path) = app.current_file.clone() else {
-        app.status = "error: no filename (use :w <path>)".into();
-        return;
-    };
-    write_to(app, &path);
+/// Enter the instrument editor. If the cell under the cursor has a note,
+/// target that cell's instrument so F2 / `:inst` edits the sound you're
+/// looking at. Otherwise keep whatever instrument was previously selected.
+fn enter_instrument_mode(app: &mut App) {
+    let (s, c) = (app.cursor_step, app.cursor_ch);
+    let cell = app.phrase().cells[s][c];
+    if cell.note.is_some() {
+        app.selected_instr = (cell.instr as usize).min(INSTRUMENTS - 1) as u8;
+    }
+    app.mode = Mode::Instrument;
+    app.status = format!("instrument {:02X} — Esc to return", app.selected_instr);
 }
 
-fn write_to(app: &mut App, path: &Path) {
+// ---------- Phrase navigation ----------
+
+fn next_phrase(app: &mut App) {
+    let n = app.song.phrases.len();
+    if n <= 1 {
+        app.status = "only one phrase".into();
+        return;
+    }
+    app.song.current_phrase = (app.song.current_phrase + 1) % n;
+    app.cursor_step = 0;
+    app.status = format!("phrase {:02X}", app.song.current_phrase);
+}
+
+fn prev_phrase(app: &mut App) {
+    let n = app.song.phrases.len();
+    if n <= 1 {
+        app.status = "only one phrase".into();
+        return;
+    }
+    let cur = app.song.current_phrase;
+    app.song.current_phrase = if cur == 0 { n - 1 } else { cur - 1 };
+    app.cursor_step = 0;
+    app.status = format!("phrase {:02X}", app.song.current_phrase);
+}
+
+fn goto_phrase(app: &mut App, idx: usize) {
+    if idx >= app.song.phrases.len() {
+        app.status = format!("no phrase {:02X} (have {})", idx, app.song.phrases.len());
+        return;
+    }
+    app.song.current_phrase = idx;
+    app.cursor_step = 0;
+    app.status = format!("phrase {:02X}", idx);
+}
+
+fn new_phrase(app: &mut App) {
+    app.snapshot();
+    app.song.phrases.push(Phrase::default());
+    app.song.current_phrase = app.song.phrases.len() - 1;
+    app.cursor_step = 0;
+    app.cursor_ch = 0;
+    app.status = format!("new phrase {:02X}", app.song.current_phrase);
+}
+
+fn delete_phrase_cmd(app: &mut App) {
+    app.snapshot();
+    if app.song.phrases.len() == 1 {
+        // Refuse to delete the last phrase — clear its contents instead.
+        app.song.phrases[0] = Phrase::default();
+        app.cursor_step = 0;
+        app.cursor_ch = 0;
+        app.status = "cleared phrase (last one, not deleted)".into();
+        return;
+    }
+    let idx = app.song.current_phrase;
+    app.song.phrases.remove(idx);
+    if app.song.current_phrase >= app.song.phrases.len() {
+        app.song.current_phrase = app.song.phrases.len() - 1;
+    }
+    app.cursor_step = 0;
+    app.status = format!("deleted phrase {:02X}, now on {:02X}", idx, app.song.current_phrase);
+}
+
+// ---------- File I/O helpers ----------
+
+/// Returns `true` on a successful write. Sets `app.status` either way.
+fn write_current(app: &mut App) -> bool {
+    let Some(path) = app.current_file.clone() else {
+        app.status = "error: no filename (use :w <path>)".into();
+        return false;
+    };
+    write_to(app, &path)
+}
+
+/// Returns `true` on a successful write. Sets `app.status` either way.
+fn write_to(app: &mut App, path: &Path) -> bool {
     match vip::save(&app.song, path) {
         Ok(()) => {
             app.current_file = Some(path.to_path_buf());
+            app.dirty = false;
             app.status = format!("wrote {}", path.display());
+            true
         }
-        Err(e) => { app.status = format!("error: {}", e); }
+        Err(e) => {
+            app.status = format!("error: {}", e);
+            false
+        }
+    }
+}
+
+/// Save to the current file, then quit if the save succeeded. Used by both
+/// `:wq` and `ZZ`.
+fn save_and_quit(app: &mut App) {
+    if write_current(app) {
+        app.quit = true;
     }
 }
 
 fn edit_file(app: &mut App, path: &Path) {
+    if !path.exists() {
+        app.song = Song::default();
+        app.current_file = Some(path.to_path_buf());
+        app.cursor_step = 0;
+        app.cursor_ch = 0;
+        app.play_step = 0;
+        app.undo_stack.clear();
+        app.redo_stack.clear();
+        app.dirty = false;
+        app.status = format!("new file: {}", path.display());
+        return;
+    }
     match vip::load(path) {
-        Ok(song) => {
+        Ok((song, warnings)) => {
             app.song = song;
             app.current_file = Some(path.to_path_buf());
             app.cursor_step = 0;
             app.cursor_ch = 0;
             app.play_step = 0;
-            app.status = format!("loaded {}", path.display());
+            app.undo_stack.clear();
+            app.redo_stack.clear();
+            app.dirty = false;
+            app.status = if warnings.is_empty() {
+                format!("loaded {}", path.display())
+            } else {
+                // Don't eprintln here — stderr writes into the alt screen and
+                // corrupts the TUI until a resize forces a redraw. The status
+                // line gets the count + first warning; the rest are dropped
+                // for now (a `:messages` buffer would be the natural home).
+                format!(
+                    "loaded {} ({} warning{}: {})",
+                    path.display(),
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" },
+                    warnings[0],
+                )
+            };
         }
         Err(e) => { app.status = format!("error: {}", e); }
     }
+}
+
+fn set_cursor_vol(app: &mut App, tok: &str) {
+    let (s, c) = (app.cursor_step, app.cursor_ch);
+    let cell = app.phrase().cells[s][c];
+    if cell.note.is_none() {
+        app.status = "cursor cell has no note — vol only applies to notes".into();
+        return;
+    }
+    let v = match u8::from_str_radix(tok, 16) {
+        Ok(v) if v <= 0x0F => v,
+        Ok(v) => {
+            app.status = format!("vol out of range (00–0F): {:02X}", v);
+            return;
+        }
+        Err(_) => {
+            app.status = format!("bad vol hex: {:?}", tok);
+            return;
+        }
+    };
+    app.snapshot();
+    app.phrase_mut().cells[s][c].vol = v;
+    app.status = format!("vol = {:02X} at [{:02X},ch{}]", v, s, c + 1);
+}
+
+fn set_cursor_fx(app: &mut App, tok: &str) {
+    let (s, c) = (app.cursor_step, app.cursor_ch);
+    if app.phrase().cells[s][c].note.is_none() {
+        app.status = "cursor cell has no note — fx only applies to notes".into();
+        return;
+    }
+    let tok = tok.to_ascii_uppercase();
+    if tok.len() != 3 {
+        app.status = format!("fx form: CPP (e.g. A04) — got {:?}", tok);
+        return;
+    }
+    let bytes = tok.as_bytes();
+    let cmd = bytes[0];
+    if !cmd.is_ascii_alphanumeric() {
+        app.status = format!("fx command must be A-Z or 0-9 — got {:?}", cmd as char);
+        return;
+    }
+    let param = match u8::from_str_radix(&tok[1..], 16) {
+        Ok(p) => p,
+        Err(_) => {
+            app.status = format!("bad fx param hex: {:?}", &tok[1..]);
+            return;
+        }
+    };
+    app.snapshot();
+    app.phrase_mut().cells[s][c].fx = Some((cmd, param));
+    app.status = format!("fx = {}{:02X} at [{:02X},ch{}]", cmd as char, param, s, c + 1);
+}
+
+fn clear_cursor_fx(app: &mut App) {
+    let (s, c) = (app.cursor_step, app.cursor_ch);
+    if app.phrase().cells[s][c].fx.is_none() {
+        app.status = "no fx to clear".into();
+        return;
+    }
+    app.snapshot();
+    app.phrase_mut().cells[s][c].fx = None;
+    app.status = format!("fx cleared at [{:02X},ch{}]", s, c + 1);
+}
+
+/// Shift every pitched note in the current phrase by `delta` semitones.
+/// NOI is skipped — noise has no pitch, so transposing it would be a no-op
+/// that nonetheless changes the displayed note, surprising the composer.
+/// Notes that would clamp to 0 or 127 hold at those edges rather than wrap.
+fn transpose_phrase(app: &mut App, tok: &str) {
+    let delta = match tok.parse::<i32>() {
+        Ok(d) => d,
+        Err(_) => {
+            app.status = format!("bad transpose amount: {:?} (try +5 or -3)", tok);
+            return;
+        }
+    };
+    if delta == 0 {
+        app.status = "transpose: 0 semitones (no-op)".into();
+        return;
+    }
+    let was_dirty = app.dirty;
+    app.snapshot();
+    let mut moved = 0;
+    let phrase = app.phrase_mut();
+    for row in phrase.cells.iter_mut() {
+        for (ch, cell) in row.iter_mut().enumerate() {
+            if ch == 3 /* NOI */ { continue; }
+            if let Some(n) = cell.note {
+                let new_n = (n as i32 + delta).clamp(0, 127) as u8;
+                if new_n != n {
+                    cell.note = Some(new_n);
+                    moved += 1;
+                }
+            }
+        }
+    }
+    if moved == 0 {
+        // No pitched notes moved — drop the snapshot so undo stays clean.
+        app.undo_stack.pop();
+        app.dirty = was_dirty;
+        app.status = "transpose: nothing to move (or all clamped)".into();
+    } else {
+        let sign = if delta > 0 { "+" } else { "" };
+        app.status = format!("transposed {} note(s) by {}{} semitones", moved, sign, delta);
+    }
+}
+
+fn new_song(app: &mut App) {
+    app.song = Song::default();
+    app.current_file = None;
+    app.cursor_step = 0;
+    app.cursor_ch = 0;
+    app.play_step = 0;
+    app.undo_stack.clear();
+    app.redo_stack.clear();
+    app.dirty = false;
+    app.status = "new song (no filename — :w <path> to save)".into();
 }
 
 // ---------- Main loop ----------

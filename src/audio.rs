@@ -45,6 +45,8 @@ struct Voice {
     freq: f32,
     phase: f32,
     level: f32,
+    /// Per-note velocity in 0..=1, captured at gate-on from the cell's volume column.
+    vel: f32,
     env: EnvPhase,
     instrument: Instrument,
     noise_state: u32,
@@ -57,15 +59,17 @@ impl Voice {
             freq: 0.0,
             phase: 0.0,
             level: 0.0,
+            vel: 1.0,
             env: EnvPhase::Idle,
             instrument: Instrument::default(),
             noise_state: 0xACE1u32.wrapping_add((kind as u32).wrapping_mul(0x9E3779B9)),
         }
     }
 
-    fn gate_on(&mut self, freq: f32, instr: Instrument) {
+    fn gate_on(&mut self, freq: f32, instr: Instrument, vel: f32) {
         self.freq = freq;
         self.instrument = instr;
+        self.vel = vel.clamp(0.0, 1.0);
         self.env = EnvPhase::Attack;
         // Don't hard-reset level: retriggers ramp smoothly from the current level.
     }
@@ -149,7 +153,7 @@ impl Voice {
             }
             _ => 0.0,
         };
-        raw * self.level * self.instrument.volume
+        raw * self.level * self.instrument.volume * self.vel
     }
 }
 
@@ -239,7 +243,15 @@ where
                         let cell = tr.phrase.cells[tr.step][ch];
                         if let Some(n) = cell.note {
                             let idx = (cell.instr as usize).min(INSTRUMENTS - 1);
-                            v.gate_on(midi_to_hz(n), tr.instruments[idx]);
+                            // vol=0 is treated as "default/full" so notes entered
+                            // in insert mode (which leaves vol=0) play normally.
+                            // vol=1..=15 maps linearly to 1/15..=1.0.
+                            let vel = if cell.vol == 0 {
+                                1.0
+                            } else {
+                                (cell.vol as f32 / 15.0).min(1.0)
+                            };
+                            v.gate_on(midi_to_hz(n), tr.instruments[idx], vel);
                         } else {
                             v.gate_off();
                         }
