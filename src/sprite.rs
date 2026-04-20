@@ -63,17 +63,19 @@ impl SpriteSheet {
     }
 }
 
-/// Load a PNG and auto-derive a ≤4-entry palette. Fully-transparent
-/// pixels (alpha=0) always map to slot 0; opaque colors claim slots 1..=3
-/// in order of first appearance.
+/// Load a PNG and derive a ≤4-entry palette (slot 0 = transparent, 1..=3
+/// opaque). Alpha < 8 always maps to slot 0.
 ///
-/// Errors if the image uses more than 4 distinct opaque colors, keeping
-/// the NES discipline explicit rather than silently quantizing.
+/// With `quantize=false`, errors if the image uses more than 3 distinct
+/// opaque colors — preserves NES discipline and catches accidentally-rich
+/// sheets. With `quantize=true`, keeps the 3 most-frequent opaque colors
+/// and remaps the rest to the nearest by squared RGB distance.
 pub(crate) fn load_sheet(
     name: impl Into<String>,
     path: &Path,
     cell_w: u32,
     cell_h: u32,
+    quantize: bool,
 ) -> Result<SpriteSheet> {
     if cell_w == 0 || cell_h == 0 {
         bail!("cell dimensions must be ≥ 1 (got {}×{})", cell_w, cell_h);
@@ -89,33 +91,58 @@ pub(crate) fn load_sheet(
         );
     }
 
-    let mut palette_rgb: Vec<[u8; 3]> = Vec::with_capacity(PALETTE_SIZE - 1);
+    // Pass 1: count opaque color occurrences.
+    let mut counts: Vec<([u8; 3], usize)> = Vec::new();
+    for pixel in rgba.pixels() {
+        let [r, g, b, a] = pixel.0;
+        if a < 8 { continue; }
+        let key = [r, g, b];
+        match counts.iter().position(|(c, _)| *c == key) {
+            Some(i) => counts[i].1 += 1,
+            None => counts.push((key, 1)),
+        }
+    }
+
+    let chosen: Vec<[u8; 3]> = if counts.len() <= PALETTE_SIZE - 1 {
+        counts.iter().map(|(c, _)| *c).collect()
+    } else if quantize {
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.truncate(PALETTE_SIZE - 1);
+        counts.into_iter().map(|(c, _)| c).collect()
+    } else {
+        return Err(anyhow!(
+            "sheet {} has {} opaque colors (>3) — reduce palette or add \
+             'quantize' flag to remap to top-3", path.display(), counts.len()
+        ));
+    };
+
+    // Pass 2: index each pixel into the chosen palette (exact match first,
+    // nearest-neighbor by sq RGB distance for the quantized remainder).
     let mut indices: Vec<u8> = Vec::with_capacity((w * h) as usize);
     for pixel in rgba.pixels() {
         let [r, g, b, a] = pixel.0;
-        if a < 8 {
-            indices.push(0);
-            continue;
-        }
+        if a < 8 { indices.push(0); continue; }
         let key = [r, g, b];
-        let slot = palette_rgb.iter().position(|c| *c == key);
-        let idx = match slot {
+        let idx = match chosen.iter().position(|c| *c == key) {
             Some(i) => (i + 1) as u8,
             None => {
-                if palette_rgb.len() >= PALETTE_SIZE - 1 {
-                    return Err(anyhow!(
-                        "sheet {} has more than 4 opaque colors — reduce palette \
-                         before loading (NES discipline)", path.display()));
+                let mut best = 0usize;
+                let mut best_d = u32::MAX;
+                for (i, c) in chosen.iter().enumerate() {
+                    let dr = c[0] as i32 - r as i32;
+                    let dg = c[1] as i32 - g as i32;
+                    let db = c[2] as i32 - b as i32;
+                    let d = (dr * dr + dg * dg + db * db) as u32;
+                    if d < best_d { best_d = d; best = i; }
                 }
-                palette_rgb.push(key);
-                palette_rgb.len() as u8
+                (best + 1) as u8
             }
         };
         indices.push(idx);
     }
 
     let mut palette = [Color::Rgb(0, 0, 0); PALETTE_SIZE];
-    for (i, rgb) in palette_rgb.iter().enumerate() {
+    for (i, rgb) in chosen.iter().enumerate() {
         palette[i + 1] = Color::Rgb(rgb[0], rgb[1], rgb[2]);
     }
 

@@ -334,6 +334,8 @@ struct App {
     /// Pending count prefix (e.g. `4j`).
     count: u32,
     command_buf: String,
+    /// Byte index into `command_buf`. Always on a char boundary.
+    command_cursor: usize,
     status: String,
     playing: bool,
     /// Current playhead step, mirrored from the audio engine.
@@ -431,6 +433,7 @@ impl App {
             pending: Pending::None,
             count: 0,
             command_buf: String::new(),
+            command_cursor: 0,
             status: "demo loaded — space: play   ?: help   :new blank   :e <file.vip> open".into(),
             playing: true,
             play_step: 0,
@@ -1194,7 +1197,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":mute [N]",        "toggle mute on cursor channel (or N: 1-4 / pu1..noi)"),
         row(":unmute [N|off]",  "unmute specific / all channels"),
         row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites)"),
-        row(":sprite load P WxH", "load PNG sheet from P, cells W×H (≤4 colors)"),
+        row(":sprite load P WxH [q]", "load PNG sheet (≤3 opaque colors, or 'q' to quantize)"),
         row(":sprite place N I x y", "place sheet N's tile I at viz pixel (x,y)"),
         row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
         row(":sprite repalette N P", "apply palette P to sheet N"),
@@ -1443,16 +1446,29 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     left_spans.push(Span::raw("  "));
     left_spans.push(Span::raw(&app.status));
     let left = Line::from(left_spans);
-    let right = if app.mode == Mode::Command {
-        format!(":{}", app.command_buf)
+    let right_line = if app.mode == Mode::Command {
+        let buf = &app.command_buf;
+        let cur = app.command_cursor.min(buf.len());
+        let (before, rest) = buf.split_at(cur);
+        let (at, after) = match rest.chars().next() {
+            Some(c) => rest.split_at(c.len_utf8()),
+            None => (" ", ""),
+        };
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+        Line::from(vec![
+            Span::raw(":"),
+            Span::raw(before.to_string()),
+            Span::styled(at.to_string(), cursor_style),
+            Span::raw(after.to_string()),
+        ])
     } else if app.count > 0 || app.pending != Pending::None {
-        format!("{}{}",
+        Line::from(format!("{}{}",
             if app.count > 0 { app.count.to_string() } else { String::new() },
-            app.pending.display())
+            app.pending.display()))
     } else {
-        String::new()
+        Line::from(String::new())
     };
-    let content = vec![left, Line::from(right)];
+    let content = vec![left, right_line];
     f.render_widget(Paragraph::new(content), area);
 }
 
@@ -1745,6 +1761,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char(':') => {
             app.mode = Mode::Command;
             app.command_buf.clear();
+            app.command_cursor = 0;
         }
         KeyCode::Char(' ') => { perform(app, MacroOp::TogglePlay); }
         KeyCode::Char('q') if ctrl => { app.quit = true; }
@@ -1856,25 +1873,98 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_command(app: &mut App, key: KeyEvent) {
+    use crossterm::event::KeyModifiers;
     match key.code {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.command_buf.clear();
+            app.command_cursor = 0;
         }
         KeyCode::Enter => {
             let cmd = app.command_buf.trim().to_string();
             execute_command(app, &cmd);
             app.command_buf.clear();
+            app.command_cursor = 0;
             // Only fall back to Normal if the command didn't switch modes itself.
             if app.mode == Mode::Command {
                 app.mode = Mode::Normal;
             }
         }
-        KeyCode::Backspace => { app.command_buf.pop(); }
+        KeyCode::Backspace => {
+            if let Some(prev) = prev_char_boundary(&app.command_buf, app.command_cursor) {
+                app.command_buf.replace_range(prev..app.command_cursor, "");
+                app.command_cursor = prev;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(next) = next_char_boundary(&app.command_buf, app.command_cursor) {
+                app.command_buf.replace_range(app.command_cursor..next, "");
+            }
+        }
+        KeyCode::Left => {
+            if let Some(prev) = prev_char_boundary(&app.command_buf, app.command_cursor) {
+                app.command_cursor = prev;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(next) = next_char_boundary(&app.command_buf, app.command_cursor) {
+                app.command_cursor = next;
+            }
+        }
+        KeyCode::Home => { app.command_cursor = 0; }
+        KeyCode::End => { app.command_cursor = app.command_buf.len(); }
         KeyCode::Tab => { complete_path(app); }
-        KeyCode::Char(c) => { app.command_buf.push(c); }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match c {
+                'a' => { app.command_cursor = 0; }
+                'e' => { app.command_cursor = app.command_buf.len(); }
+                'b' => {
+                    if let Some(prev) = prev_char_boundary(&app.command_buf, app.command_cursor) {
+                        app.command_cursor = prev;
+                    }
+                }
+                'f' => {
+                    if let Some(next) = next_char_boundary(&app.command_buf, app.command_cursor) {
+                        app.command_cursor = next;
+                    }
+                }
+                'u' => {
+                    app.command_buf.replace_range(..app.command_cursor, "");
+                    app.command_cursor = 0;
+                }
+                'k' => { app.command_buf.truncate(app.command_cursor); }
+                'w' => { delete_word_back(app); }
+                _ => {}
+            }
+        }
+        KeyCode::Char(c) => {
+            app.command_buf.insert(app.command_cursor, c);
+            app.command_cursor += c.len_utf8();
+        }
         _ => {}
     }
+}
+
+fn prev_char_boundary(s: &str, byte: usize) -> Option<usize> {
+    if byte == 0 { return None; }
+    s[..byte].chars().next_back().map(|c| byte - c.len_utf8())
+}
+
+fn next_char_boundary(s: &str, byte: usize) -> Option<usize> {
+    if byte >= s.len() { return None; }
+    s[byte..].chars().next().map(|c| byte + c.len_utf8())
+}
+
+fn delete_word_back(app: &mut App) {
+    let end = app.command_cursor;
+    let bytes = app.command_buf.as_bytes();
+    let mut i = end;
+    // Skip trailing whitespace immediately before the cursor.
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() { i -= 1; }
+    // Then skip non-whitespace back to the previous word boundary.
+    while i > 0 && !bytes[i - 1].is_ascii_whitespace() { i -= 1; }
+    app.command_buf.replace_range(i..end, "");
+    app.command_cursor = i;
 }
 
 /// Single-shot prefix completion for `:w`, `:wq`, `:e` path args.
@@ -1890,7 +1980,10 @@ fn complete_path(app: &mut App) {
     // Only complete for file-taking commands.
     let cmd = head.trim();
     let want_vip = matches!(cmd, "e" | "edit");
-    if !matches!(cmd, "w" | "e" | "wq" | "edit" | "write") {
+    let want_png = matches!(cmd, "sprite load" | "sprites load");
+    if !matches!(cmd, "w" | "e" | "wq" | "edit" | "write")
+        && !want_png
+    {
         return;
     }
 
@@ -1909,6 +2002,7 @@ fn complete_path(app: &mut App) {
         if name.starts_with('.') && !name_prefix.starts_with('.') { continue; }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if want_vip && !is_dir && !name.ends_with(".vip") { continue; }
+        if want_png && !is_dir && !name.to_ascii_lowercase().ends_with(".png") { continue; }
         matches.push((name, is_dir));
     }
 
@@ -1928,6 +2022,7 @@ fn complete_path(app: &mut App) {
 
     let new_frag = format!("{}{}", display_dir, completed);
     app.command_buf = format!("{}{}", head, new_frag);
+    app.command_cursor = app.command_buf.len();
     if matches.len() > 1 {
         let preview: Vec<String> = matches
             .iter()
@@ -2050,10 +2145,14 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.status = format!("sprite: cleared {} placement{}",
                 n, if n == 1 { "" } else { "s" });
         }
-        ["sprite", "load", path] => sprite_load_cmd(app, path, None),
-        ["sprite", "load", path, cell] => sprite_load_cmd(app, path, Some(cell)),
-        ["sprites", "load", path] => sprite_load_cmd(app, path, None),
-        ["sprites", "load", path, cell] => sprite_load_cmd(app, path, Some(cell)),
+        ["sprite", "load", path] => sprite_load_cmd(app, path, None, false),
+        ["sprite", "load", path, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, None, true),
+        ["sprite", "load", path, cell] => sprite_load_cmd(app, path, Some(cell), false),
+        ["sprite", "load", path, cell, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, Some(cell), true),
+        ["sprites", "load", path] => sprite_load_cmd(app, path, None, false),
+        ["sprites", "load", path, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, None, true),
+        ["sprites", "load", path, cell] => sprite_load_cmd(app, path, Some(cell), false),
+        ["sprites", "load", path, cell, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, Some(cell), true),
         ["sprite", "place", name, idx, x, y] => sprite_place_cmd(app, name, idx, x, y),
         ["sprite", "palette", pname, c0, c1, c2, c3] =>
             sprite_palette_cmd(app, pname, &[c0, c1, c2, c3]),
@@ -2385,7 +2484,11 @@ fn parse_cell_dim(tok: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>) {
+fn is_quantize_flag(tok: &str) -> bool {
+    matches!(tok, "quantize" | "q" | "-q" | "--quantize")
+}
+
+fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>, quantize: bool) {
     let path = resolve_sprite_path(app, Path::new(path_str));
     // Default cell dimension: the full image — auto-derived after load.
     let (cw, ch) = match cell {
@@ -2414,11 +2517,12 @@ fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>) {
     } else {
         (cw, ch)
     };
-    match sprite::load_sheet(stem.clone(), &path, cw, ch) {
+    match sprite::load_sheet(stem.clone(), &path, cw, ch, quantize) {
         Ok(sheet) => {
+            let q_tag = if quantize { " [quantized]" } else { "" };
             app.status = format!(
-                "sprite: loaded {} ({}×{}, cells {}×{}, {} tiles)",
-                stem, sheet.width, sheet.height, cw, ch, sheet.cell_count(),
+                "sprite: loaded {} ({}×{}, cells {}×{}, {} tiles){}",
+                stem, sheet.width, sheet.height, cw, ch, sheet.cell_count(), q_tag,
             );
             app.sprite_sheets.insert(stem, sheet);
         }
@@ -2428,14 +2532,31 @@ fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>) {
     }
 }
 
-/// Resolve a sprite path: relative paths are anchored to the current song
-/// file's directory if one is loaded, so `.vip` files and their assets
-/// ship together naturally.
+/// Resolve a sprite path: `~` expands to `$HOME`, relative paths are
+/// anchored to the current song file's directory if one is loaded, so
+/// `.vip` files and their assets ship together naturally.
 fn resolve_sprite_path(app: &App, path: &Path) -> PathBuf {
-    if path.is_absolute() { return path.to_path_buf(); }
+    let expanded = expand_tilde(path);
+    if expanded.is_absolute() { return expanded; }
     if let Some(vip) = &app.current_file {
         if let Some(dir) = vip.parent() {
-            return dir.join(path);
+            return dir.join(&expanded);
+        }
+    }
+    expanded
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = match path.to_str() {
+        Some(s) => s,
+        None => return path.to_path_buf(),
+    };
+    if s == "~" {
+        return std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
         }
     }
     path.to_path_buf()
