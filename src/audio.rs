@@ -389,7 +389,12 @@ where
             let mut voices_out = [VoiceFrame::default(); CHANNELS];
             for (i, v) in voices.iter().enumerate() {
                 voices_out[i] = VoiceFrame {
-                    gate: !matches!(v.env, EnvPhase::Idle),
+                    // `gate` reports "note held" — Attack/Decay/Sustain only.
+                    // Release counts as note-off even though the envelope is
+                    // still audible, so modulation bindings on `ch.gate` fall
+                    // cleanly at note-off instead of latching on through the
+                    // release tail.
+                    gate: matches!(v.env, EnvPhase::Attack | EnvPhase::Decay | EnvPhase::Sustain),
                     env_level: v.level,
                     freq: v.freq,
                     vel: v.vel,

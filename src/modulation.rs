@@ -480,6 +480,100 @@ fn parse_source(name: &str) -> Result<Source> {
     bail!("unknown identifier '{}'", name)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{VizFrame, VoiceFrame};
+
+    fn ctx_with_voices(voices: [VoiceFrame; 4]) -> (VizFrame, ()) {
+        (VizFrame { playing: true, step: 3, step_phase: 0.5, voices }, ())
+    }
+
+    fn run(expr_src: &str, frame: &VizFrame) -> f32 {
+        let toks = tokenize(expr_src).unwrap();
+        let mut p = Parser { toks, i: 0 };
+        let expr = p.parse_expr().unwrap();
+        let ctx = EvalCtx {
+            frame,
+            tempo: 120.0,
+            scene_index: 2,
+            phrase: 2,
+            time_s: 1.0,
+        };
+        eval(&expr, &ctx)
+    }
+
+    #[test]
+    fn arithmetic() {
+        let (frame, _) = ctx_with_voices([VoiceFrame::default(); 4]);
+        assert_eq!(run("1 + 2 * 3", &frame), 7.0);
+        assert_eq!(run("(1 + 2) * 3", &frame), 9.0);
+        assert_eq!(run("10 % 3", &frame), 1.0);
+        assert_eq!(run("-5 + 2", &frame), -3.0);
+        assert_eq!(run("abs(-4)", &frame), 4.0);
+        assert_eq!(run("min(3, 5)", &frame), 3.0);
+        assert_eq!(run("clamp(10, 0, 5)", &frame), 5.0);
+    }
+
+    #[test]
+    fn sources() {
+        let voices = [
+            VoiceFrame { gate: true,  env_level: 0.8, freq: 440.0, vel: 1.0 },
+            VoiceFrame { gate: false, env_level: 0.0, freq: 0.0,   vel: 0.0 },
+            VoiceFrame { gate: true,  env_level: 0.5, freq: 220.0, vel: 0.5 },
+            VoiceFrame { gate: false, env_level: 0.0, freq: 0.0,   vel: 0.0 },
+        ];
+        let (frame, _) = ctx_with_voices(voices);
+        assert!((run("pu1.env", &frame) - 0.8).abs() < 1e-6);
+        assert_eq!(run("pu2.gate", &frame), 0.0);
+        assert_eq!(run("tri.gate", &frame), 1.0);
+        assert_eq!(run("pu1.pitch", &frame), 440.0);
+        assert_eq!(run("step", &frame), 3.0);
+        assert!((run("step_phase", &frame) - 0.5).abs() < 1e-6);
+        assert_eq!(run("tempo", &frame), 120.0);
+        assert_eq!(run("scene.index", &frame), 2.0);
+        assert_eq!(run("playing", &frame), 1.0);
+    }
+
+    #[test]
+    fn binding_parse_and_apply() {
+        let b = parse_binding("mario.0 scale = tri.env * 2 + 1").unwrap();
+        assert_eq!(b.sheet, "mario");
+        assert!(matches!(b.idx, IdxPat::Exact(0)));
+        assert_eq!(b.target, Target::Scale);
+        assert_eq!(b.expr_src, "tri.env * 2 + 1");
+
+        let wild = parse_binding("bg.* y = sin(time)").unwrap();
+        assert!(matches!(wild.idx, IdxPat::Wildcard));
+
+        // Apply: one placement, scale binding → scale = 0.5*2+1 = 2
+        let placements = vec![Placement {
+            sheet: "mario".into(), idx: 0, x: 10, y: 20, palette: None,
+        }];
+        let voices = [
+            VoiceFrame::default(),
+            VoiceFrame::default(),
+            VoiceFrame { gate: true, env_level: 0.5, freq: 0.0, vel: 1.0 },
+            VoiceFrame::default(),
+        ];
+        let frame = VizFrame { playing: false, step: 0, step_phase: 0.0, voices };
+        let ctx = EvalCtx { frame: &frame, tempo: 120.0, scene_index: 0, phrase: 0, time_s: 0.0 };
+        let eff = apply_bindings(&placements, &[b], &ctx);
+        assert_eq!(eff.len(), 1);
+        assert!((eff[0].scale - 2.0).abs() < 1e-6);
+        assert_eq!(eff[0].x, 10);
+    }
+
+    #[test]
+    fn error_messages() {
+        assert!(parse_binding("no equals here").is_err());
+        assert!(parse_binding("mario.0 badtarget = 1").is_err());
+        assert!(parse_binding("mario.0 x = 1 +").is_err());
+        assert!(parse_binding("mario.0 x = unknown.src").is_err());
+        assert!(parse_binding("mario.0 x = min(1)").is_err()); // wrong arity
+    }
+}
+
 /// Parse a full binding spec: `<sheet>.<idx|*> <target> = <expr>`.
 pub(crate) fn parse_binding(spec: &str) -> Result<Binding> {
     let (lhs, rhs) = spec
