@@ -56,6 +56,7 @@ enum VoiceField {
     Pitch,
     Gate,
     Vel,
+    Age,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +156,10 @@ pub(crate) struct EvalCtx<'a> {
     pub scene_index: i32,
     pub phrase: i32,
     pub time_s: f32,
+    /// Seconds since the last note-on edge per channel. Very large when
+    /// no note has fired yet, so `<ch>.age < 0.5`-style thresholds behave
+    /// correctly on startup.
+    pub voice_ages: [f32; crate::CHANNELS],
 }
 
 fn eval(expr: &Expr, ctx: &EvalCtx) -> f32 {
@@ -200,6 +205,7 @@ fn eval(expr: &Expr, ctx: &EvalCtx) -> f32 {
                         if v[*ch].gate { 1.0 } else { 0.0 }
                     }
                     VoiceField::Vel => v[*ch].vel,
+                    VoiceField::Age => ctx.voice_ages[*ch],
                 },
                 Source::MasterRms => {
                     let mut sum = 0.0_f32;
@@ -473,6 +479,7 @@ fn parse_source(name: &str) -> Result<Source> {
             "pitch" | "freq" => VoiceField::Pitch,
             "gate" => VoiceField::Gate,
             "vel" => VoiceField::Vel,
+            "age" => VoiceField::Age,
             _ => bail!("unknown field '{}' on voice '{}'", field, ch_name),
         };
         return Ok(Source::Voice(ch, f));
@@ -499,6 +506,7 @@ mod tests {
             scene_index: 2,
             phrase: 2,
             time_s: 1.0,
+            voice_ages: [0.25, 0.5, 1.0, 10.0],
         };
         eval(&expr, &ctx)
     }
@@ -557,11 +565,25 @@ mod tests {
             VoiceFrame::default(),
         ];
         let frame = VizFrame { playing: false, step: 0, step_phase: 0.0, voices };
-        let ctx = EvalCtx { frame: &frame, tempo: 120.0, scene_index: 0, phrase: 0, time_s: 0.0 };
+        let ctx = EvalCtx {
+            frame: &frame, tempo: 120.0, scene_index: 0, phrase: 0,
+            time_s: 0.0, voice_ages: [0.0; 4],
+        };
         let eff = apply_bindings(&placements, &[b], &ctx);
         assert_eq!(eff.len(), 1);
         assert!((eff[0].scale - 2.0).abs() < 1e-6);
         assert_eq!(eff[0].x, 10);
+    }
+
+    #[test]
+    fn voice_age() {
+        let (frame, _) = ctx_with_voices([VoiceFrame::default(); 4]);
+        // voice_ages in `run` ctx = [0.25, 0.5, 1.0, 10.0] → pu1/pu2/tri/noi.
+        assert!((run("pu1.age", &frame) - 0.25).abs() < 1e-6);
+        assert!((run("noi.age", &frame) - 10.0).abs() < 1e-6);
+        // Classic "one-shot animation after NOI hits" frame expression.
+        assert_eq!(run("clamp(floor(noi.age * 16), 0, 3)", &frame), 3.0);
+        assert_eq!(run("clamp(floor(pu1.age * 16), 0, 3)", &frame), 3.0); // 0.25*16=4, clamped to 3
     }
 
     #[test]

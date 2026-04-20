@@ -405,6 +405,12 @@ struct App {
     /// Stage 9: latest per-voice snapshot from the audio thread. Single slot;
     /// `sync_audio` copies it out of the Transport mutex each UI tick.
     viz_frame: audio::VizFrame,
+    /// Stage 13: seconds since the last note-on edge per channel. Starts
+    /// very negative so fresh `.age` reads are "long ago" before any note
+    /// has played.
+    voice_last_on: [f32; CHANNELS],
+    /// Previous-tick gate state for edge detection.
+    prev_gates: [bool; CHANNELS],
     /// Stage 10: visualizer pane toggle + selected viz kind. Hidden by
     /// default; `:viz` toggles, `:viz <kind>` picks and shows.
     show_viz: bool,
@@ -469,6 +475,8 @@ impl App {
             recording_macro: None,
             last_macro: None,
             viz_frame: audio::VizFrame::default(),
+            voice_last_on: [-1.0e9; CHANNELS],
+            prev_gates: [false; CHANNELS],
             show_viz: false,
             viz_kind: viz::VizKind::Bars,
             viz_tick: 0,
@@ -1210,6 +1218,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":sprite repalette N P", "apply palette P to sheet N"),
         row(":sprite list / clear", "list loaded sheets / remove placements"),
         row(":bind S.N|* T = EXPR", "modulate sprite S placement N (or '*'): T = x/y/scale/flipx/flipy/frame/visible"),
+        row("  sources", "<ch>.env/.pitch/.gate/.vel/.age, master.rms, step/beat/bar/time/tempo/scene.index"),
         row(":bind list / clear / del N", "inspect / drop all / remove binding N"),
         row(":scene N save",    "bind current phrase to slot N (1-9)"),
         row(":scene N",         "queue / launch scene N (clears slot with :scene N clear)"),
@@ -3113,6 +3122,22 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         app.viz_frame = tr.frame;
     }
     app.viz_tick = app.viz_tick.wrapping_add(1);
+    let time_s = app.viz_tick as f32 / 60.0;
+    // Stage 13: detect note-on edges and stamp the per-voice "last on" time.
+    // Paired with EvalCtx::voice_ages, this gives `<ch>.age = seconds since
+    // last trigger`, which composes with the expression language to produce
+    // event-driven animations without a separate state-machine DSL.
+    for ch in 0..CHANNELS {
+        let g = app.viz_frame.voices[ch].gate;
+        if g && !app.prev_gates[ch] {
+            app.voice_last_on[ch] = time_s;
+        }
+        app.prev_gates[ch] = g;
+    }
+    let mut voice_ages = [f32::MAX; CHANNELS];
+    for ch in 0..CHANNELS {
+        voice_ages[ch] = (time_s - app.voice_last_on[ch]).max(0.0);
+    }
     // Stage 12: fold binding overrides onto each placement once per UI tick.
     // Always computed (even without bindings) so the viz renderer has a
     // single input shape.
@@ -3121,7 +3146,8 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tempo: app.song.bpm as f32,
         scene_index: app.song.current_phrase as i32,
         phrase: app.song.current_phrase as i32,
-        time_s: app.viz_tick as f32 / 60.0,
+        time_s,
+        voice_ages,
     };
     app.effective_placements = modulation::apply_bindings(
         &app.sprite_placements,
