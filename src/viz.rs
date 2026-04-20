@@ -59,6 +59,7 @@ pub(crate) struct VizCtx<'a> {
     pub sheets: &'a HashMap<String, SpriteSheet>,
     pub placements: &'a [crate::modulation::EffectivePlacement],
     pub palettes: &'a HashMap<String, [Color; PALETTE_SIZE]>,
+    pub bg: Color,
 }
 
 /// Per-channel palette. NES-ish: green pulse, amber pulse, violet triangle,
@@ -89,7 +90,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, kind: VizKind, ctx: &VizCtx) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(Color::DarkGray).bg(ctx.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -384,9 +385,12 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
     if ctx.placements.is_empty() {
         let hint = Line::from(Span::styled(
             "no placements — :sprite load <path> [WxH] then :sprite place <name> <idx> <x> <y>",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray).bg(ctx.bg),
         ));
-        f.render_widget(Paragraph::new(hint), area);
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().bg(ctx.bg)),
+            area,
+        );
         return;
     }
 
@@ -484,6 +488,7 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
         }
     }
 
+    let bg = ctx.bg;
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
     for row in 0..rows {
         let upper = &grid[2 * row];
@@ -493,15 +498,15 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
             let (u, l) = (upper[x], lower[x]);
             let (glyph, style) = match (u, l) {
                 (Some(a), Some(b)) => ("▀", Style::default().fg(a).bg(b)),
-                (Some(a), None) => ("▀", Style::default().fg(a)),
-                (None, Some(b)) => ("▄", Style::default().fg(b)),
-                (None, None) => (" ", Style::default()),
+                (Some(a), None) => ("▀", Style::default().fg(a).bg(bg)),
+                (None, Some(b)) => ("▄", Style::default().fg(b).bg(bg)),
+                (None, None) => (" ", Style::default().bg(bg)),
             };
             spans.push(Span::styled(glyph.to_string(), style));
         }
         lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(bg)), area);
 }
 
 /// Stage 12.1: shift a color in HSV space. `hue_deg` rotates hue (wraps

@@ -166,10 +166,23 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
   thresholds-from-scratch behave correctly. A real `:anim` / `:trigger`
   DSL (named states, sequenced transitions) is deferred — the expression
   form covers the musically-triggered case cleanly.
-- **Stage 14 — Optional native window backend** (feature flag `window`). Same viz, rendered to a real GPU-accelerated window via `pixels` or `macroquad`. Same bindings, more pixels, optional shaders.
-
 ### Export & polish
 
-- **Stage 15 — Export.** `:bounce out.wav` renders to WAV. `:midi out.mid` exports MIDI. `:render out.mp4` records the viz synced to the bounce.
+- **Stage 15a** ✅ — Offline WAV bounce. `:bounce <path> [loops]` renders
+  the current phrase to 16-bit mono 44.1kHz PCM WAV without touching any
+  audio driver — a `bounce_to_wav` fn reuses the live `Voice`/`EnvPhase`
+  synth and the same `spb` step scheduler, then keeps rendering after the
+  last step until every voice is Idle (capped at 2s) so release tails
+  finish cleanly. Hand-rolled WAV writer (RIFF + fmt + data chunks); no
+  hound dep. Resolves `~` and anchors relative paths to the current `.vip`
+  file's directory, same as `:sprite load`.
+- **Stage 15b** ✅ — MIDI export. `:midi <path> [loops]` writes a format-1
+  Standard MIDI File with a conductor track (tempo) plus one track per
+  channel. PU1/PU2/TRI → MIDI channels 0/1/2; NOI → channel 10 (GM drums)
+  with a small pitch→slot remap (low=kick, mid=snare, high=hat) so the
+  demo's 36/50/60 land on GM 36/38/42 and sound right in any DAW. Hand-
+  rolled SMF writer, no midly dep — VLQ, MThd/MTrk chunks, note-offs
+  ordered before note-ons at the same tick to survive same-tick retriggers.
+- Possible later: `:render out.mp4` recording the viz synced to the bounce.
 - **Stage 16 — Song mode.** Phrases → chains → song, groove/swing, per-channel track length (polymeter).
 - **Stage 17 — Plugin voices.** Load external SID/VRC6/FDS emulator cores as additional voice types for that extended-chip flavor.

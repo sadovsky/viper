@@ -5,6 +5,7 @@
 
 mod audio;
 mod gen;
+mod midi;
 mod modulation;
 mod sprite;
 mod vip;
@@ -882,6 +883,9 @@ struct Theme {
     instr_row_fg: Color,
     instr_value: Color,
     instr_label: Color,
+
+    // Visualizer
+    viz_bg: Color,
 }
 
 impl Theme {
@@ -916,6 +920,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Green,
         instr_label: Color::Gray,
+        viz_bg: Color::Rgb(12, 12, 24),
     };
 
     // Amber-on-black CRT. Three tiers of amber (bright/mid/dark) + black.
@@ -950,6 +955,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Rgb(255, 220, 120),
         instr_label: Color::Rgb(200, 130, 0),
+        viz_bg: Color::Rgb(10, 5, 0),
     };
 
     fn by_name(n: &str) -> Option<Self> {
@@ -1526,6 +1532,7 @@ fn ui(f: &mut Frame, app: &App) {
             sheets: &app.sprite_sheets,
             placements: &app.effective_placements,
             palettes: &app.sprite_palettes,
+            bg: app.theme.viz_bg,
         };
         viz::render(f, area, app.viz_kind, &ctx);
     }
@@ -2254,6 +2261,16 @@ fn execute_command(app: &mut App, cmd: &str) {
             let joined = format!("{}{}", cmd, param);
             set_cursor_fx(app, &joined);
         }
+        ["bounce", path] => bounce_cmd(app, path, 1),
+        ["bounce", path, loops] => match loops.parse::<u32>() {
+            Ok(n) if n >= 1 => bounce_cmd(app, path, n),
+            _ => app.status = format!("bounce: bad loop count '{}'", loops),
+        },
+        ["midi", path] => midi_cmd(app, path, 1),
+        ["midi", path, loops] => match loops.parse::<u32>() {
+            Ok(n) if n >= 1 => midi_cmd(app, path, n),
+            _ => app.status = format!("midi: bad loop count '{}'", loops),
+        },
         ["gen", rest @ ..] => {
             app.snapshot();
             let seed = app.gen_seed;
@@ -2518,6 +2535,10 @@ fn bind_command(app: &mut App, rest: &str) {
         }
         return;
     }
+    if rest == "demo" || rest.starts_with("demo ") {
+        bind_demo(app, rest.strip_prefix("demo").unwrap().trim());
+        return;
+    }
     match modulation::parse_binding(rest) {
         Ok(b) => {
             app.status = format!("bound {} {} = {}", b.addr(), b.target.name(), b.expr_src);
@@ -2525,6 +2546,50 @@ fn bind_command(app: &mut App, rest: &str) {
         }
         Err(e) => app.status = format!("bind: {}", e),
     }
+}
+
+/// Apply a canned suite of bindings to a sheet — the set we use to smoke-
+/// test every modulation target at once. Picks the first placed sheet if
+/// no name is given; replaces any bindings already attached to that sheet.
+fn bind_demo(app: &mut App, arg: &str) {
+    let sheet = if arg.is_empty() {
+        match app.sprite_placements.first().map(|p| p.sheet.clone()) {
+            Some(s) => s,
+            None => {
+                app.status = "bind demo: no placements — :sprite place <sheet> …".into();
+                return;
+            }
+        }
+    } else {
+        arg.to_string()
+    };
+    if !app.sprite_sheets.contains_key(&sheet) {
+        app.status = format!("bind demo: unknown sheet '{}'", sheet);
+        return;
+    }
+
+    app.bindings.retain(|b| b.sheet != sheet);
+
+    let exprs = [
+        "y = sin(time * 4) * 6",
+        "scale = pu1.env * 1.5 + 1",
+        "flipx = tri.gate",
+        "rotate = sin(time * 2) * 15",
+        "hue = master.rms * 180",
+        "frame = clamp(floor(noi.age * 16), 0, 3)",
+    ];
+    let mut added = 0usize;
+    for e in exprs {
+        let full = format!("{} {}", sheet, e);
+        match modulation::parse_binding(&full) {
+            Ok(b) => { app.bindings.push(b); added += 1; }
+            Err(err) => {
+                app.status = format!("bind demo: parse error on '{}': {}", e, err);
+                return;
+            }
+        }
+    }
+    app.status = format!("bind demo: {} bindings on {}", added, sheet);
 }
 
 // ---------- Stage 11: sprite commands ----------
@@ -2588,9 +2653,26 @@ fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>, quantize:
     match sprite::load_sheet(stem.clone(), &path, cw, ch, quantize) {
         Ok(sheet) => {
             let q_tag = if quantize { " [quantized]" } else { "" };
+            let tiles = sheet.cell_count();
+            // Auto-place at (0,0) on first load so `:viz sprites` shows
+            // something immediately. A user who already has placements
+            // for this sheet keeps them; otherwise we drop in frame 0.
+            let already_placed = app.sprite_placements.iter().any(|p| p.sheet == stem);
+            let auto_tag = if already_placed {
+                ""
+            } else {
+                app.sprite_placements.push(sprite::Placement {
+                    sheet: stem.clone(),
+                    idx: 0,
+                    x: 0,
+                    y: 0,
+                    palette: None,
+                });
+                " [placed 0,0]"
+            };
             app.status = format!(
-                "sprite: loaded {} ({}×{}, cells {}×{}, {} tiles){}",
-                stem, sheet.width, sheet.height, cw, ch, sheet.cell_count(), q_tag,
+                "sprite: loaded {} ({}×{}, cells {}×{}, {} tiles){}{}",
+                stem, sheet.width, sheet.height, cw, ch, tiles, q_tag, auto_tag,
             );
             app.sprite_sheets.insert(stem, sheet);
         }
@@ -2904,6 +2986,56 @@ fn delete_phrase_cmd(app: &mut App) {
 // ---------- File I/O helpers ----------
 
 /// Returns `true` on a successful write. Sets `app.status` either way.
+/// Stage 15a: offline WAV bounce of the current phrase. Resolves `~` and
+/// relative paths the same way sprite loading does, renders at 44.1kHz
+/// 16-bit mono, N loops of the phrase + release tail.
+fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
+    let path = resolve_sprite_path(app, Path::new(path_str));
+    let phrase = match app.song.phrases.get(app.song.current_phrase) {
+        Some(p) => p.clone(),
+        None => {
+            app.status = "bounce: no phrase loaded".into();
+            return;
+        }
+    };
+    const SR: u32 = 44100;
+    match audio::bounce_to_wav(
+        &path, &phrase, &app.song.instruments, app.song.bpm, loops, SR,
+    ) {
+        Ok(frames) => {
+            let secs = frames as f32 / SR as f32;
+            app.status = format!(
+                "bounce: {} ({}× loop, {:.2}s @ {}Hz)",
+                path.display(), loops, secs, SR,
+            );
+        }
+        Err(e) => app.status = format!("bounce: {}", e),
+    }
+}
+
+/// Stage 15b: MIDI export of the current phrase. Same path conventions
+/// as `:bounce`. Tracks: conductor (tempo) + PU1 / PU2 / TRI / NOI.
+/// NOI is routed to MIDI channel 10 (GM drum map) with a kick/snare/hat
+/// remap based on pitch.
+fn midi_cmd(app: &mut App, path_str: &str, loops: u32) {
+    let path = resolve_sprite_path(app, Path::new(path_str));
+    let phrase = match app.song.phrases.get(app.song.current_phrase) {
+        Some(p) => p.clone(),
+        None => {
+            app.status = "midi: no phrase loaded".into();
+            return;
+        }
+    };
+    match midi::export_phrase_to_midi(
+        &path, &phrase, &app.song.instruments, app.song.bpm, loops,
+    ) {
+        Ok(()) => {
+            app.status = format!("midi: {} ({}× loop)", path.display(), loops);
+        }
+        Err(e) => app.status = format!("midi: {}", e),
+    }
+}
+
 fn write_current(app: &mut App) -> bool {
     let Some(path) = app.current_file.clone() else {
         app.status = "error: no filename (use :w <path>)".into();

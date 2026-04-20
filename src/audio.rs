@@ -4,6 +4,9 @@
 //! Stage 5: live gate events — UI can push realtime gate_on/off while stopped.
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -258,6 +261,114 @@ impl AudioEngine {
     }
 }
 
+/// Stage 15a: render `phrase` to 16-bit mono PCM WAV at `path`, offline.
+/// Mirrors the realtime step scheduler (same `spb`, same voice model), then
+/// keeps rendering after the last step until every voice is Idle or we hit
+/// a 2-second tail cap — ensures release tails finish cleanly. Returns the
+/// number of audio frames written.
+pub fn bounce_to_wav(
+    path: &Path,
+    phrase: &Phrase,
+    instruments: &[Instrument; INSTRUMENTS],
+    bpm: u16,
+    loops: u32,
+    sample_rate: u32,
+) -> Result<u32> {
+    if loops == 0 {
+        bail!("bounce: loops must be ≥ 1");
+    }
+    let sr_f = sample_rate as f32;
+    let spb = (sr_f * 60.0 / bpm.max(1) as f32 / 4.0).max(1.0) as u32;
+    let total_steps = (loops as usize).saturating_mul(STEPS_PER_PHRASE);
+    let tail_cap = sample_rate * 2;
+
+    let mut voices: [Voice; CHANNELS] = [
+        Voice::new(0),
+        Voice::new(1),
+        Voice::new(2),
+        Voice::new(3),
+    ];
+    let mut samples: Vec<f32> = Vec::with_capacity(
+        (total_steps as u64 * spb as u64).min(u32::MAX as u64) as usize
+    );
+
+    let render_sample = |voices: &mut [Voice; CHANNELS], samples: &mut Vec<f32>| {
+        let mut mix = 0.0f32;
+        for v in voices.iter_mut() {
+            mix += v.tick(sr_f);
+        }
+        samples.push((mix * 0.2).clamp(-1.0, 1.0));
+    };
+
+    for global_step in 0..total_steps {
+        let step = global_step % STEPS_PER_PHRASE;
+        for (ch, v) in voices.iter_mut().enumerate() {
+            let cell = phrase.cells[step][ch];
+            if let Some(n) = cell.note {
+                let idx = (cell.instr as usize).min(INSTRUMENTS - 1);
+                let vel = if cell.vol == 0 { 1.0 } else { (cell.vol as f32 / 15.0).min(1.0) };
+                v.gate_on(midi_to_hz(n), instruments[idx], vel);
+            } else {
+                v.gate_off();
+            }
+        }
+        for _ in 0..spb {
+            render_sample(&mut voices, &mut samples);
+        }
+    }
+    // Release-tail rendering: gate every voice off, then keep ticking until
+    // they all settle or we hit the cap (prevents runaway release times).
+    for v in voices.iter_mut() {
+        v.gate_off();
+    }
+    let mut tail = 0u32;
+    while tail < tail_cap
+        && voices.iter().any(|v| !matches!(v.env, EnvPhase::Idle))
+    {
+        render_sample(&mut voices, &mut samples);
+        tail += 1;
+    }
+
+    write_wav_pcm16_mono(path, sample_rate, &samples)?;
+    Ok(samples.len() as u32)
+}
+
+/// Minimal 16-bit PCM mono WAV writer — RIFF header + fmt chunk + data chunk.
+/// No compression, no extra fmt bytes. Clamps input to [-1, 1] before scaling
+/// to i16.
+fn write_wav_pcm16_mono(path: &Path, sample_rate: u32, samples: &[f32]) -> Result<()> {
+    let f = File::create(path)
+        .with_context(|| format!("bounce: create {}", path.display()))?;
+    let mut w = BufWriter::new(f);
+    let num_channels: u16 = 1;
+    let bits: u16 = 16;
+    let block_align = num_channels * bits / 8;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_size = (samples.len() as u32).saturating_mul(block_align as u32);
+    let riff_size = 36 + data_size;
+
+    w.write_all(b"RIFF")?;
+    w.write_all(&riff_size.to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?;            // PCM
+    w.write_all(&num_channels.to_le_bytes())?;
+    w.write_all(&sample_rate.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&bits.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_size.to_le_bytes())?;
+    for s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let v = (clamped * i16::MAX as f32).round() as i16;
+        w.write_all(&v.to_le_bytes())?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -411,4 +522,67 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Cell, Phrase};
+
+    fn demo_phrase() -> Phrase {
+        let mut p = Phrase::default();
+        // PU1 hit on step 0, step 4, step 8, step 12.
+        for s in (0..STEPS_PER_PHRASE).step_by(4) {
+            p.cells[s][0] = Cell {
+                note: Some(60 + (s as u8 % 12)),
+                instr: 0,
+                vol: 0,
+                fx: None,
+            };
+        }
+        // NOI hit every step (kick).
+        for s in 0..STEPS_PER_PHRASE {
+            p.cells[s][3] = Cell { note: Some(40), instr: 0, vol: 0, fx: None };
+        }
+        p
+    }
+
+    #[test]
+    fn bounce_writes_valid_wav_header_and_nonzero_audio() {
+        let path = std::env::temp_dir().join("viper_bounce_test.wav");
+        let _ = std::fs::remove_file(&path);
+        let instr = [Instrument::default(); INSTRUMENTS];
+        let phrase = demo_phrase();
+        let frames = bounce_to_wav(&path, &phrase, &instr, 140, 1, 44_100)
+            .expect("bounce should succeed");
+
+        // At 140 BPM, 16 steps = 60/140 * 4 = ~1.714 sec, plus release tail.
+        // 44100 * 1.7 ≈ 75k frames — anything under 60k would be suspicious.
+        assert!(frames > 60_000, "too few frames: {}", frames);
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"fmt ");
+        assert_eq!(&bytes[36..40], b"data");
+
+        // Count non-zero samples — silence would fail this.
+        let data = &bytes[44..];
+        let nonzero = data
+            .chunks(2)
+            .filter(|c| i16::from_le_bytes([c[0], c[1]]) != 0)
+            .count();
+        assert!(nonzero > 1000, "too few non-zero samples: {}", nonzero);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounce_rejects_zero_loops() {
+        let path = std::env::temp_dir().join("viper_bounce_zero.wav");
+        let instr = [Instrument::default(); INSTRUMENTS];
+        let err = bounce_to_wav(&path, &Phrase::default(), &instr, 140, 0, 44_100)
+            .expect_err("zero loops should fail");
+        assert!(err.to_string().contains("loops"));
+    }
 }
