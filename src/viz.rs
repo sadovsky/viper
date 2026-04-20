@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::audio::VizFrame;
-use crate::sprite::{Placement, SpriteSheet, PALETTE_SIZE};
+use crate::sprite::{SpriteSheet, PALETTE_SIZE};
 use crate::CHANNELS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub(crate) struct VizCtx<'a> {
     pub frame: &'a VizFrame,
     pub tick: u32,
     pub sheets: &'a HashMap<String, SpriteSheet>,
-    pub placements: &'a [Placement],
+    pub placements: &'a [crate::modulation::EffectivePlacement],
     pub palettes: &'a HashMap<String, [Color; PALETTE_SIZE]>,
 }
 
@@ -393,6 +393,7 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
     let mut grid: Vec<Vec<Option<Color>>> = vec![vec![None; cols]; pixels];
 
     for p in ctx.placements {
+        if !p.visible { continue; }
         let Some(sheet) = ctx.sheets.get(&p.sheet) else { continue; };
         // Palette override via named palette, else the sheet's own.
         let palette = p
@@ -400,17 +401,33 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
             .as_ref()
             .and_then(|n| ctx.palettes.get(n).copied())
             .unwrap_or(sheet.palette);
-        for py in 0..sheet.cell_h {
-            for px in 0..sheet.cell_w {
-                let Some(idx) = sheet.pixel(p.idx, px, py) else { continue; };
-                if idx == 0 { continue; } // transparent
+
+        // Wrap frame-index modulation past the sheet's cell count.
+        let frame = if sheet.cell_count() == 0 { 0 } else { p.idx % sheet.cell_count() };
+        let cw = sheet.cell_w;
+        let ch = sheet.cell_h;
+        let scale = p.scale.max(0.01);
+        let out_w = ((cw as f32) * scale).round().max(1.0) as i32;
+        let out_h = ((ch as f32) * scale).round().max(1.0) as i32;
+
+        for dy in 0..out_h {
+            for dx in 0..out_w {
+                // Source cell coord (nearest-neighbor for non-unit scales).
+                let mut sx_src = ((dx as f32) / scale) as u32;
+                let mut sy_src = ((dy as f32) / scale) as u32;
+                if sx_src >= cw { sx_src = cw - 1; }
+                if sy_src >= ch { sy_src = ch - 1; }
+                let sx_cell = if p.flipx { cw - 1 - sx_src } else { sx_src };
+                let sy_cell = if p.flipy { ch - 1 - sy_src } else { sy_src };
+                let Some(idx) = sheet.pixel(frame, sx_cell, sy_cell) else { continue; };
+                if idx == 0 { continue; }
                 let color = palette[idx as usize];
-                let sx = p.x + px as i32;
-                let sy = p.y + py as i32;
-                if sx < 0 || sy < 0 { continue; }
-                let (sx, sy) = (sx as usize, sy as usize);
-                if sx >= cols || sy >= pixels { continue; }
-                grid[sy][sx] = Some(color);
+                let ox = p.x + dx;
+                let oy = p.y + dy;
+                if ox < 0 || oy < 0 { continue; }
+                let (ox, oy) = (ox as usize, oy as usize);
+                if ox >= cols || oy >= pixels { continue; }
+                grid[oy][ox] = Some(color);
             }
         }
     }

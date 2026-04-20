@@ -5,6 +5,7 @@
 
 mod audio;
 mod gen;
+mod modulation;
 mod sprite;
 mod vip;
 mod viz;
@@ -420,6 +421,10 @@ struct App {
     /// User-defined 4-color palettes keyed by name. Used to recolor
     /// sheets without reloading the source PNG.
     sprite_palettes: HashMap<String, [ratatui::style::Color; sprite::PALETTE_SIZE]>,
+    /// Stage 12: modulation bindings tie audio sources to sprite props.
+    bindings: Vec<modulation::Binding>,
+    /// Derived each frame from placements + bindings; what the viz pane draws.
+    effective_placements: Vec<modulation::EffectivePlacement>,
     quit: bool,
 }
 
@@ -470,6 +475,8 @@ impl App {
             sprite_sheets: HashMap::new(),
             sprite_placements: Vec::new(),
             sprite_palettes: HashMap::new(),
+            bindings: Vec::new(),
+            effective_placements: Vec::new(),
             quit: false,
         }
     }
@@ -1202,6 +1209,8 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
         row(":sprite repalette N P", "apply palette P to sheet N"),
         row(":sprite list / clear", "list loaded sheets / remove placements"),
+        row(":bind S.N|* T = EXPR", "modulate sprite S placement N (or '*'): T = x/y/scale/flipx/flipy/frame/visible"),
+        row(":bind list / clear / del N", "inspect / drop all / remove binding N"),
         row(":scene N save",    "bind current phrase to slot N (1-9)"),
         row(":scene N",         "queue / launch scene N (clears slot with :scene N clear)"),
         row(":scene off",       "cancel queued scene launch"),
@@ -1506,7 +1515,7 @@ fn ui(f: &mut Frame, app: &App) {
             frame: &app.viz_frame,
             tick: app.viz_tick,
             sheets: &app.sprite_sheets,
-            placements: &app.sprite_placements,
+            placements: &app.effective_placements,
             palettes: &app.sprite_palettes,
         };
         viz::render(f, area, app.viz_kind, &ctx);
@@ -2086,6 +2095,16 @@ fn longest_common_prefix<'a, I: IntoIterator<Item = &'a str>>(strs: I) -> String
 }
 
 fn execute_command(app: &mut App, cmd: &str) {
+    // `:bind` takes a free-form expression (with '=', whitespace, operators)
+    // that doesn't map onto slice-pattern tokenization; peel it off first.
+    if let Some(rest) = cmd.strip_prefix("bind ").or_else(|| cmd.strip_prefix("bind\t")) {
+        bind_command(app, rest.trim());
+        return;
+    }
+    if cmd.trim() == "bind" {
+        bind_command(app, "");
+        return;
+    }
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     match parts.as_slice() {
         ["q"] | ["q!"] | ["quit"] | ["quit!"] => { app.quit = true; }
@@ -2456,6 +2475,46 @@ fn channel_name(ch: usize) -> &'static str {
         2 => "TRI",
         3 => "NOI",
         _ => "???",
+    }
+}
+
+// ---------- Stage 12: modulation bindings ----------
+
+fn bind_command(app: &mut App, rest: &str) {
+    if rest.is_empty() || rest == "list" {
+        if app.bindings.is_empty() {
+            app.status = "bind: none — :bind <sheet>.<N|*> <target> = <expr>".into();
+            return;
+        }
+        let lines: Vec<String> = app.bindings.iter().enumerate()
+            .map(|(i, b)| format!("{}:{} {}={}", i, b.addr(), b.target.name(), b.expr_src))
+            .collect();
+        app.status = format!("bindings: {}", lines.join(" | "));
+        return;
+    }
+    if rest == "clear" || rest == "off" {
+        let n = app.bindings.len();
+        app.bindings.clear();
+        app.status = format!("bind: cleared {} binding{}", n, if n == 1 { "" } else { "s" });
+        return;
+    }
+    if let Some(idx_s) = rest.strip_prefix("del ").or_else(|| rest.strip_prefix("rm ")) {
+        match idx_s.trim().parse::<usize>() {
+            Ok(i) if i < app.bindings.len() => {
+                let removed = app.bindings.remove(i);
+                app.status = format!("bind: removed {} {}={}",
+                    removed.addr(), removed.target.name(), removed.expr_src);
+            }
+            _ => app.status = format!("bind: bad index '{}'", idx_s.trim()),
+        }
+        return;
+    }
+    match modulation::parse_binding(rest) {
+        Ok(b) => {
+            app.status = format!("bound {} {} = {}", b.addr(), b.target.name(), b.expr_src);
+            app.bindings.push(b);
+        }
+        Err(e) => app.status = format!("bind: {}", e),
     }
 }
 
@@ -3054,6 +3113,21 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         app.viz_frame = tr.frame;
     }
     app.viz_tick = app.viz_tick.wrapping_add(1);
+    // Stage 12: fold binding overrides onto each placement once per UI tick.
+    // Always computed (even without bindings) so the viz renderer has a
+    // single input shape.
+    let eval_ctx = modulation::EvalCtx {
+        frame: &app.viz_frame,
+        tempo: app.song.bpm as f32,
+        scene_index: app.song.current_phrase as i32,
+        phrase: app.song.current_phrase as i32,
+        time_s: app.viz_tick as f32 / 60.0,
+    };
+    app.effective_placements = modulation::apply_bindings(
+        &app.sprite_placements,
+        &app.bindings,
+        &eval_ctx,
+    );
     // Stage 7: fire any queued scene launch at the next bar boundary. We
     // detect the boundary by comparing to `prev_play_step` so we fire once
     // per crossing, not once per frame.
