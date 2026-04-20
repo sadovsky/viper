@@ -407,27 +407,79 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
         let cw = sheet.cell_w;
         let ch = sheet.cell_h;
         let scale = p.scale.max(0.01);
-        let out_w = ((cw as f32) * scale).round().max(1.0) as i32;
-        let out_h = ((ch as f32) * scale).round().max(1.0) as i32;
+        let identity_color = p.hue_shift == 0.0 && p.saturation == 1.0 && p.value == 1.0;
 
-        for dy in 0..out_h {
-            for dx in 0..out_w {
-                // Source cell coord (nearest-neighbor for non-unit scales).
-                let mut sx_src = ((dx as f32) / scale) as u32;
-                let mut sy_src = ((dy as f32) / scale) as u32;
-                if sx_src >= cw { sx_src = cw - 1; }
-                if sy_src >= ch { sy_src = ch - 1; }
-                let sx_cell = if p.flipx { cw - 1 - sx_src } else { sx_src };
-                let sy_cell = if p.flipy { ch - 1 - sy_src } else { sy_src };
-                let Some(idx) = sheet.pixel(frame, sx_cell, sy_cell) else { continue; };
-                if idx == 0 { continue; }
-                let color = palette[idx as usize];
-                let ox = p.x + dx;
-                let oy = p.y + dy;
-                if ox < 0 || oy < 0 { continue; }
-                let (ox, oy) = (ox as usize, oy as usize);
-                if ox >= cols || oy >= pixels { continue; }
-                grid[oy][ox] = Some(color);
+        if p.rotate == 0.0 {
+            // Fast axis-aligned path — unchanged from Stage 11/12 plus an
+            // optional HSV color transform on the way to the grid.
+            let out_w = ((cw as f32) * scale).round().max(1.0) as i32;
+            let out_h = ((ch as f32) * scale).round().max(1.0) as i32;
+            for dy in 0..out_h {
+                for dx in 0..out_w {
+                    let mut sx_src = ((dx as f32) / scale) as u32;
+                    let mut sy_src = ((dy as f32) / scale) as u32;
+                    if sx_src >= cw { sx_src = cw - 1; }
+                    if sy_src >= ch { sy_src = ch - 1; }
+                    let sx_cell = if p.flipx { cw - 1 - sx_src } else { sx_src };
+                    let sy_cell = if p.flipy { ch - 1 - sy_src } else { sy_src };
+                    let Some(idx) = sheet.pixel(frame, sx_cell, sy_cell) else { continue; };
+                    if idx == 0 { continue; }
+                    let base = palette[idx as usize];
+                    let color = if identity_color { base }
+                        else { apply_color_transform(base, p.hue_shift, p.saturation, p.value) };
+                    let ox = p.x + dx;
+                    let oy = p.y + dy;
+                    if ox < 0 || oy < 0 { continue; }
+                    let (ox, oy) = (ox as usize, oy as usize);
+                    if ox >= cols || oy >= pixels { continue; }
+                    grid[oy][ox] = Some(color);
+                }
+            }
+        } else {
+            // Rotated path: iterate a bounding box around the sprite center
+            // and inverse-rotate/scale each destination pixel to find its
+            // source cell coord. Nearest-neighbor sampling keeps the pixel-
+            // art look sharp (no smoothing, no gap filling other than the
+            // row-below fallback below).
+            let theta = p.rotate.to_radians();
+            let c = theta.cos();
+            let s = theta.sin();
+            let cx_src = cw as f32 * 0.5;
+            let cy_src = ch as f32 * 0.5;
+            let half_diag = ((cw * cw + ch * ch) as f32).sqrt() * 0.5 * scale;
+            let half = half_diag.ceil() as i32 + 1;
+            let center_ox = p.x + ((cw as f32 * scale) * 0.5).round() as i32;
+            let center_oy = p.y + ((ch as f32 * scale) * 0.5).round() as i32;
+            for dy in -half..=half {
+                for dx in -half..=half {
+                    // Inverse rotation + inverse scale around the sprite
+                    // center. `1.5` over-sample radius fills the 1-pixel
+                    // gaps that nearest-neighbor rotation produces near
+                    // 45° without doubling work.
+                    let fx = dx as f32;
+                    let fy = dy as f32;
+                    let srx = (fx * c + fy * s) / scale;
+                    let sry = (-fx * s + fy * c) / scale;
+                    let sx = srx + cx_src;
+                    let sy = sry + cy_src;
+                    if sx < 0.0 || sy < 0.0 { continue; }
+                    let sxi = sx as u32;
+                    let syi = sy as u32;
+                    if sxi >= cw || syi >= ch { continue; }
+                    let sx_cell = if p.flipx { cw - 1 - sxi } else { sxi };
+                    let sy_cell = if p.flipy { ch - 1 - syi } else { syi };
+                    let Some(idx) = sheet.pixel(frame, sx_cell, sy_cell) else { continue; };
+                    if idx == 0 { continue; }
+                    let base = palette[idx as usize];
+                    let color = if identity_color { base }
+                        else { apply_color_transform(base, p.hue_shift, p.saturation, p.value) };
+                    let ox = center_ox + dx;
+                    let oy = center_oy + dy;
+                    if ox < 0 || oy < 0 { continue; }
+                    let (ox, oy) = (ox as usize, oy as usize);
+                    if ox >= cols || oy >= pixels { continue; }
+                    grid[oy][ox] = Some(color);
+                }
             }
         }
     }
@@ -450,6 +502,65 @@ fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Stage 12.1: shift a color in HSV space. `hue_deg` rotates hue (wraps
+/// at 360°); `sat_mul` and `val_mul` scale saturation/value (clamped to
+/// [0, 1]). Called per pixel from `render_sprites`, so the identity case
+/// should be short-circuited before calling.
+fn apply_color_transform(c: Color, hue_deg: f32, sat_mul: f32, val_mul: f32) -> Color {
+    let Color::Rgb(r, g, b) = c else { return c; };
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    let new_s = (s * sat_mul).clamp(0.0, 1.0);
+    let new_v = (v * val_mul).clamp(0.0, 1.0);
+    let (nr, ng, nb) = hsv_to_rgb(h + hue_deg, new_s, new_v);
+    Color::Rgb(nr, ng, nb)
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    let s = if max <= 0.0 { 0.0 } else { delta / max };
+    let h = if delta <= 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    (h, s, v)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    (
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// Scale an RGB color toward black by `t ∈ 0..=1`; `t=1` returns the

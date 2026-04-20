@@ -22,6 +22,11 @@ pub(crate) enum Target {
     FlipY,
     Frame,
     Visible,
+    Rotate,
+    Hue,
+    Saturation,
+    Value,
+    Palette,
 }
 
 impl Target {
@@ -34,6 +39,11 @@ impl Target {
             "flipy" => Some(Self::FlipY),
             "frame" => Some(Self::Frame),
             "visible" | "show" => Some(Self::Visible),
+            "rotate" | "rot" => Some(Self::Rotate),
+            "hue" => Some(Self::Hue),
+            "saturation" | "sat" => Some(Self::Saturation),
+            "value" | "val" | "brightness" => Some(Self::Value),
+            "palette" | "pal" => Some(Self::Palette),
             _ => None,
         }
     }
@@ -46,6 +56,11 @@ impl Target {
             Self::FlipY => "flipy",
             Self::Frame => "frame",
             Self::Visible => "visible",
+            Self::Rotate => "rotate",
+            Self::Hue => "hue",
+            Self::Saturation => "saturation",
+            Self::Value => "value",
+            Self::Palette => "palette",
         }
     }
 }
@@ -248,6 +263,36 @@ pub(crate) struct EffectivePlacement {
     pub scale: f32,
     pub visible: bool,
     pub palette: Option<String>,
+    /// Rotation in degrees, 0 = no rotation. Rendered by nearest-neighbor
+    /// inverse-mapping around the sprite center.
+    pub rotate: f32,
+    /// Hue shift in degrees added to each pixel's hue (HSV space).
+    pub hue_shift: f32,
+    /// Saturation multiplier applied in HSV space. 1.0 = identity.
+    pub saturation: f32,
+    /// Value (brightness) multiplier applied in HSV space. 1.0 = identity.
+    pub value: f32,
+    /// When Some, resolved to an index into the sorted list of named
+    /// palettes post-binding; overrides `palette` for this frame.
+    pub palette_idx: Option<i32>,
+}
+
+/// Resolve `palette_idx` bindings to a concrete palette name from the
+/// alphabetically-sorted list. `:bind mario palette = scene.index` picks
+/// the Nth named palette (wrapping). No-op when there are no named
+/// palettes or no placement has a `palette_idx` override.
+pub(crate) fn resolve_palette_indices(
+    placements: &mut [EffectivePlacement],
+    sorted_palette_names: &[String],
+) {
+    if sorted_palette_names.is_empty() { return; }
+    let n = sorted_palette_names.len() as i32;
+    for p in placements {
+        if let Some(idx) = p.palette_idx {
+            let i = idx.rem_euclid(n) as usize;
+            p.palette = Some(sorted_palette_names[i].clone());
+        }
+    }
 }
 
 pub(crate) fn apply_bindings(
@@ -272,6 +317,11 @@ pub(crate) fn apply_bindings(
             scale: 1.0,
             visible: true,
             palette: p.palette.clone(),
+            rotate: 0.0,
+            hue_shift: 0.0,
+            saturation: 1.0,
+            value: 1.0,
+            palette_idx: None,
         };
 
         for b in bindings {
@@ -297,6 +347,11 @@ pub(crate) fn apply_bindings(
                     eff.idx = n;
                 }
                 Target::Visible => eff.visible = v != 0.0,
+                Target::Rotate => eff.rotate = v,
+                Target::Hue => eff.hue_shift = v,
+                Target::Saturation => eff.saturation = v.max(0.0),
+                Target::Value => eff.value = v.max(0.0),
+                Target::Palette => eff.palette_idx = Some(v.floor() as i32),
             }
         }
         out.push(eff);
@@ -554,6 +609,11 @@ mod tests {
         let wild = parse_binding("bg.* y = sin(time)").unwrap();
         assert!(matches!(wild.idx, IdxPat::Wildcard));
 
+        // Bare sheet name is sugar for `.*`.
+        let bare = parse_binding("bub y = sin(time)").unwrap();
+        assert_eq!(bare.sheet, "bub");
+        assert!(matches!(bare.idx, IdxPat::Wildcard));
+
         // Apply: one placement, scale binding → scale = 0.5*2+1 = 2
         let placements = vec![Placement {
             sheet: "mario".into(), idx: 0, x: 10, y: 20, palette: None,
@@ -613,15 +673,15 @@ pub(crate) fn parse_binding(spec: &str) -> Result<Binding> {
     if parts.next().is_some() {
         bail!("too many tokens before '='");
     }
-    let (sheet, idx_str) = addr
-        .rsplit_once('.')
-        .ok_or_else(|| anyhow!("address must be <sheet>.<idx|*>"))?;
-    let idx = match idx_str {
-        "*" => IdxPat::Wildcard,
-        s => IdxPat::Exact(
-            s.parse::<u32>()
-                .map_err(|_| anyhow!("bad index '{}' (want integer or '*')", s))?,
-        ),
+    // Address forms: `<sheet>` (alias for `<sheet>.*`), `<sheet>.N`, `<sheet>.*`.
+    // Bare sheet name is the common case when there's only one placement.
+    let (sheet, idx): (&str, IdxPat) = match addr.rsplit_once('.') {
+        Some((s, "*")) => (s, IdxPat::Wildcard),
+        Some((s, num)) => (s, IdxPat::Exact(
+            num.parse::<u32>()
+                .map_err(|_| anyhow!("bad index '{}' (want integer or '*')", num))?,
+        )),
+        None => (addr, IdxPat::Wildcard),
     };
     let target = Target::parse(target_s)
         .ok_or_else(|| anyhow!("unknown target '{}'", target_s))?;

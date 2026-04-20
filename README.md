@@ -127,11 +127,14 @@ since last note-on), `master.rms`, `beat`, `time`:
 ```
 :sprite load ~/mario.png 16x16 q
 :sprite place mario 0 10 10
-:bind mario.0 y = sin(time * 4) * 6                    # bob on sine
-:bind mario.0 scale = pu1.env * 1.5 + 1                # pulse with PU1
-:bind mario.0 flipx = tri.gate                         # turn on TRI notes
-:bind mario.0 frame = clamp(floor(noi.age * 16), 0, 3) # 4-frame hit anim
+:bind mario y = sin(time * 4) * 6                    # bob on sine
+:bind mario scale = pu1.env * 1.5 + 1                # pulse with PU1
+:bind mario flipx = tri.gate                         # turn on TRI notes
+:bind mario frame = clamp(floor(noi.age * 16), 0, 3) # 4-frame hit anim
 ```
+
+A bare `<sheet>` address targets every placement of that sheet. Use
+`<sheet>.N` for the Nth placement or `<sheet>.*` to be explicit.
 
 Sheets are strict NES-style (≤3 opaque colors + transparent); append
 `q` on load to auto-quantize richer PNGs to their top 3 colors.

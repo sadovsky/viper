@@ -1217,7 +1217,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
         row(":sprite repalette N P", "apply palette P to sheet N"),
         row(":sprite list / clear", "list loaded sheets / remove placements"),
-        row(":bind S.N|* T = EXPR", "modulate sprite S placement N (or '*'): T = x/y/scale/flipx/flipy/frame/visible"),
+        row(":bind S[.N|*] T = EXPR", "modulate sprite S (bare=all placements): T = x/y/scale/flipx/flipy/frame/visible/rotate/hue/sat/value/palette"),
         row("  sources", "<ch>.env/.pitch/.gate/.vel/.age, master.rms, step/beat/bar/time/tempo/scene.index"),
         row(":bind list / clear / del N", "inspect / drop all / remove binding N"),
         row(":scene N save",    "bind current phrase to slot N (1-9)"),
@@ -3154,6 +3154,12 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         &app.bindings,
         &eval_ctx,
     );
+    // Stage 12.1: resolve `palette = N` bindings to named palettes.
+    // Alphabetical ordering of `:sprite palette <name> ...` registrations
+    // gives a stable, user-controllable ring via naming convention.
+    let mut palette_names: Vec<String> = app.sprite_palettes.keys().cloned().collect();
+    palette_names.sort();
+    modulation::resolve_palette_indices(&mut app.effective_placements, &palette_names);
     // Stage 7: fire any queued scene launch at the next bar boundary. We
     // detect the boundary by comparing to `prev_play_step` so we fire once
     // per crossing, not once per frame.
