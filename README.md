@@ -44,21 +44,26 @@ splash, then <kbd>space</kbd> to play.
 
 ## The 30-second tour
 
-| action                           | keys                                |
-|----------------------------------|-------------------------------------|
-| move                             | `h j k l` or arrows (`4j` = down 4) |
-| jump by bar / phrase / column    | `w b`, `{ }`, `0 $ g G`             |
-| insert a note                    | `i`, then bottom keyboard row       |
-| delete a row / bar / phrase      | `dd`, `dab`, `dip`                  |
-| delete a channel column          | `div`                               |
-| yank / paste                     | `y{...}`, `p` or `P`                |
-| visual block selection           | `v`, then move, then `d` / `y` / `x`|
-| repeat last destructive action   | `.`                                 |
-| play / stop                      | `space` or `:play` / `:stop`        |
-| save / load `.vip`               | `:w path`, `:e path`                |
-| edit instrument                  | `F2` or `:inst`                     |
-| help screen                      | `?` or `F1`                         |
-| quit                             | `ZZ`, `Ctrl-q`, or `:q`             |
+| action                              | keys                                |
+|-------------------------------------|-------------------------------------|
+| move                                | `h j k l` or arrows (`4j` = down 4) |
+| jump by bar / phrase / column       | `w b`, `{ }`, `0 $ g G`             |
+| insert a note                       | `i`, then bottom keyboard row       |
+| delete a row / bar / phrase         | `dd`, `dab`, `dip`                  |
+| delete a channel column             | `div`                               |
+| yank / paste                        | `y{...}`, `p` or `P`                |
+| visual block selection              | `v`, then move, then `d` / `y` / `x`|
+| repeat last destructive action      | `.`                                 |
+| undo / redo                         | `u` / `Ctrl-r`                      |
+| play / stop                         | `space` or `:play` / `:stop`        |
+| live keyboard monitor / record arm  | `K`, `R`                            |
+| mute channel / launch scene         | `M`, digit key in Live mode         |
+| record / replay macro               | `q<letter>` ... `q`, `@<letter>`    |
+| toggle visualizer                   | `:viz` (bars/scope/grid/orbit/sprites) |
+| save / load `.vip`                  | `:w path`, `:e path`                |
+| edit instrument                     | `F2` or `:inst`                     |
+| help screen                         | `?` or `F1`                         |
+| quit                                | `ZZ`, `Ctrl-q`, or `:q`             |
 
 Insert mode uses the bottom keyboard row as a chromatic piano:
 
@@ -85,6 +90,51 @@ same song), composable, and fast enough to run on every keypress.
 More generators (Markov chains, chord-progression voicing, basslines,
 arpeggiator, L-systems, cellular automata, LLM prompting) are planned —
 see [`docs/GENERATION.md`](docs/GENERATION.md) for the full design.
+
+## Live performance
+
+Beyond the grid editor, viper is playable as an instrument:
+
+- `K` drops you into **Live mode** — the piano row triggers notes in
+  realtime on the current channel without writing to the pattern.
+- `R` arms the cursor channel for **overdub recording**; live-mode
+  notes snap to the nearest 16th under the playhead while the transport
+  rolls.
+- Digits `1`–`9` in Live mode launch **scenes** (phrases bound via
+  `:scene N save`) at the next bar boundary — Ableton-style continuity.
+- `M` mutes the current channel; muted voices drop cleanly within one
+  audio buffer and re-enter on the next note.
+- `q<letter>` records a **performance macro** (scene launches, mutes,
+  transposition, play/stop). `@<letter>` replays. Scene launches inside
+  macros still respect the bar-boundary queue.
+
+## Visualizer & sprites
+
+Toggle the viz pane with `:viz`. Five renderers, all using half-blocks
+and 24-bit color for 2× vertical terminal resolution:
+
+- **bars** — per-voice envelope levels
+- **scope** — synthesized waveform, tinted by loudest voice
+- **grid** — 4×4 step grid with a pulsing playhead
+- **orbit** — per-voice bodies orbiting a shared ring, pitch → angle
+- **sprites** — load 4-color PNG sprite sheets and animate them
+
+Sprites can be bound to any audio-reactive source. The binding language
+is a small expression DSL — operators, parentheses, a handful of
+functions, and sources like `pu1.env`, `noi.gate`, `tri.age` (seconds
+since last note-on), `master.rms`, `beat`, `time`:
+
+```
+:sprite load ~/mario.png 16x16 q
+:sprite place mario 0 10 10
+:bind mario.0 y = sin(time * 4) * 6                    # bob on sine
+:bind mario.0 scale = pu1.env * 1.5 + 1                # pulse with PU1
+:bind mario.0 flipx = tri.gate                         # turn on TRI notes
+:bind mario.0 frame = clamp(floor(noi.age * 16), 0, 3) # 4-frame hit anim
+```
+
+Sheets are strict NES-style (≤3 opaque colors + transparent); append
+`q` on load to auto-quantize richer PNGs to their top 3 colors.
 
 ## The `.vip` file format
 
@@ -118,19 +168,26 @@ mouse-driven DAWs never quite do.
 
 ## Status
 
-**Stages 1–4 and 3.5 are shipped.** You can:
+**Stages 1–13 are shipped.** You can:
 
 - edit a 16-step × 4-channel phrase with full vim motions, operators,
-  text objects, visual block selection, counts, and `.` repeat;
+  text objects, visual block selection, counts, undo/redo, and `.` repeat;
 - play it back with sample-accurate ADSR-driven pulse/triangle/noise
   synthesis via `cpal`;
 - edit instruments with a dedicated modal editor;
 - save and load `.vip` files;
-- generate drum patterns, Euclidean rhythms, and random-in-scale melodies.
+- generate drum patterns, Euclidean rhythms, and random-in-scale melodies;
+- play live through the piano row, overdub-record to the grid, launch
+  scenes on bar boundaries, mute/unmute voices, record and replay
+  performance macros;
+- watch the song on a built-in visualizer (bars, scope, grid, orbit)
+  or load 4-color PNG sprite sheets and bind their position, scale,
+  flip, and frame index to any audio source via a small expression
+  language with note-on-triggered animations.
 
-Upcoming: live keyboard monitoring, overdub recording, scene launching,
-a real-time visualizer, sprite bindings, WAV/MIDI export. See
-[`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
+Upcoming: color-domain modulation (rotate, hue, palette swap), WAV/MIDI
+export, song mode, plugin voices. See [`docs/STAGES.md`](docs/STAGES.md)
+for the full roadmap.
 
 ## Contributing
 
