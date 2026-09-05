@@ -33,6 +33,7 @@ viper check song.vip                             # parse + lowering report
 viper compile song.vip --driver driver.bin -o song.nsf
 viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
+viper verify song.nsf --against fceux.log --vip song.vip  # diff vs another emulator
 viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
 ```
 
@@ -204,9 +205,10 @@ arrangement (`:chain`, `:arr`, `:song` pane) with per-channel polymeter
 against a 6502 driver, `:engine apu` to play the result through an
 emulated 2A03 in the tracker, `viper render` for deterministic
 per-channel stems and a register-write log (see
-[`docs/NSF.md`](docs/NSF.md)); and `viper gen`, which composes whole
-songs from a style directory. Upcoming: more generators, verification
-against external emulators, plugin voices. See
+[`docs/NSF.md`](docs/NSF.md)), with `viper verify` diffing that log
+against another emulator's (the bundled stress song matches FCEUX frame
+for frame); and `viper gen`, which composes whole songs from a style
+directory. Upcoming: more generators, plugin voices. See
 [`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
 
 ## Contributing

@@ -178,13 +178,56 @@ viper gen --style <dir> --seed N [-o songs/]
 is deterministic per seed and style version; the output `.vip` records
 both in `@meta` so a track can always be regenerated.
 
-## Verification
+## Verification (Stage 24)
 
-Downstream repos are expected to CI this: compile each `.vip`, render
-with viper-apu and with NSFPlay headless, diff the register logs per
-frame, fail on any mismatch. viper's own test suite carries the same
-check for `projects/stress_melodeath.vip` against a checked-in golden
-log.
+Two receipts, both in `tests/golden/` and both enforced by
+`tests/pipeline.rs`:
+
+1. **Golden log.** `stress_melodeath.log` is viper-apu's own
+   register-write log for `projects/stress_melodeath.vip` compiled
+   against the vendored driver. A render must reproduce it byte for
+   byte. Regenerate it deliberately when the driver fixture or the
+   compiler changes:
+   ```
+   viper compile projects/stress_melodeath.vip --driver tests/fixtures/driver.bin -o stress.nsf
+   viper render stress.nsf --vip projects/stress_melodeath.vip --log tests/golden/stress_melodeath.log
+   ```
+2. **External emulator.** `stress_melodeath.fceux.log` is FCEUX 2.6.6
+   playing the same NSF, captured by `tools/fceux_apu_log.lua`. All 196
+   PLAY frames match viper-apu's log write for write (first run
+   2026-09-05).
+
+`viper verify` is the comparator:
+
+```
+viper verify song.nsf --against other.log [--vip song.vip] [-o normalized.log]
+viper verify writes.log --against other.log
+```
+
+It reads the other dump loosely — any line with a frame number, a
+`$4000`–`$4017` address and a byte, in that order, decimal or hex, with
+or without `$`/`0x` — so NSFPlay, Mesen and FCEUX dumps need no
+conversion. Two allowances keep the diff about the driver rather than
+the player shell: frame numbering may differ by a constant (taken from
+the first PLAY frame; FCEUX also runs INIT and PLAY 1 in one frame, which
+is detected and split), and INIT-frame writes are compared as a set with
+extra player housekeeping allowed. PLAY frames must match exactly and in
+order; the first divergence is printed with both sides and the exit code
+is 1.
+
+Capturing an FCEUX dump:
+
+```
+# Linux, with the distro FCEUX and xvfb:
+FCEUX_LOG=out.log FCEUX_FRAMES=300 xvfb-run -a fceux --loadlua tools/fceux_apu_log.lua song.nsf
+# WSL, with the Windows build (paths must be Windows paths inside the script):
+./fceux64.exe -lua 'C:\path\apu_log.lua' 'C:\path\song.nsf'
+```
+
+Downstream repos are expected to CI the same thing: compile each `.vip`,
+render with viper-apu, dump with an external emulator, `viper verify`,
+fail on any mismatch. nintendo-metal's `session/verify.sh` is the
+template.
 
 ## Milestones
 
@@ -195,6 +238,8 @@ log.
 3. **Stage 20** — register-write log diffs clean against NSFPlay.
 4. **Stage 21** — stem + trigger export.
 5. **Stage 22** — style interface, neutral style, `viper gen`.
+6. **Stage 24** — golden log + `viper verify`; the stress song diffs
+   clean against FCEUX.
 
 Stage 18 needs a driver binary to link against; that is Phase 0/1 of the
 nintendo-metal plan and lands there first.

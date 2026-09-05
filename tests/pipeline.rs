@@ -56,6 +56,40 @@ fn stress_song_compiles_renders_and_loops_exactly() {
     assert!(log.lines().any(|l| l.starts_with("1 4003 ")), "PU1 gets a period-hi write on the first PLAY frame");
     assert!(log.lines().count() > 2000);
 
+    // Stage 24: the exact-length render must equal the checked-in golden
+    // log. Regenerate it deliberately when the driver fixture or the
+    // compiler changes:
+    //   viper render stress.nsf --vip projects/stress_melodeath.vip \
+    //       --log tests/golden/stress_melodeath.log
+    let golden_log = tmp.join("golden.log");
+    let out = viper().args(["render"]).arg(&nsf).arg("--vip").arg(&vip).arg("--log").arg(&golden_log).output().unwrap();
+    assert!(out.status.success(), "render failed: {}", String::from_utf8_lossy(&out.stderr));
+    let got = std::fs::read_to_string(&golden_log).unwrap();
+    let want = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
+    if got != want {
+        let first_diff = got.lines().zip(want.lines()).position(|(a, b)| a != b);
+        panic!(
+            "register log differs from tests/golden/stress_melodeath.log (first differing line: {:?}); regenerate the golden log if the change is intended",
+            first_diff.map(|i| i + 1)
+        );
+    }
+    // `viper verify` accepts the golden log as the other side and passes.
+    let out = viper().args(["verify"]).arg(&nsf).arg("--vip").arg(&vip).arg("--against").arg(root().join("tests/golden/stress_melodeath.log")).output().unwrap();
+    let verify_out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && verify_out.contains("PLAY frames match"), "{}\n{}", verify_out, String::from_utf8_lossy(&out.stderr));
+    // The external receipt: FCEUX 2.6.6 playing the same NSF, logged by
+    // tools/fceux_apu_log.lua (INIT and PLAY 1 share a frame there, and
+    // its frame counter starts at 3). Every PLAY frame must match.
+    let out = viper().args(["verify"]).arg(&nsf).arg("--vip").arg(&vip).arg("--against").arg(root().join("tests/golden/stress_melodeath.fceux.log")).output().unwrap();
+    let verify_out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && verify_out.contains("frames compared: 196") && verify_out.contains("PLAY frames match"), "{}", verify_out);
+    // A tampered log is caught, with the frame named.
+    let tampered = tmp.join("tampered.log");
+    std::fs::write(&tampered, want.replacen("1 4003 ", "1 4007 ", 1)).unwrap();
+    let out = viper().args(["verify"]).arg(&golden_log).arg("--against").arg(&tampered).output().unwrap();
+    let verify_out = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success() && verify_out.contains("first mismatch at frame 1"), "{}", verify_out);
+
     // nsfe by extension carries the track label
     let nsfe = tmp.join("stress.nsfe");
     let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsfe).output().unwrap();
