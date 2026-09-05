@@ -21,7 +21,9 @@ viper — vim-keybound chiptune tracker + NSF compiler
 usage:
   viper [song.vip]                          open the tracker
   viper check song.vip                      parse and report problems
-  viper compile song.vip --driver BIN [--sym SYM] -o out.nsf [--title T]
+  viper compile song.vip [more.vip ...] --driver BIN [--sym SYM] -o out.nsf [--title T]
+      several .vip files become one multi-song NSF (album bundle)
+  viper fmt song.vip [-o out.vip]           rewrite in canonical form
   viper render song.nsf [-o mix.wav] [--stems DIR] [--triggers drums.mid]
                         [--log writes.txt] [--loops N] [--frames N]
                         [--vip song.vip] [--song N] [--rate HZ] [--bpm B]
@@ -76,6 +78,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let a = Args::parse(&args[1..]);
     match cmd {
         "check" => check(&a),
+        "fmt" => fmt(&a),
         "compile" => compile_cmd(&a),
         "render" => render(&a),
         "info" => info(&a),
@@ -117,42 +120,80 @@ fn check(a: &Args) -> Result<()> {
     Ok(())
 }
 
-fn compile_cmd(a: &Args) -> Result<()> {
-    let path = a.positional.first().map(PathBuf::from).context("compile: need a .vip path")?;
-    let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| path.with_extension("nsf"));
-    let (mut song, warnings) = load_song(&path)?;
+fn fmt(a: &Args) -> Result<()> {
+    let path = a.positional.first().map(PathBuf::from).context("fmt: need a .vip path")?;
+    let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| path.clone());
+    let (song, warnings) = load_song(&path)?;
     for w in &warnings {
         eprintln!("warning: {}", w);
     }
-    if let Some(t) = a.get("title") {
-        song.title = t.to_string();
+    std::fs::write(&out, vip::to_vip(&song)).with_context(|| format!("write {}", out.display()))?;
+    println!("{} → {}", path.display(), out.display());
+    Ok(())
+}
+
+fn compile_cmd(a: &Args) -> Result<()> {
+    if a.positional.is_empty() {
+        bail!("compile: need at least one .vip path");
     }
-    if song.title.is_empty() {
-        song.title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    }
-    let driver = match a.get("driver") {
+    let paths: Vec<PathBuf> = a.positional.iter().map(PathBuf::from).collect();
+    let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| paths[0].with_extension("nsf"));
+    let mut driver: Option<viper_nsf::Driver> = match a.get("driver") {
         Some(bin) => {
             let bin = PathBuf::from(bin);
             let sym = a.get("sym").map(PathBuf::from).unwrap_or_else(|| bin.with_extension("sym"));
-            viper_nsf::Driver::load(&bin, &sym)?
+            Some(viper_nsf::Driver::load(&bin, &sym)?)
         }
-        None => compile::load_song_driver(&song, path.parent())
-            .context("compile: pass --driver BIN or add an @driver directive to the song")?,
+        None => None,
     };
-    let c = compile::compile(&song, &driver, path.parent())?;
-    for w in &c.warnings {
+    let mut module: Option<viper_nsf::Module> = None;
+    let mut total_frames = 0u32;
+    for path in &paths {
+        let (mut song, warnings) = load_song(path)?;
+        for w in &warnings {
+            eprintln!("warning: {}: {}", path.display(), w);
+        }
+        if song.title.is_empty() {
+            song.title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        if driver.is_none() {
+            driver = Some(
+                compile::load_song_driver(&song, path.parent())
+                    .context("compile: pass --driver BIN or add an @driver directive to the song")?,
+            );
+        }
+        let lowered = compile::lower(&song, path.parent())?;
+        for w in &lowered.warnings {
+            eprintln!("warning: {}: {}", path.display(), w);
+        }
+        total_frames += lowered.module.songs[0].total_frames();
+        match module.as_mut() {
+            None => module = Some(lowered.module),
+            Some(m) => m.songs.extend(lowered.module.songs),
+        }
+    }
+    let mut module = module.unwrap();
+    if let Some(t) = a.get("title") {
+        // The NSF name field is the album/first-song title.
+        if let Some(first) = module.songs.first_mut() {
+            first.title = t.to_string();
+        }
+    }
+    let driver = driver.unwrap();
+    let emitted = viper_nsf::emit(&module, &driver)?;
+    for w in &emitted.warnings {
         eprintln!("warning: {}", w);
     }
-    std::fs::write(&out, &c.nsf).with_context(|| format!("write {}", out.display()))?;
+    std::fs::write(&out, &emitted.nsf).with_context(|| format!("write {}", out.display()))?;
     println!(
-        "{} → {}: {} bytes ({} song data, {} samples), {} frames ≈ {:.1}s",
-        path.display(),
+        "{} song(s) → {}: {} bytes ({} song data, {} samples), {} frames ≈ {:.1}s",
+        module.songs.len(),
         out.display(),
-        c.nsf.len(),
-        c.data_bytes,
-        c.sample_bytes,
-        c.total_frames,
-        c.total_frames as f64 / 60.0988
+        emitted.nsf.len(),
+        emitted.data_bytes,
+        emitted.sample_bytes,
+        total_frames,
+        total_frames as f64 / 60.0988
     );
     Ok(())
 }
