@@ -85,6 +85,58 @@ fn fixed_8_8(frames: f64) -> Result<(u8, u8)> {
     Ok(((fixed & 0xFF) as u8, (fixed >> 8) as u8))
 }
 
+/// The image under construction. Song data is appended sequentially; when
+/// it would run into $C000 the DPCM sample area is placed there first and
+/// data continues after it, so a 32 KB image can hold ~28 KB of songs.
+struct Layout {
+    base: usize,
+    image: Vec<u8>,
+    blobs: Vec<Vec<u8>>,
+    blob_addr: Vec<usize>,
+    samples_placed: bool,
+}
+
+impl Layout {
+    fn end(&self) -> usize {
+        self.base + self.image.len()
+    }
+    fn place_samples(&mut self) -> Result<()> {
+        if self.samples_placed || self.blobs.is_empty() {
+            return Ok(());
+        }
+        if self.end() > DPCM_BASE {
+            bail!("song data reaches ${:04X}, past the DPCM area at $C000", self.end());
+        }
+        self.image.resize(DPCM_BASE - self.base, 0);
+        for (i, blob) in self.blobs.iter().enumerate() {
+            let off = self.blob_addr[i] - self.base;
+            if self.image.len() < off {
+                self.image.resize(off, 0);
+            }
+            self.image.extend_from_slice(blob);
+        }
+        self.samples_placed = true;
+        Ok(())
+    }
+    /// Append `bytes` as one object that must not straddle the sample area.
+    fn place(&mut self, bytes: &[u8]) -> Result<usize> {
+        if !self.samples_placed && !self.blobs.is_empty() && self.end() + bytes.len() > DPCM_BASE {
+            self.place_samples()?;
+        }
+        if self.end() + bytes.len() > IMAGE_END {
+            bail!("song data exceeds the 32 KB image (needs ${:04X})", self.end() + bytes.len());
+        }
+        let addr = self.end();
+        self.image.extend_from_slice(bytes);
+        Ok(addr)
+    }
+    fn patch16(&mut self, addr: usize, value: usize) {
+        let off = addr - self.base;
+        self.image[off] = (value & 0xFF) as u8;
+        self.image[off + 1] = (value >> 8) as u8;
+    }
+}
+
 pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     if module.songs.is_empty() {
         bail!("module has no songs");
@@ -94,15 +146,10 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     }
     let mut warnings = Vec::new();
     let base = driver.load as usize;
-    let mut image: Vec<u8> = Vec::with_capacity(0x8000);
-    image.extend_from_slice(&driver.bin);
-    debug_assert_eq!(base + image.len(), driver.song_table as usize);
 
     // --- DPCM samples: collect across songs, dedupe by content ---
-    // Placed at $C000+ after we know everything else fits.
     let mut sample_blobs: Vec<Vec<u8>> = Vec::new();
     let mut sample_index: HashMap<Vec<u8>, usize> = HashMap::new();
-    // per song: sample id -> global blob index
     let mut song_sample_map: Vec<Vec<usize>> = Vec::new();
     for song in &module.songs {
         let mut map = Vec::new();
@@ -111,7 +158,6 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
             if data.is_empty() {
                 data.push(0x55);
             }
-            // pad to 16n+1
             let want = ((data.len() - 1 + 15) / 16) * 16 + 1;
             data.resize(want, 0x55);
             if data.len() > 0xFF1 {
@@ -125,7 +171,6 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         }
         song_sample_map.push(map);
     }
-    // assign sample addresses
     let mut sample_addr: Vec<usize> = Vec::new();
     let mut cursor = DPCM_BASE;
     for blob in &sample_blobs {
@@ -136,11 +181,14 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     if cursor > IMAGE_END {
         bail!("DPCM samples need {} bytes at $C000; only 16384 available", cursor - DPCM_BASE);
     }
-    let sample_end = cursor;
+    let sample_bytes = if sample_blobs.is_empty() { 0 } else { cursor - DPCM_BASE };
 
-    // --- song table placeholder ---
-    let table_at = image.len();
-    image.resize(table_at + 2 * module.songs.len(), 0);
+    let mut lay = Layout { base, image: driver.bin.clone(), blobs: sample_blobs.clone(), blob_addr: sample_addr.clone(), samples_placed: false };
+    debug_assert_eq!(lay.end(), driver.song_table as usize);
+
+    // --- song table ---
+    let table_at = lay.place(&vec![0u8; 2 * module.songs.len()])?;
+    let mut data_bytes = 2 * module.songs.len();
 
     for (si, song) in module.songs.iter().enumerate() {
         if song.order.is_empty() {
@@ -168,18 +216,14 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         if song.instruments.len() > 64 {
             bail!("song {}: more than 64 instruments", si);
         }
-        let song_addr = base + image.len();
-        image[table_at + 2 * si] = (song_addr & 0xFF) as u8;
-        image[table_at + 2 * si + 1] = (song_addr >> 8) as u8;
 
-        // header
+        // header + order list as one object (the driver indexes into it)
         let (sp_lo, sp_hi) = fixed_8_8(song.frames_per_row)?;
-        image.extend([sp_lo, sp_hi, song.rows_per_pattern, song.order.len() as u8, song.loop_pos as u8]);
-        let instr_ptr_at = image.len();
-        image.extend([0, 0, 0, 0]); // instr ptr, dpcm ptr
-        // order list placeholder: 10 bytes per entry
-        let order_at = image.len();
-        image.resize(order_at + 10 * song.order.len(), 0);
+        let mut header = vec![sp_lo, sp_hi, song.rows_per_pattern, song.order.len() as u8, song.loop_pos as u8, 0, 0, 0, 0];
+        header.resize(9 + 10 * song.order.len(), 0);
+        let song_addr = lay.place(&header)?;
+        lay.patch16(table_at + 2 * si, song_addr);
+        data_bytes += header.len();
 
         // envelopes + instrument table
         let mut env_addr: Vec<Option<usize>> = Vec::new();
@@ -189,37 +233,40 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
                     if env.values.is_empty() || env.values.len() > 252 {
                         bail!("song {}: envelope length {} out of range 1..=252", si, env.values.len());
                     }
-                    env_addr.push(Some(base + image.len()));
-                    image.extend(env.encode());
+                    let enc = env.encode();
+                    data_bytes += enc.len();
+                    env_addr.push(Some(lay.place(&enc)?));
                 }
                 None => env_addr.push(None),
             }
         }
-        let instr_table = base + image.len();
+        let mut itab = Vec::new();
         for (i, ins) in song.instruments.iter().enumerate() {
             let e = env_addr[i].unwrap_or(0);
-            image.extend([ins.duty.map(|d| d & 3).unwrap_or(0xFF), (e & 0xFF) as u8, (e >> 8) as u8, 0]);
+            itab.extend([ins.duty.map(|d| d & 3).unwrap_or(0xFF), (e & 0xFF) as u8, (e >> 8) as u8, 0]);
         }
         if song.instruments.is_empty() {
-            // one default instrument so INSTR 0 is always valid
-            image.extend([0xFF, 0, 0, 0]);
+            itab.extend([0xFF, 0, 0, 0]);
         }
+        let instr_table = lay.place(&itab)?;
+        data_bytes += itab.len();
+
         // dpcm table
-        let dpcm_table = base + image.len();
+        let mut dtab = Vec::new();
         for (k, s) in song.samples.iter().enumerate() {
             let gi = song_sample_map[si][k];
             let addr = sample_addr[gi];
             let len = sample_blobs[gi].len();
             let rate = (s.rate & 0x0F) | if s.loop_ { 0x40 } else { 0 };
-            image.extend([rate, ((addr - 0xC000) >> 6) as u8, ((len - 1) >> 4) as u8, 0]);
+            dtab.extend([rate, ((addr - 0xC000) >> 6) as u8, ((len - 1) >> 4) as u8, 0]);
         }
         if song.samples.is_empty() {
-            image.extend([0x0F, 0, 0, 0]);
+            dtab.extend([0x0F, 0, 0, 0]);
         }
-        image[instr_ptr_at] = (instr_table & 0xFF) as u8;
-        image[instr_ptr_at + 1] = (instr_table >> 8) as u8;
-        image[instr_ptr_at + 2] = (dpcm_table & 0xFF) as u8;
-        image[instr_ptr_at + 3] = (dpcm_table >> 8) as u8;
+        let dpcm_table = lay.place(&dtab)?;
+        data_bytes += dtab.len();
+        lay.patch16(song_addr + 5, instr_table);
+        lay.patch16(song_addr + 7, dpcm_table);
 
         // streams, deduplicated by content
         let mut stream_addr: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -229,46 +276,27 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
             for (ci, _) in CHANNELS.iter().enumerate() {
                 let rows: Vec<Vec<Event>> = p.rows.iter().map(|r| r[ci].clone()).collect();
                 let bytes = encode_stream(&rows);
-                let a = *stream_addr.entry(bytes.clone()).or_insert_with(|| {
-                    let a = base + image.len();
-                    image.extend(&bytes);
-                    a
-                });
+                let a = match stream_addr.get(&bytes) {
+                    Some(&a) => a,
+                    None => {
+                        let a = lay.place(&bytes)?;
+                        data_bytes += bytes.len();
+                        stream_addr.insert(bytes, a);
+                        a
+                    }
+                };
                 addrs[ci] = a;
             }
             pattern_streams.push(addrs);
         }
         for (oi, &pi) in song.order.iter().enumerate() {
             for ci in 0..5 {
-                let a = pattern_streams[pi][ci];
-                let at = order_at + oi * 10 + ci * 2;
-                image[at] = (a & 0xFF) as u8;
-                image[at + 1] = (a >> 8) as u8;
+                lay.patch16(song_addr + 9 + oi * 10 + ci * 2, pattern_streams[pi][ci]);
             }
-        }
-        if base + image.len() > DPCM_BASE && !sample_blobs.is_empty() {
-            bail!("song data reaches ${:04X}, colliding with DPCM at $C000", base + image.len());
-        }
-        if base + image.len() > IMAGE_END {
-            bail!("song data exceeds the 32 KB image");
         }
     }
-    let data_bytes = image.len() - driver.bin.len();
-
-    // --- samples ---
-    let sample_bytes = if sample_blobs.is_empty() {
-        0
-    } else {
-        image.resize(DPCM_BASE - base, 0);
-        for (i, blob) in sample_blobs.iter().enumerate() {
-            let off = sample_addr[i] - base;
-            if image.len() < off {
-                image.resize(off, 0);
-            }
-            image.extend_from_slice(blob);
-        }
-        sample_end - DPCM_BASE
-    };
+    lay.place_samples()?;
+    let image = lay.image;
     if image.len() > 0x8000 {
         bail!("image is {} bytes; max 32768", image.len());
     }
@@ -339,6 +367,17 @@ mod tests {
         let silent = Envelope::from_adsr(0, 60, 0.0, 20, 0.6);
         assert_eq!(silent.loop_point, None);
         assert_eq!(silent.values[0], 9);
+    }
+
+    #[test]
+    fn layout_wraps_song_data_around_the_sample_area() {
+        let mut lay = Layout { base: 0x8000, image: vec![0; 0x3FF0], blobs: vec![vec![0x55; 17]], blob_addr: vec![0xC000], samples_placed: false };
+        // 32 bytes no longer fit before $C000: samples go down first, data after.
+        let a = lay.place(&[1u8; 32]).unwrap();
+        assert!(lay.samples_placed);
+        assert_eq!(a, 0xC000 + 17);
+        assert_eq!(lay.image[0xC000 - 0x8000], 0x55);
+        assert_eq!(lay.image[a - 0x8000], 1);
     }
 
     #[test]
