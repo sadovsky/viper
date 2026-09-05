@@ -169,7 +169,7 @@ lossless:
 
 Full grammar lives in [`docs/FORMAT.md`](docs/FORMAT.md). Validate a
 file without opening the TUI by writing the parser test yourself —
-proper `viper --check path.vip` is on the roadmap.
+`viper check path.vip` does the same from the shell.
 
 ## Why?
 

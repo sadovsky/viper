@@ -232,11 +232,15 @@ fn render(a: &Args) -> Result<()> {
     };
     let mut fixed_frames = a.num::<u32>("frames")?;
     let mut bpm_from_vip: Option<f64> = None;
+    // DPCM stem names: from the song's sample list when --vip is given,
+    // otherwise the built-in bank order.
+    let mut sample_names: Vec<String> = crate::dpcm::default_bank().iter().map(|s| s.name.to_string()).collect();
     if let Some(vp) = a.get("vip") {
         let vp = PathBuf::from(vp);
         let (song, _) = load_song(&vp)?;
         let lowered = compile::lower(&song, vp.parent())?;
         let s = &lowered.module.songs[0];
+        sample_names = s.samples.iter().map(|x| x.name.clone()).collect();
         let (intro, looped) = s.intro_and_loop_frames();
         let tail = (opts.tail_seconds * 60.0988) as u32;
         fixed_frames = Some(intro + looped * opts.loops.max(1) + tail);
@@ -263,14 +267,19 @@ fn render(a: &Args) -> Result<()> {
     }
     if let Some(dir) = &stems_dir {
         std::fs::create_dir_all(dir)?;
-        // Name DPCM stems after their sample index: dpcm0 = kick, dpcm1 = snare
-        // in the built-in bank; the manifest records the mapping.
+        // Name DPCM stems after the sample that produced them. Stems are
+        // indexed by order of first use in the register log; the NSF's
+        // sample table order (= .vip order) is recovered from the $4012
+        // value, which increases with table position for viper output.
+        let mut used = r.dpcm_samples.clone();
+        used.sort_unstable();
         for s in &r.stems {
-            let name = match s.name.as_str() {
-                "dpcm0" => "kick".to_string(),
-                "dpcm1" => "snare".to_string(),
-                "dpcm2" => "hat".to_string(),
-                other => other.to_string(),
+            let name = match s.name.strip_prefix("dpcm").and_then(|n| n.parse::<usize>().ok()) {
+                Some(i) if i < r.dpcm_samples.len() => {
+                    let table_pos = used.iter().position(|&a| a == r.dpcm_samples[i]).unwrap_or(i);
+                    sample_names.get(table_pos).cloned().unwrap_or_else(|| s.name.clone())
+                }
+                _ => s.name.clone(),
             };
             let p = dir.join(format!("{}.wav", name));
             let f = std::fs::File::create(&p).with_context(|| format!("create {}", p.display()))?;

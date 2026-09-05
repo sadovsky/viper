@@ -686,15 +686,14 @@ where
                         last_step = tr.step;
                         let muted = tr.muted;
                         let instruments = tr.instruments;
+                        let step = tr.step;
                         if tr.song_mode && !tr.order.is_empty() {
                             let pi = tr.playing_phrase.min(tr.phrases.len().saturating_sub(1));
                             if let Some(p) = tr.phrases.get(pi) {
-                                let p = p.clone();
-                                gate_step(&mut voices, &p, tr.step, &instruments, &muted);
+                                gate_step(&mut voices, p, step, &instruments, &muted);
                             }
                         } else {
-                            let p = tr.phrase.clone();
-                            gate_step(&mut voices, &p, tr.step, &instruments, &muted);
+                            gate_step(&mut voices, &tr.phrase, step, &instruments, &muted);
                         }
                     }
                     for v in &mut voices {
@@ -838,6 +837,41 @@ mod tests {
         let err = bounce_to_wav(&path, &[Phrase::default()], &instr, 140, 0, 44_100)
             .expect_err("zero loops should fail");
         assert!(err.to_string().contains("loops"));
+    }
+
+    #[test]
+    fn apu_position_wraps_to_loop_point() {
+        // 4 order entries, loop at 1, 4.5 frames per row: rows 0..64 then
+        // wrap into rows 16..64 forever.
+        let mut st = ApuState {
+            generation: 0,
+            player: {
+                let nsf = viper_apu::Nsf::parse(&{
+                    let mut v = viper_nsf_test_header();
+                    v.extend_from_slice(&[0x60; 16]); // RTS at $8000
+                    v
+                }).unwrap();
+                viper_apu::Player::new(nsf, 44_100)
+            },
+            buf: Vec::new(), buf_pos: 0, frames: 0, total_rows: 64, loop_row: 16,
+        };
+        st.frames = 1;
+        assert_eq!(st.position(4.5), (0, 0));
+        st.frames = 64 * 45 / 10 + 1; // row 64 -> wraps to row 16
+        assert_eq!(st.position(4.5), (0, 1));
+        st.frames = 520; // row 115.3 -> one more full loop + 3 rows
+        assert_eq!(st.position(4.5), (3, 1));
+    }
+
+    fn viper_nsf_test_header() -> Vec<u8> {
+        let mut h = vec![0u8; 128];
+        h[0..5].copy_from_slice(b"NESM\x1A");
+        h[5] = 1; h[6] = 1; h[7] = 1;
+        h[8..10].copy_from_slice(&0x8000u16.to_le_bytes());
+        h[10..12].copy_from_slice(&0x8000u16.to_le_bytes());
+        h[12..14].copy_from_slice(&0x8000u16.to_le_bytes());
+        h[0x6E..0x70].copy_from_slice(&0x411Au16.to_le_bytes());
+        h
     }
 
     #[test]

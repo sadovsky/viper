@@ -170,7 +170,9 @@ impl Song {
     /// Exact frame count for `rows` rows under the driver's 8.8 row clock,
     /// starting with an empty fractional accumulator.
     pub fn frames_for_rows(&self, rows: usize) -> u32 {
-        let speed = (self.frames_per_row * 256.0).round() as i64;
+        // The driver requires >= 1 frame per row; mirror that floor so an
+        // out-of-range tempo cannot spin here (emit() rejects it anyway).
+        let speed = ((self.frames_per_row * 256.0).round() as i64).max(256);
         let mut cnt: i64 = 0;
         let mut frames: u32 = 0;
         let mut done = 0usize;
