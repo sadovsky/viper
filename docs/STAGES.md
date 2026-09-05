@@ -58,6 +58,7 @@ Command mode:
 - `:set octave=4` — base octave for insert-mode piano row (0–8)
 - `:set theme=nes` / `:set theme=phosphor` — switch color theme
 - `:set still=on|off|toggle` — freeze the tempo-locked breathing animations
+- `:diff [phrase] <A> [B]` — compare two phrases in the grid; `:diff off` (or Esc) dismisses
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
 - `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`); `:viz off` hides it
 - `:sprite load <path> [WxH]` — load a PNG sprite sheet (≤4 opaque colors; cell size defaults to the whole image)
@@ -301,6 +302,44 @@ lives in viper.
   through one `mix` primitive that blends RGB numerically but switches
   named ANSI colors at the halfway point, so a user's terminal palette
   still decides what "yellow" is.
+
+- **Stage 27** ✅ — **Ghost preview and diff mode.** DESIGN.md's "because
+  it's text, because of course" pair, both built on one per-cell `Overlay`
+  the phrase grid composites over the authored cells.
+
+  Typing `:gen euclid pu1 5 16` or `:transpose +5` shows what the command
+  would do, dimmed and italic, before it commits; Esc discards it. The
+  guarantee that the ghost is exactly what commits comes from sharing the
+  transformation, not from mirroring it: preview runs `gen::dispatch` on a
+  throwaway clone of the song at the *current* `gen_seed`, and the commit
+  runs it at the same value — `App::take_gen_seed` is now the only place
+  that seed advances. `:transpose` likewise funnels through a new
+  `transpose_phrase_cells`, so the commit still records into macros while
+  the preview does not. Only cheap in-memory generators preview;
+  `:gen style` reads a directory off disk and `lsystem` expands
+  exponentially, so both are left out.
+
+  `:diff [phrase] <A> [B]` compares two phrases in the grid, `git`-style:
+  `+` added, `-` removed, `~` changed, in the pad the note field already
+  had, so the diff costs zero columns. A change marks only the fields that
+  differ, so a volume-only edit tints the volume column rather than
+  painting the cell. DESIGN.md asked for two phrases stacked vertically;
+  that needs about 40 rows and the grid is already 83 columns wide, so a
+  unified diff was built instead — it fits an 80x24 terminal, adds no
+  layout, and is closer to what `git diff` is. A standing diff is dropped
+  by any edit (one line in `snapshot`, which every mutation goes through),
+  by undo/redo, by leaving the phrase, and by Esc.
+
+  Signal is carried on backgrounds and the margin sigil rather than
+  foreground colour: every background in both themes is `Color::Rgb` and
+  blends, while most `nes` foregrounds are named ANSI colours that `mix`
+  deliberately snaps rather than resolving — a derived ghost would have
+  been invisible there.
+
+  Also fixed here: the channel headers emitted 16 columns against a
+  15-column data column, so every label sat one column right of its own
+  data, four by the DPCM column. The Stage 26 alignment test only checked
+  PU1, which is why it shipped.
 
 ### Generators
 

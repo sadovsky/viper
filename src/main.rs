@@ -66,6 +66,160 @@ impl Default for Phrase {
     }
 }
 
+// ---------- Stage 27: the overlay layer ----------
+
+/// Which fields of a cell actually differ. A volume-only change should
+/// tint the volume column, not paint the whole cell — a diff you can't
+/// read precisely is a diff you stop trusting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FieldMask {
+    pub note: bool,
+    pub instr: bool,
+    pub vol: bool,
+    pub fx: bool,
+}
+
+impl FieldMask {
+    fn between(a: Cell, b: Cell) -> Self {
+        // instr and vol render as `--` on a cell with no note, so a
+        // difference there is invisible and marking it would put a sigil
+        // beside two cells that look identical.
+        let both_empty = a.note.is_none() && b.note.is_none();
+        Self {
+            note: a.note != b.note,
+            instr: !both_empty && a.instr != b.instr,
+            vol: !both_empty && a.vol != b.vol,
+            fx: a.fx != b.fx,
+        }
+    }
+    fn any(self) -> bool {
+        self.note || self.instr || self.vol || self.fx
+    }
+}
+
+/// What an overlaid cell is doing relative to the authored grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// Ghost preview: the pending command would write this cell.
+    Proposed,
+    /// Ghost preview: the pending command would erase this cell.
+    Vanishing,
+    /// Diff: absent on the left, present on the right.
+    Added,
+    /// Diff: present on the left, gone on the right.
+    Removed,
+    /// Diff: present on both, some fields differ.
+    Changed(FieldMask),
+}
+
+impl Mark {
+    /// The margin glyph, in the pad the note field already had. Colors can
+    /// be themed away or lost on a monochrome terminal; the sigil cannot.
+    fn sigil(self) -> char {
+        match self {
+            Mark::Proposed | Mark::Vanishing => '·',
+            Mark::Added => '+',
+            Mark::Removed => '-',
+            Mark::Changed(_) => '~',
+        }
+    }
+    /// Which fields this mark recolors. Adds, removes and ghosts concern
+    /// the whole cell; a change concerns only what changed.
+    fn fields(self) -> FieldMask {
+        match self {
+            Mark::Changed(m) => m,
+            _ => FieldMask { note: true, instr: true, vol: true, fx: true },
+        }
+    }
+}
+
+/// One overlaid cell. The content travels with the mark because it is not
+/// in the phrase the renderer is reading: a proposed cell shows the note
+/// the command *would* write, a removed cell shows the note that is going
+/// away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkedCell {
+    pub cell: Cell,
+    pub mark: Mark,
+}
+
+/// A sparse per-cell layer drawn over the phrase grid: the ghost of a
+/// command that has not committed, or a diff against another phrase.
+/// `None` entries fall straight through to the authored cell.
+#[derive(Clone, Debug)]
+pub(crate) struct Overlay {
+    grid: [[Option<MarkedCell>; CHANNELS]; STEPS_PER_PHRASE],
+    /// Appended to the pane title. The only place the user is told how to
+    /// read the colors, so it earns its space.
+    title: String,
+}
+
+impl Overlay {
+    /// Ghost: compare the authored phrase against what the command would
+    /// leave in the same slot. Returns `None` when nothing would change,
+    /// so a no-op command draws nothing rather than an empty overlay.
+    fn ghost(base: &Phrase, proposed: &Phrase, title: String) -> Option<Self> {
+        let mut grid = [[None; CHANNELS]; STEPS_PER_PHRASE];
+        let mut any = false;
+        for s in 0..STEPS_PER_PHRASE {
+            for c in 0..CHANNELS {
+                let (a, b) = (base.cells[s][c], proposed.cells[s][c]);
+                if a == b {
+                    continue;
+                }
+                any = true;
+                grid[s][c] = Some(if b.note.is_none() && a.note.is_some() {
+                    // Show what is about to go away, not the blank.
+                    MarkedCell { cell: a, mark: Mark::Vanishing }
+                } else {
+                    MarkedCell { cell: b, mark: Mark::Proposed }
+                });
+            }
+        }
+        any.then_some(Self { grid, title })
+    }
+
+    /// Diff: `left` is the phrase on screen, `right` the one compared
+    /// against it.
+    fn diff(left: &Phrase, right: &Phrase, title: String) -> Self {
+        let mut grid = [[None; CHANNELS]; STEPS_PER_PHRASE];
+        for s in 0..STEPS_PER_PHRASE {
+            for c in 0..CHANNELS {
+                let (a, b) = (left.cells[s][c], right.cells[s][c]);
+                if a == b {
+                    continue;
+                }
+                grid[s][c] = Some(match (a.note.is_none(), b.note.is_none()) {
+                    (true, false) => MarkedCell { cell: b, mark: Mark::Added },
+                    (false, true) => MarkedCell { cell: a, mark: Mark::Removed },
+                    _ => {
+                        let mask = FieldMask::between(a, b);
+                        if !mask.any() {
+                            continue;
+                        }
+                        MarkedCell { cell: b, mark: Mark::Changed(mask) }
+                    }
+                });
+            }
+        }
+        Self { grid, title }
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        let (mut add, mut del, mut chg) = (0, 0, 0);
+        for row in &self.grid {
+            for m in row.iter().flatten() {
+                match m.mark {
+                    Mark::Added | Mark::Proposed => add += 1,
+                    Mark::Removed | Mark::Vanishing => del += 1,
+                    Mark::Changed(_) => chg += 1,
+                }
+            }
+        }
+        (add, del, chg)
+    }
+}
+
 pub(crate) const INSTRUMENTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -547,6 +701,12 @@ struct App {
     /// Free-running counter bumped every UI tick. Scope uses it to animate
     /// phase so waveforms scroll instead of snapshot-freezing at rest.
     viz_tick: u32,
+    /// Stage 27: ghost preview of the `:` command being typed. Lives only
+    /// while `mode == Command`, recomputed on every keystroke, discarded on
+    /// Esc and on Enter.
+    ghost: Option<Overlay>,
+    /// Stage 27: `:diff`. Sticky until dismissed or invalidated by an edit.
+    diff: Option<Overlay>,
     /// `:set still=on` — freeze the tempo-locked breathing animations.
     /// Signal-driven feedback (channel LEDs, the playhead) stays live;
     /// only the decorative pulses stop. See [`Breath`].
@@ -623,6 +783,8 @@ impl App {
             show_viz: false,
             viz_kind: viz::VizKind::Bars,
             viz_tick: 0,
+            ghost: None,
+            diff: None,
             still: false,
             sprite_sheets: HashMap::new(),
             sprite_placements: Vec::new(),
@@ -666,7 +828,30 @@ impl App {
     /// Snapshot the current song into the undo stack and clear the redo stack.
     /// Call this *before* mutating. Cap the stack so edits over a long session
     /// don't grow the heap without bound.
+    /// The layer the phrase grid draws over the authored cells. A live
+    /// ghost outranks a standing diff: you are asking a question about
+    /// what happens next, so the comparison steps aside until you are done.
+    fn overlay(&self) -> Option<&Overlay> {
+        self.ghost.as_ref().or(self.diff.as_ref())
+    }
+
+    /// The seed for the next `:gen`, consuming it. The **only** place
+    /// `gen_seed` advances. The ghost preview reads the field directly
+    /// without advancing it, so preview and commit run the same generator
+    /// at the same seed; if anything else ever bumped the seed between the
+    /// two, they would silently disagree and the user would get something
+    /// other than what they saw.
+    fn take_gen_seed(&mut self) -> u64 {
+        let seed = self.gen_seed;
+        self.gen_seed = self.gen_seed.wrapping_add(1);
+        seed
+    }
+
     fn snapshot(&mut self) {
+        // A standing diff describes a comparison this edit is about to
+        // falsify. Every mutation in the app snapshots first, so clearing
+        // it here covers all of them from one line.
+        self.diff = None;
         const UNDO_LIMIT: usize = 200;
         if self.undo_stack.len() == UNDO_LIMIT {
             self.undo_stack.remove(0);
@@ -699,8 +884,11 @@ impl App {
     }
 
     /// After restoring a prior Song (from undo/redo or `:e`), make sure the
-    /// editor cursor and phrase index still point at valid cells.
+    /// editor cursor and phrase index still point at valid cells. Also drops
+    /// a standing diff: undo and redo replace the song wholesale without
+    /// snapshotting, so they bypass the clear in `snapshot`.
     fn clamp_cursor_to_song(&mut self) {
+        self.diff = None;
         if self.song.current_phrase >= self.song.phrases.len() {
             self.song.current_phrase = self.song.phrases.len().saturating_sub(1);
         }
@@ -1029,6 +1217,34 @@ struct Theme {
 
     // Visualizer
     viz_bg: Color,
+
+    // Stage 27 overlay: ghost preview and diff. Declared per theme rather
+    // than derived with `mix`, because `mix` snaps *named* colors at the
+    // halfway point and every field foreground under `nes` is named — a
+    // derived ghost would be invisible there. Backgrounds are `Rgb` in both
+    // themes, so they blend reliably and carry most of the signal.
+    ghost_fg: Color,
+    ghost_bg: Color,
+    vanish_bg: Color,
+    diff_add_fg: Color,
+    diff_add_bg: Color,
+    diff_del_fg: Color,
+    diff_del_bg: Color,
+    diff_chg_fg: Color,
+    diff_chg_bg: Color,
+}
+
+impl Theme {
+    /// Foreground and background for an overlay mark.
+    fn mark_colors(&self, mark: Mark) -> (Color, Color) {
+        match mark {
+            Mark::Proposed => (self.ghost_fg, self.ghost_bg),
+            Mark::Vanishing => (self.ghost_fg, self.vanish_bg),
+            Mark::Added => (self.diff_add_fg, self.diff_add_bg),
+            Mark::Removed => (self.diff_del_fg, self.diff_del_bg),
+            Mark::Changed(_) => (self.diff_chg_fg, self.diff_chg_bg),
+        }
+    }
 }
 
 impl Theme {
@@ -1064,6 +1280,16 @@ impl Theme {
         instr_value: Color::Green,
         instr_label: Color::Gray,
         viz_bg: Color::Rgb(12, 12, 24),
+        // Colour does the talking here, matching git's vocabulary.
+        ghost_fg: Color::DarkGray,
+        ghost_bg: Color::Rgb(26, 30, 44),
+        vanish_bg: Color::Rgb(40, 20, 20),
+        diff_add_fg: Color::Green,
+        diff_add_bg: Color::Rgb(12, 40, 16),
+        diff_del_fg: Color::Red,
+        diff_del_bg: Color::Rgb(48, 14, 14),
+        diff_chg_fg: Color::Yellow,
+        diff_chg_bg: Color::Rgb(46, 40, 10),
     };
 
     // Amber-on-black CRT. Three tiers of amber (bright/mid/dark) + black.
@@ -1099,6 +1325,17 @@ impl Theme {
         instr_value: Color::Rgb(255, 220, 120),
         instr_label: Color::Rgb(200, 130, 0),
         viz_bg: Color::Rgb(10, 5, 0),
+        // Near-monochrome by design, so brightness and the margin sigil
+        // carry the distinction instead of hue.
+        ghost_fg: Color::Rgb(140, 80, 0),
+        ghost_bg: Color::Rgb(30, 18, 0),
+        vanish_bg: Color::Rgb(38, 14, 0),
+        diff_add_fg: Color::Rgb(255, 220, 120),
+        diff_add_bg: Color::Rgb(52, 34, 0),
+        diff_del_fg: Color::Rgb(120, 66, 0),
+        diff_del_bg: Color::Rgb(34, 12, 0),
+        diff_chg_fg: Color::Rgb(255, 200, 60),
+        diff_chg_bg: Color::Rgb(48, 36, 0),
     };
 
     fn by_name(n: &str) -> Option<Self> {
@@ -1309,6 +1546,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     let p = app.phrase();
     let theme = &app.theme;
     let breath = Breath::new(app);
+    let overlay = app.overlay();
     let mut lines: Vec<Line> = Vec::with_capacity(STEPS_PER_PHRASE + 2);
 
     // Visual-mode rectangle (inclusive on both axes).
@@ -1358,7 +1596,12 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 style = style.bg(theme.column_bg);
             }
         }
-        header.push(Span::styled(format!(" {:<15}", label), style));
+        // 15 columns, matching a data column exactly (note 5, instr 2, gap 1,
+        // vol 2, gap 1, fx 3, trail 1). It read 16 until Stage 27, which drifted
+        // every header one column right of its own data, four by the DPCM
+        // column. The longest label is "DPCM MUTE" at 9, so 14 + the lead is
+        // plenty.
+        header.push(Span::styled(format!(" {:<14}", label), style));
     }
     lines.push(Line::from(header));
     lines.push(Line::from(""));
@@ -1396,7 +1639,13 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         // grid lines up with the header's 6-space lead whether or not the
         // playhead is in it.
         let mut spans = vec![Span::styled(format!(" {} {:02X} ", glyph, i), label_style)];
-        for (c, cell) in row.iter().enumerate() {
+        for (c, authored) in row.iter().enumerate() {
+            // A marked cell draws the overlay's content, not what is in the
+            // phrase today: a proposed cell shows the note the command would
+            // write, a removed one shows the note that is going away.
+            let over = overlay.and_then(|o| o.grid[i][c]);
+            let cell = &over.map_or(*authored, |m| m.cell);
+            let mark = over.map(|m| m.mark);
             let has_note = cell.note.is_some();
             let note_text = note_name(cell.note);
             let instr_text = if has_note {
@@ -1410,10 +1659,21 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 None => "---".into(),
             };
 
-            let note_color = if has_note { theme.note } else { theme.dim };
-            let instr_color = if has_note { theme.instr } else { theme.dim };
-            let vol_color = if has_note && cell.vol > 0 { theme.vol } else { theme.dim };
-            let fx_color = if cell.fx.is_some() { theme.fx } else { theme.dim };
+            let mut note_color = if has_note { theme.note } else { theme.dim };
+            let mut instr_color = if has_note { theme.instr } else { theme.dim };
+            let mut vol_color = if has_note && cell.vol > 0 { theme.vol } else { theme.dim };
+            let mut fx_color = if cell.fx.is_some() { theme.fx } else { theme.dim };
+            // A mark recolors only the fields it concerns, so a volume-only
+            // change tints the volume column and leaves the note reading
+            // normally.
+            if let Some(m) = mark {
+                let (fg, _) = theme.mark_colors(m);
+                let f = m.fields();
+                if f.note { note_color = fg; }
+                if f.instr { instr_color = fg; }
+                if f.vol { vol_color = fg; }
+                if f.fx { fx_color = fg; }
+            }
 
             let in_selection = selection
                 .map(|(s0, s1, c0, c1)| i >= s0 && i <= s1 && c >= c0 && c <= c1)
@@ -1435,14 +1695,34 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 None
             };
 
+            // The overlay composites on top of whatever that produced, so
+            // the playhead still sweeps visibly under a ghost or a diff. The
+            // cursor is the one thing it will not cover — you must never
+            // lose track of where you are.
+            let bg = match mark {
+                Some(m) if !is_cursor => {
+                    let (_, tint) = theme.mark_colors(m);
+                    Some(mix(bg.unwrap_or(theme.viz_bg), tint, 0.75))
+                }
+                _ => bg,
+            };
+
+            let ghosting = matches!(mark, Some(Mark::Proposed) | Some(Mark::Vanishing));
             let apply = |fg: Color| {
                 let mut s = Style::default().fg(fg);
                 if let Some(b) = bg { s = s.bg(b); }
                 if is_cursor { s = s.add_modifier(Modifier::BOLD); }
+                // Reinforcement only: DIM is unevenly supported, so the
+                // tint and the sigil have to stand on their own.
+                if ghosting { s = s.add_modifier(Modifier::DIM | Modifier::ITALIC); }
                 s
             };
 
-            spans.push(Span::styled(format!(" {} ", note_text), apply(note_color)));
+            // git puts +/- in the left margin, and so do we. It costs zero
+            // columns — the note field already opened with a pad — and it is
+            // the one signal that survives a monochrome terminal.
+            let sigil = mark.map_or(' ', Mark::sigil);
+            spans.push(Span::styled(format!("{}{} ", sigil, note_text), apply(note_color)));
             spans.push(Span::styled(instr_text, apply(instr_color)));
             spans.push(Span::styled(" ".to_string(), apply(theme.dim)));
             spans.push(Span::styled(vol_text, apply(vol_color)));
@@ -1489,6 +1769,12 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         app.song.bpm,
         if app.playing { "● PLAY" } else { "■ STOP" },
     );
+    // An overlay is a mode you can be in without having asked for it to
+    // persist, so the pane says which one and, for a diff, between what.
+    let title = match overlay {
+        Some(o) => format!("{}{}  ", title, o.title),
+        None => title,
+    };
     // The frame brightens on the downbeat of every bar — the whole pane
     // taking a breath with the music.
     let block = Block::default()
@@ -1571,6 +1857,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set octave=4",   "base octave for insert-mode piano row (0–8)"),
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":set still=on",   "freeze the tempo-locked breathing animations (off / toggle)"),
+        row(":diff [A] B",     "compare phrase A (or the current one) against B; :diff off dismisses"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
         row(":mute [N]",        "toggle mute on cursor channel (or N: 1-5 / pu1..dpcm)"),
@@ -2206,7 +2493,11 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             // "stop everything" escape hatch from Normal.
             app.pending = Pending::None;
             app.count = 0;
-            if app.recording_macro.is_some() {
+            if app.diff.take().is_some() {
+                // A standing diff is a mode you can forget you are in; Esc
+                // is where hands already go to get out of one.
+                app.status = "diff off".into();
+            } else if app.recording_macro.is_some() {
                 let (letter, _) = app.recording_macro.take().unwrap();
                 app.status = format!("q{}: recording cancelled", letter);
             } else if app.any_recording() {
@@ -2297,6 +2588,16 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_command(app: &mut App, key: KeyEvent) {
+    handle_command_key(app, key);
+    // Every arm above either edits the command buffer or leaves the mode,
+    // and the ghost is a pure function of that buffer — so refresh it in
+    // one place rather than sprinkling calls through fifteen arms.
+    // `refresh_ghost` clears it unless we are still in Command mode, which
+    // covers both the Esc and the Enter path.
+    refresh_ghost(app);
+}
+
+fn handle_command_key(app: &mut App, key: KeyEvent) {
     use crossterm::event::KeyModifiers;
     match key.code {
         KeyCode::Esc => {
@@ -2521,8 +2822,16 @@ fn execute_command(app: &mut App, cmd: &str) {
         return;
     }
     let parts: Vec<&str> = cmd.split_whitespace().collect();
+    // Note: the commit paths for the previewable commands are the ordinary
+    // arms below. They already call the very functions `PreviewCmd::apply`
+    // calls — `gen::dispatch` at the seed `take_gen_seed` hands out, and
+    // `transpose_phrase_cells` — so preview and commit agree by sharing the
+    // transformation, without routing the commit through a second dispatch
+    // that would bypass `perform` and stop `:transpose` recording into
+    // macros.
     match parts.as_slice() {
         ["q"] | ["q!"] | ["quit"] | ["quit!"] => { app.quit = true; }
+        ["diff", rest @ ..] => diff_cmd(app, rest),
         ["help"] | ["h"] => {
             app.mode = Mode::Help;
             app.status = "help — q/Esc/? to close".into();
@@ -2775,8 +3084,7 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["gen", rest @ ..] => {
             app.snapshot();
-            let seed = app.gen_seed;
-            app.gen_seed = app.gen_seed.wrapping_add(1);
+            let seed = app.take_gen_seed();
             match gen::dispatch(&mut app.song, rest, seed) {
                 Ok(msg) => { app.status = msg; }
                 Err(e) => {
@@ -3723,6 +4031,8 @@ fn goto_phrase(app: &mut App, idx: usize) {
     }
     app.song.current_phrase = idx;
     app.cursor_step = 0;
+    // A diff names two specific phrases; walking away from one ends it.
+    app.diff = None;
     app.status = format!("phrase {:02X}", idx);
 }
 
@@ -4047,15 +4357,144 @@ fn transpose_phrase(app: &mut App, tok: &str) {
     perform(app, MacroOp::Transpose(delta));
 }
 
-fn transpose_delta(app: &mut App, delta: i32) {
+/// `:diff <A> <B>` compares phrase A (shown in the grid) against B;
+/// `:diff <B>` compares the current phrase against B; `:diff off` dismisses.
+///
+/// DESIGN.md describes two phrases stacked vertically, but two 16-step grids
+/// need about 40 rows and the grid is already 83 columns wide — it does not
+/// survive an 80x24 terminal. A unified diff, A in the grid with B's changes
+/// composited on top and `+ - ~` in the margin, needs no new layout, adds no
+/// columns, and is closer to what `git diff` actually is.
+fn diff_cmd(app: &mut App, rest: &[&str]) {
+    let parse = |t: &str| usize::from_str_radix(t, 16).ok().filter(|&i| i < app.song.phrases.len());
+    let (a, b) = match rest {
+        [] | ["off"] | ["clear"] => {
+            let had = app.diff.take().is_some();
+            app.status = if had { "diff off".into() } else { "usage: :diff [phrase] <A> [B] | :diff off".into() };
+            return;
+        }
+        ["phrase", x] | [x] => (app.song.current_phrase, parse(x)),
+        ["phrase", x, y] | [x, y] => match parse(x) {
+            Some(i) => (i, parse(y)),
+            None => (usize::MAX, None),
+        },
+        _ => {
+            app.status = "usage: :diff [phrase] <A> [B] | :diff off".into();
+            return;
+        }
+    };
+    let (Some(b), true) = (b, a < app.song.phrases.len()) else {
+        app.status = format!("diff: no such phrase (have {})", app.song.phrases.len());
+        return;
+    };
+    // Show A in the grid so "edit A until it matches B" is a real workflow.
+    app.song.current_phrase = a;
+    app.cursor_step = app.cursor_step.min(STEPS_PER_PHRASE - 1);
+    let overlay = Overlay::diff(
+        &app.song.phrases[a],
+        &app.song.phrases[b],
+        format!("◈ diff {:02X}→{:02X}", a, b),
+    );
+    let (add, del, chg) = overlay.counts();
+    app.status = format!("diff {:02X} → {:02X}: +{} -{} ~{}", a, b, add, del, chg);
+    app.diff = Some(overlay);
+}
+
+// ---------- Stage 27: previewable commands ----------
+
+/// A `:` command that can run against a bare [`Song`]. Parsing is pure — no
+/// `App`, no I/O, no status writes — so the ghost preview and Enter run
+/// literally the same code and cannot disagree about what a command means.
+enum PreviewCmd<'a> {
+    Gen(&'a [&'a str]),
+    Transpose(i32),
+}
+
+/// Generators cheap and self-contained enough to re-run on every keystroke.
+///
+/// `lsystem` expands exponentially in its iteration count and `cellular`
+/// is only meaningful once its arguments are complete, so both are left out
+/// until there is a measurement to justify them. `style` is excluded a level
+/// up: it reads a directory off disk and replaces the whole song, which one
+/// phrase of overlay could not honestly show anyway.
+const PREVIEWABLE_GENERATORS: &[&str] = &[
+    "four", "four_on_floor", "euclid", "scale", "arp", "drums",
+    "chord_prog", "chords", "prog", "bassline", "bass",
+];
+
+impl<'a> PreviewCmd<'a> {
+    /// `None` means "not previewable" — silently, with no status write.
+    fn parse(parts: &'a [&'a str]) -> Option<Self> {
+        match parts {
+            ["gen", "style", ..] => None,
+            ["gen", rest @ ..] => {
+                let name = rest.first()?;
+                PREVIEWABLE_GENERATORS.contains(name).then(|| Self::Gen(rest))
+            }
+            ["transpose", n] | ["tr", n] => n.parse().ok().map(Self::Transpose),
+            _ => None,
+        }
+    }
+
+    fn apply(&self, song: &mut Song, seed: u64) -> Result<String> {
+        match self {
+            Self::Gen(args) => gen::dispatch(song, args, seed),
+            Self::Transpose(d) => transpose_song(song, *d),
+        }
+    }
+}
+
+/// Transpose the song's current phrase, returning the message the commit
+/// would print. `Err` for the cases that should leave the song untouched.
+fn transpose_song(song: &mut Song, delta: i32) -> Result<String> {
     if delta == 0 {
-        app.status = "transpose: 0 semitones (no-op)".into();
+        anyhow::bail!("transpose: 0 semitones (no-op)");
+    }
+    let idx = song.current_phrase.min(song.phrases.len().saturating_sub(1));
+    let moved = transpose_phrase_cells(&mut song.phrases[idx], delta);
+    if moved == 0 {
+        anyhow::bail!("transpose: nothing to move (or all clamped)");
+    }
+    let sign = if delta > 0 { "+" } else { "" };
+    Ok(format!("transposed {} note(s) by {}{} semitones", moved, sign, delta))
+}
+
+/// Recompute the ghost preview from the command line. Called after every
+/// keystroke in Command mode, which is the only thing that can change its
+/// input — nothing else mutates `app.song` while the command line is open.
+fn refresh_ghost(app: &mut App) {
+    app.ghost = None;
+    if app.mode != Mode::Command {
         return;
     }
-    let was_dirty = app.dirty;
-    app.snapshot();
+    let cmd = app.command_buf.trim().to_string();
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let Some(pc) = PreviewCmd::parse(&parts) else { return };
+
+    // Run against a throwaway clone at the *same* seed the commit will
+    // read. A Song is all small data, so this costs nothing per keystroke.
+    let mut proposed = app.song.clone();
+    if pc.apply(&mut proposed, app.gen_seed).is_err() {
+        return; // half-typed or invalid: preview nothing, say nothing
+    }
+    let idx = app.song.current_phrase;
+    let (Some(base), Some(after)) = (app.song.phrases.get(idx), proposed.phrases.get(idx)) else {
+        return;
+    };
+    // Some generators (chord_prog, bassline) write following phrases too.
+    // The overlay can only show one, so the title says so rather than
+    // quietly under-reporting.
+    let extra = proposed.phrases.len().saturating_sub(app.song.phrases.len());
+    let more = if extra > 0 { format!(" +{} more phrase(s)", extra) } else { String::new() };
+    app.ghost = Overlay::ghost(base, after, format!("◈ preview{}", more));
+}
+
+/// Shift every pitched note in `phrase` by `delta` semitones, returning how
+/// many actually moved. NOI is skipped — its "pitch" selects a noise period,
+/// not a note. Pulled out of [`transpose_delta`] so the ghost preview can run
+/// exactly the same transformation against a throwaway copy of the song.
+fn transpose_phrase_cells(phrase: &mut Phrase, delta: i32) -> usize {
     let mut moved = 0;
-    let phrase = app.phrase_mut();
     for row in phrase.cells.iter_mut() {
         for (ch, cell) in row.iter_mut().enumerate() {
             if ch == 3 /* NOI */ { continue; }
@@ -4068,6 +4507,17 @@ fn transpose_delta(app: &mut App, delta: i32) {
             }
         }
     }
+    moved
+}
+
+fn transpose_delta(app: &mut App, delta: i32) {
+    if delta == 0 {
+        app.status = "transpose: 0 semitones (no-op)".into();
+        return;
+    }
+    let was_dirty = app.dirty;
+    app.snapshot();
+    let moved = transpose_phrase_cells(app.phrase_mut(), delta);
     if moved == 0 {
         // No pitched notes moved — drop the snapshot so undo stays clean.
         app.undo_stack.pop();
@@ -4420,4 +4870,285 @@ mod tests {
             "PU1's column header sits over PU1's cells",
         );
     }
+
+    /// Every channel's header must sit over its own data, not just PU1's.
+    /// The header emitted 16 columns per channel against a 15-column data
+    /// column until Stage 27, so labels drifted one column right per
+    /// channel — four by the DPCM column — and the PU1-only assertion above
+    /// never noticed.
+    #[test]
+    fn every_channel_header_aligns_with_its_column() {
+        let app = playing_app(0, 0.0);
+        let header = row_symbols(&app, 1);
+        let row = row_symbols(&app, 3);
+        let starts = |line: &[String]| -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut prev_blank = true;
+            for (x, s) in line.iter().enumerate().skip(GLYPH_X + 2) {
+                let ch = s.chars().next().unwrap_or(' ');
+                let solid = ch.is_ascii_alphanumeric() || ch == '-';
+                if solid && prev_blank {
+                    out.push(x);
+                }
+                prev_blank = !solid;
+            }
+            out
+        };
+        let label_x = starts(&header);
+        let field_x = starts(&row);
+        assert_eq!(label_x.len(), CHANNELS, "one header label per channel: {:?}", label_x);
+        for (ch, &x) in label_x.iter().enumerate() {
+            assert!(field_x.contains(&x), "{} header at {} has no field there: {:?}", CH_NAMES[ch], x, field_x);
+        }
+    }
+
+    // ---------- Stage 27: ghost preview and diff ----------
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::from(code));
+    }
+
+    /// Open the command line and type `cmd`, exactly as a user would.
+    fn type_command(app: &mut App, cmd: &str) {
+        app.show_splash = false;
+        press(app, KeyCode::Char(':'));
+        for c in cmd.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// What the grid would hold if the ghost committed: the authored
+    /// phrase with every mark applied.
+    fn materialize(app: &App) -> Phrase {
+        let mut p = app.phrase().clone();
+        let o = app.ghost.as_ref().expect("a ghost");
+        for s in 0..STEPS_PER_PHRASE {
+            for c in 0..CHANNELS {
+                match o.grid[s][c] {
+                    Some(MarkedCell { cell, mark: Mark::Proposed }) => p.cells[s][c] = cell,
+                    Some(MarkedCell { mark: Mark::Vanishing, .. }) => p.cells[s][c] = Cell::default(),
+                    _ => {}
+                }
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn a_ghost_preview_changes_nothing() {
+        let mut app = App::new();
+        let before = app.song.phrases.clone();
+        let seed = app.gen_seed;
+        type_command(&mut app, "gen euclid pu1 5 16");
+        assert!(app.ghost.is_some(), "a complete command should preview");
+        assert_eq!(app.song.phrases, before, "preview must not touch the song");
+        assert!(app.undo_stack.is_empty(), "preview must not touch undo");
+        assert!(!app.dirty, "preview must not dirty the file");
+        assert_eq!(app.gen_seed, seed, "only the commit may advance the seed");
+    }
+
+    #[test]
+    fn escape_discards_the_preview() {
+        let mut app = App::new();
+        let before = app.song.phrases.clone();
+        type_command(&mut app, "gen euclid noi 7 16");
+        assert!(app.ghost.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.ghost.is_none());
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.song.phrases, before);
+    }
+
+    #[test]
+    fn what_you_preview_is_what_enter_commits() {
+        // The whole point of the feature: the ghost and the commit are the
+        // same call at the same seed, so they cannot disagree.
+        for cmd in ["gen euclid pu1 5 16", "gen four", "gen scale pu1 A minor 0.5", "transpose +5", "transpose -12"] {
+            let mut app = App::new();
+            // From an empty phrase, so even `gen four` has something to
+            // propose — against the demo song it is a genuine no-op.
+            app.song.phrases[0] = Phrase::default();
+            app.song.phrases[0].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+            type_command(&mut app, cmd);
+            let expected = materialize(&app);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(*app.phrase(), expected, "{:?} committed something other than it previewed", cmd);
+            assert!(app.ghost.is_none(), "{:?} left a ghost behind", cmd);
+        }
+    }
+
+    #[test]
+    fn a_seeded_generator_previews_and_commits_the_same_notes() {
+        // The randomised path is where a stray seed bump would show up.
+        let mut app = App::new();
+        type_command(&mut app, "gen scale pu2 C major 0.4");
+        let expected = materialize(&app);
+        let seed = app.gen_seed;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(*app.phrase(), expected);
+        assert_eq!(app.gen_seed, seed + 1, "the commit consumes exactly one seed");
+    }
+
+    #[test]
+    fn transpose_previews_without_recording_a_macro() {
+        // Preview must not go through `perform`, which appends to the macro
+        // buffer — previewing while recording would poison the macro.
+        let mut app = App::new();
+        app.recording_macro = Some(('a', Vec::new()));
+        type_command(&mut app, "transpose +5");
+        assert_eq!(app.recording_macro.as_ref().unwrap().1.len(), 0, "preview must not record");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.recording_macro.as_ref().unwrap().1.len(), 1, "the commit records once");
+    }
+
+    #[test]
+    fn partial_and_unpreviewable_commands_say_nothing() {
+        for cmd in ["gen", "gen eucl", "gen euclid pu1 x 16", "wq", "q", "set bpm=140", "gen style styles/neutral", "gen lsystem axiom=A rules=A=AB"] {
+            let mut app = App::new();
+            let status = app.status.clone();
+            type_command(&mut app, cmd);
+            assert!(app.ghost.is_none(), "{:?} should not preview", cmd);
+            assert_eq!(app.status, status, "{:?} should not write a status", cmd);
+            press(&mut app, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn a_no_op_command_previews_nothing() {
+        let mut app = App::new();
+        type_command(&mut app, "transpose +0");
+        assert!(app.ghost.is_none(), "a no-op must not flicker an empty overlay");
+    }
+
+    #[test]
+    fn ghost_cells_show_the_note_the_command_would_write() {
+        let mut app = App::new();
+        app.song.phrases[0] = Phrase::default(); // start empty so ghosts stand out
+        app.still = true;
+        type_command(&mut app, "gen four");
+        let o = app.ghost.as_ref().expect("ghost");
+        let marked: Vec<(usize, usize)> = (0..STEPS_PER_PHRASE)
+            .flat_map(|s| (0..CHANNELS).map(move |c| (s, c)))
+            .filter(|&(s, c)| o.grid[s][c].is_some())
+            .collect();
+        assert!(!marked.is_empty(), "four-on-the-floor should propose notes");
+        let (s, c) = marked[0];
+        assert_eq!(o.grid[s][c].unwrap().mark, Mark::Proposed);
+        assert!(app.song.phrases[0].cells[s][c].note.is_none(), "the song itself is still empty there");
+        // The proposed note reaches the screen, with its margin sigil.
+        let row = row_symbols(&app, s as u16 + 3);
+        let text: String = row.concat();
+        assert!(text.contains('·'), "a proposed cell carries the ghost sigil: {:?}", text);
+    }
+
+    #[test]
+    fn diff_classifies_added_removed_and_changed() {
+        let note = |n: u8| Cell { note: Some(n), instr: 0, vol: 0, fx: None };
+        let mut a = Phrase::default();
+        let mut b = Phrase::default();
+        b.cells[0][0] = note(60);                       // added
+        a.cells[1][0] = note(62);                       // removed
+        a.cells[2][0] = note(64);
+        b.cells[2][0] = note(65);                       // changed: note
+        a.cells[3][0] = note(67);
+        b.cells[3][0] = Cell { vol: 9, ..note(67) };    // changed: volume only
+        a.cells[4][0] = note(69);
+        b.cells[4][0] = note(69);                       // identical
+
+        let d = Overlay::diff(&a, &b, String::new());
+        assert_eq!(d.grid[0][0].unwrap().mark, Mark::Added);
+        assert_eq!(d.grid[1][0].unwrap().mark, Mark::Removed);
+        assert_eq!(d.grid[1][0].unwrap().cell.note, Some(62), "a removal shows what is going away");
+        assert!(matches!(d.grid[2][0].unwrap().mark, Mark::Changed(m) if m.note));
+        match d.grid[3][0].unwrap().mark {
+            Mark::Changed(m) => assert_eq!((m.note, m.vol, m.instr, m.fx), (false, true, false, false),
+                "a volume-only change marks only the volume"),
+            other => panic!("expected Changed, got {:?}", other),
+        }
+        assert!(d.grid[4][0].is_none(), "identical cells are not marked");
+        assert_eq!(d.counts(), (1, 1, 2));
+    }
+
+    #[test]
+    fn empty_cells_do_not_diff_on_fields_that_never_render() {
+        // instr and vol print as `--` when there is no note, so a difference
+        // there is invisible; marking it would put a sigil beside two cells
+        // that look identical.
+        let a = Phrase::default();
+        let mut b = Phrase::default();
+        b.cells[0][0] = Cell { note: None, instr: 7, vol: 9, fx: None };
+        assert!(Overlay::diff(&a, &b, String::new()).grid[0][0].is_none());
+        // An fx-only difference does render, so it is marked.
+        let mut c = Phrase::default();
+        c.cells[0][0] = Cell { note: None, instr: 0, vol: 0, fx: Some((b'V', 0x52)) };
+        assert!(Overlay::diff(&a, &c, String::new()).grid[0][0].is_some());
+    }
+
+    #[test]
+    fn a_standing_diff_is_cleared_by_anything_that_invalidates_it() {
+        let with_diff = || {
+            let mut app = App::new();
+            app.show_splash = false;
+            app.song.phrases.push(Phrase::default());
+            execute_command(&mut app, "diff phrase 00 01");
+            assert!(app.diff.is_some(), "diff should be showing");
+            app
+        };
+        // Any edit: every mutation snapshots first, so one clear covers all.
+        let mut app = with_diff();
+        app.snapshot();
+        assert!(app.diff.is_none(), "an edit invalidates the comparison");
+        // Undo and redo replace the song wholesale without snapshotting.
+        let mut app = with_diff();
+        app.undo_stack.push(app.song.clone());
+        app.undo();
+        assert!(app.diff.is_none(), "undo invalidates it");
+        // Walking to another phrase.
+        let mut app = with_diff();
+        goto_phrase(&mut app, 1);
+        assert!(app.diff.is_none(), "leaving the phrase ends the diff");
+        // Esc, the "stop everything" key.
+        let mut app = with_diff();
+        press(&mut app, KeyCode::Esc);
+        assert!(app.diff.is_none(), "Esc dismisses it");
+        assert_eq!(app.status, "diff off");
+    }
+
+    #[test]
+    fn diff_reports_its_counts_and_rejects_missing_phrases() {
+        let mut app = App::new();
+        app.song.phrases[0] = Phrase::default();
+        app.song.phrases.push(Phrase::default());
+        app.song.phrases[1].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        execute_command(&mut app, "diff phrase 00 01");
+        assert!(app.status.contains("+1"), "{}", app.status);
+        execute_command(&mut app, "diff off");
+        assert!(app.diff.is_none());
+        execute_command(&mut app, "diff phrase 00 09");
+        assert!(app.diff.is_none() && app.status.contains("no such phrase"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_overlay_never_hides_the_cursor() {
+        let mut app = App::new();
+        app.still = true;
+        app.song.phrases[0] = Phrase::default();
+        type_command(&mut app, "gen four");
+        let o = app.ghost.as_ref().unwrap();
+        let (s, c) = (0..STEPS_PER_PHRASE)
+            .flat_map(|s| (0..CHANNELS).map(move |c| (s, c)))
+            .find(|&(s, c)| o.grid[s][c].is_some())
+            .expect("a marked cell");
+        app.cursor_step = s;
+        app.cursor_ch = c;
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Find the cursor's note glyph and check it kept the cursor colour.
+        let y = s as u16 + 3;
+        let x = 2 + 5 + (c as u16) * 15 + 1;
+        let bg = buf.cell((x, y)).unwrap().bg;
+        assert_eq!(bg, app.theme.cursor_bg, "the mark tint must not cover the cursor");
+    }
+
 }

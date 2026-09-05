@@ -91,11 +91,11 @@ log ("▸ scene B queued · step 0c · ch2 muted").
 ## The stuff that makes it feel alive
 
 > **Status.** The playhead character and the breath system below shipped in
-> Stage 26 (see [`STAGES.md`](STAGES.md)), along with `:set still` for
-> anyone who wants the motion off. The stacked three-phrase layout, ghost
-> command preview, diff mode, the context-aware help overlay, the live
-> instrument panel, the queue-drain bar, and phosphor scanlines are still
-> only described here.
+> Stage 26, and ghost command preview and diff mode in Stage 27 (see
+> [`STAGES.md`](STAGES.md)), along with `:set still` for anyone who wants
+> the motion off. Still only described here: the stacked three-phrase
+> layout, the context-aware help overlay, the live instrument panel, the
+> queue-drain bar, register thumbnails, and phosphor scanlines.
 
 ### The playhead is a character, not a cursor
 
@@ -141,10 +141,16 @@ the result, then commit.
 
 ### Diff mode
 
-`:diff phrase 00 03` splits the phrase editor into two stacked phrases
-with differences highlighted like `git diff`. Added notes in green,
-removed in red, changed in yellow. Because it's text, because of
+`:diff phrase 00 03` compares two phrases like `git diff`. Added notes in
+green, removed in red, changed in yellow. Because it's text, because of
 course.
+
+Shipped as a *unified* diff rather than the two stacked phrases first
+described here: two 16-step grids need about 40 rows, and the grid is
+already 83 columns wide, so a split view does not survive an 80x24
+terminal. Phrase A holds the grid, B's changes composite on top, and
+`+ - ~` sit in the pad the note field already had — zero extra columns,
+and closer to what `git diff` actually is.
 
 ### Inline help
 
@@ -256,23 +262,3 @@ It's vim. It's a tracker. It's alive.
 - **Scanlines in phosphor mode**: rendered as alternating-line
   background color tweak, not a texture overlay. The CRT-ness
   should be *of* the terminal, not painted on top.
-
-## What the mockup demonstrates
-
-See `mockup/ui.html` for a working static render showing:
-
-- Three-phrase stacked layout (03 dimmed, 04 active, 05 dimmed)
-- Playhead sweeping through 16 steps at 140 BPM
-- Cursor highlight on step 07 of PU2
-- Instrument editor with live ADSR curve and pulse-25% waveform
-- Song/chain view with scene B queued, draining countdown bar
-- Viz panel with 4-channel envelope bars and pixel-fox sprite
-- LIVE mode active, red modeline, pending `4d` count visible
-- Command line ghost-previewing `:gen euclid noi 5 16`
-- Mode gallery showing all five modes with their chips
-- Theme comparison: NES palette next to phosphor amber
-
-Open it in a browser and everything breathes. The mockup is the
-design spec — if the real TUI doesn't feel as alive as the HTML,
-something's wrong.
-
