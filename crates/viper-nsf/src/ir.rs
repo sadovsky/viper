@@ -204,6 +204,8 @@ impl Song {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     pub songs: Vec<Song>,
+    /// Album title for multi-song containers (NSF name field, NSFe auth).
+    pub album: String,
     pub artist: String,
     pub copyright: String,
     pub expansion: Expansion,

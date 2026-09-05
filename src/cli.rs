@@ -23,7 +23,9 @@ usage:
   viper [song.vip]                          open the tracker
   viper check song.vip                      parse and report problems
   viper compile song.vip [more.vip ...] --driver BIN [--sym SYM] -o out.nsf [--title T]
-      several .vip files become one multi-song NSF (album bundle)
+                [--nsfe out.nsfe]
+      several .vip files become one multi-song NSF (album bundle); an .nsfe
+      output (by extension or --nsfe) carries per-track titles and times
   viper fmt song.vip [-o out.vip]           rewrite in canonical form
   viper render song.nsf [-o mix.wav] [--stems DIR] [--triggers drums.mid]
                         [--log writes.txt] [--loops N] [--frames N]
@@ -235,9 +237,10 @@ fn compile_cmd(a: &Args) -> Result<()> {
     }
     let mut module = module.unwrap();
     if let Some(t) = a.get("title") {
-        // The NSF name field is the album/first-song title.
-        if let Some(first) = module.songs.first_mut() {
-            first.title = t.to_string();
+        if module.songs.len() == 1 {
+            module.songs[0].title = t.to_string();
+        } else {
+            module.album = t.to_string();
         }
     }
     let driver = driver.unwrap();
@@ -245,12 +248,18 @@ fn compile_cmd(a: &Args) -> Result<()> {
     for w in &emitted.warnings {
         eprintln!("warning: {}", w);
     }
-    std::fs::write(&out, &emitted.nsf).with_context(|| format!("write {}", out.display()))?;
+    let is_nsfe = out.extension().map_or(false, |e| e.eq_ignore_ascii_case("nsfe"));
+    let bytes = if is_nsfe { &emitted.nsfe } else { &emitted.nsf };
+    std::fs::write(&out, bytes).with_context(|| format!("write {}", out.display()))?;
+    if let Some(extra) = a.get("nsfe") {
+        std::fs::write(extra, &emitted.nsfe).with_context(|| format!("write {}", extra))?;
+        println!("nsfe     → {}", extra);
+    }
     println!(
         "{} song(s) → {}: {} bytes ({} song data, {} samples), {} frames ≈ {:.1}s",
         module.songs.len(),
         out.display(),
-        emitted.nsf.len(),
+        bytes.len(),
         emitted.data_bytes,
         emitted.sample_bytes,
         total_frames,
@@ -270,6 +279,10 @@ fn info(a: &Args) -> Result<()> {
     println!("  load/init/play  ${:04X} / ${:04X} / ${:04X}", nsf.load, nsf.init, nsf.play);
     println!("  data       {} bytes{}", nsf.data.len(), if nsf.bankswitched() { " (bankswitched)" } else { "" });
     println!("  region     {}  expansion ${:02X}", if nsf.pal { "PAL" } else { "NTSC" }, nsf.expansion);
+    for (i, t) in nsf.track_names.iter().enumerate() {
+        let ms = nsf.track_times.get(i).copied().unwrap_or(0);
+        println!("  {:>2}. {:<28} {}:{:02}", i + 1, t, ms / 60000, (ms / 1000) % 60);
+    }
     Ok(())
 }
 

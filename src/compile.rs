@@ -160,6 +160,7 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
     Ok(Lowered {
         module: Module {
             songs: vec![nsf_song],
+            album: String::new(),
             artist: song.artist.clone(),
             copyright: song.copyright.clone(),
             expansion: if song.expansion { Expansion::Vrc6 } else { Expansion::None },

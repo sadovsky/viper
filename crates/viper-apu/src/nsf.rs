@@ -17,6 +17,9 @@ pub struct Nsf {
     pub pal: bool,
     pub expansion: u8,
     pub data: Vec<u8>,
+    /// NSFe `tlbl` / `time` (ms) when present.
+    pub track_names: Vec<String>,
+    pub track_times: Vec<i32>,
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -26,6 +29,9 @@ fn cstr(b: &[u8]) -> String {
 
 impl Nsf {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() >= 4 && &bytes[0..4] == b"NSFE" {
+            return Self::parse_nsfe(bytes);
+        }
         if bytes.len() < 128 || &bytes[0..5] != b"NESM\x1A" {
             bail!("not an NSF file");
         }
@@ -46,7 +52,62 @@ impl Nsf {
             pal: bytes[0x7A] & 1 != 0,
             expansion: bytes[0x7B],
             data: bytes[128..].to_vec(),
+            track_names: Vec::new(),
+            track_times: Vec::new(),
         })
+    }
+
+    fn parse_nsfe(bytes: &[u8]) -> Result<Self> {
+        let mut nsf = Nsf {
+            songs: 1, start_song: 1, load: 0x8000, init: 0x8000, play: 0x8000,
+            name: String::new(), artist: String::new(), copyright: String::new(),
+            ntsc_speed_us: 0x411A, banks: [0; 8], pal: false, expansion: 0, data: Vec::new(),
+            track_names: Vec::new(), track_times: Vec::new(),
+        };
+        let mut pos = 4;
+        let mut have_info = false;
+        while pos + 8 <= bytes.len() {
+            let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+            let id = &bytes[pos + 4..pos + 8];
+            let body = bytes.get(pos + 8..pos + 8 + len).ok_or_else(|| anyhow::anyhow!("NSFe chunk {} truncated", String::from_utf8_lossy(id)))?;
+            match id {
+                b"INFO" => {
+                    if body.len() < 8 { bail!("NSFe INFO chunk too short"); }
+                    nsf.load = u16::from_le_bytes([body[0], body[1]]);
+                    nsf.init = u16::from_le_bytes([body[2], body[3]]);
+                    nsf.play = u16::from_le_bytes([body[4], body[5]]);
+                    nsf.pal = body[6] & 1 != 0;
+                    nsf.expansion = body[7];
+                    nsf.songs = body.get(8).copied().unwrap_or(1);
+                    nsf.start_song = body.get(9).copied().unwrap_or(0) + 1;
+                    have_info = true;
+                }
+                b"DATA" => nsf.data = body.to_vec(),
+                b"BANK" => {
+                    for (i, b) in body.iter().take(8).enumerate() { nsf.banks[i] = *b; }
+                }
+                b"auth" => {
+                    let mut it = body.split(|&c| c == 0).map(|s| String::from_utf8_lossy(s).into_owned());
+                    nsf.name = it.next().unwrap_or_default();
+                    nsf.artist = it.next().unwrap_or_default();
+                    nsf.copyright = it.next().unwrap_or_default();
+                }
+                b"tlbl" => {
+                    nsf.track_names = body.split(|&c| c == 0).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+                    nsf.track_names.truncate(nsf.songs as usize);
+                }
+                b"time" => {
+                    nsf.track_times = body.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                }
+                b"NEND" => break,
+                _ => {}
+            }
+            pos += 8 + len;
+        }
+        if !have_info || nsf.data.is_empty() {
+            bail!("NSFe file is missing INFO or DATA");
+        }
+        Ok(nsf)
     }
 
     pub fn bankswitched(&self) -> bool {

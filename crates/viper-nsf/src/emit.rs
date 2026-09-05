@@ -32,10 +32,60 @@ const IMAGE_END: usize = 0x10000;
 #[derive(Debug)]
 pub struct EmitResult {
     pub nsf: Vec<u8>,
+    /// The same image as NSFe: per-track titles (`tlbl`), play times and
+    /// fades (`time`/`fade`), and the `auth` block. NSFPlay, Mesen and
+    /// flash-cart menus show a real track list from this.
+    pub nsfe: Vec<u8>,
     /// Bytes of song data (everything after the driver, before samples).
     pub data_bytes: usize,
     pub sample_bytes: usize,
     pub warnings: Vec<String>,
+}
+
+fn chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(id);
+    out.extend_from_slice(body);
+}
+
+/// Build an NSFe container around `image` (the bytes after the 128-byte
+/// NSF header). Play time per track = intro + two loops; fade 3 s.
+fn build_nsfe(module: &Module, driver: &Driver, image: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(image.len() + 512);
+    out.extend_from_slice(b"NSFE");
+    let mut info = Vec::new();
+    info.extend_from_slice(&driver.load.to_le_bytes());
+    info.extend_from_slice(&driver.init.to_le_bytes());
+    info.extend_from_slice(&driver.play.to_le_bytes());
+    info.push(0); // NTSC
+    info.push(module.expansion.nsf_bits());
+    info.push(module.songs.len() as u8);
+    info.push(0); // starting track (0-based)
+    chunk(&mut out, b"INFO", &info);
+    chunk(&mut out, b"DATA", image);
+    let mut auth = Vec::new();
+    let title = if module.songs.len() == 1 { module.songs[0].title.as_str() } else { module.album.as_str() };
+    for s in [title, module.artist.as_str(), module.copyright.as_str(), "viper"] {
+        auth.extend_from_slice(s.as_bytes());
+        auth.push(0);
+    }
+    chunk(&mut out, b"auth", &auth);
+    let mut tlbl = Vec::new();
+    let mut time = Vec::new();
+    let mut fade = Vec::new();
+    for s in &module.songs {
+        tlbl.extend_from_slice(s.title.as_bytes());
+        tlbl.push(0);
+        let (intro, looped) = s.intro_and_loop_frames();
+        let ms = ((intro + looped * 2) as f64 / 60.0988 * 1000.0) as i32;
+        time.extend_from_slice(&ms.to_le_bytes());
+        fade.extend_from_slice(&3000i32.to_le_bytes());
+    }
+    chunk(&mut out, b"tlbl", &tlbl);
+    chunk(&mut out, b"time", &time);
+    chunk(&mut out, b"fade", &fade);
+    chunk(&mut out, b"NEND", &[]);
+    out
 }
 
 fn encode_event(e: &Event, out: &mut Vec<u8>) {
@@ -304,7 +354,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         warnings.push("expansion audio requested but the ABI v1 driver is strict 2A03; header flag set anyway".into());
     }
 
-    let title = module.songs[0].title.as_str();
+    let title = if module.songs.len() == 1 || module.album.is_empty() { module.songs[0].title.as_str() } else { module.album.as_str() };
     let header = viper_nsf_header(
         driver.load,
         driver.init,
@@ -318,7 +368,8 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     let mut nsf = Vec::with_capacity(128 + image.len());
     nsf.extend_from_slice(&header);
     nsf.extend_from_slice(&image);
-    Ok(EmitResult { nsf, data_bytes, sample_bytes, warnings })
+    let nsfe = build_nsfe(module, driver, &image);
+    Ok(EmitResult { nsf, nsfe, data_bytes, sample_bytes, warnings })
 }
 
 fn viper_nsf_header(load: u16, init: u16, play: u16, songs: u8, name: &str, artist: &str, copyright: &str, expansion: u8) -> [u8; 128] {
