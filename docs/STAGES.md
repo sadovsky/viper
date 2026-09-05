@@ -58,6 +58,7 @@ Command mode:
 - `:set octave=4` — base octave for insert-mode piano row (0–8)
 - `:set theme=nes` / `:set theme=phosphor` — switch color theme
 - `:set still=on|off|toggle` — freeze the tempo-locked breathing animations
+- `:set scroll=jumpy|smooth|toggle` — phrase scroll style (see Stage 30)
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
 - `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`, `register`); `:viz off` hides it
 - `:sprite load <path> [WxH]` — load a PNG sprite sheet (≤4 opaque colors; cell size defaults to the whole image)
@@ -345,6 +346,50 @@ lives in viper.
   action: everything notable already announces itself there, so one watcher
   catches all of it, and the newest entry is skipped because it is already
   the status line above.
+
+- **Stage 30** ✅ — **Stacked phrases and context-aware help.** The grid is
+  now a window onto a virtual *tape* of 48 rows indexed from the active
+  phrase's step 0: −16..−1 is the previous phrase, 0..15 the active one,
+  16..31 the next. Every behaviour — graceful degradation, centring, scroll
+  style, song mode — is a choice of where that window starts, decided by one
+  pure function with a priority ladder: the cursor is always on screen; the
+  playing row joins it whenever both fit; then the requested anchor; and
+  never scroll past the neighbours into blank space, except on a pane taller
+  than the whole tape, where the tape is centred instead.
+
+  Spare rows become context, split evenly with the odd row below. At 24
+  terminal rows that is about two rows each side; at 34, seven; at 54, the
+  full three-phrase view DESIGN.md described. Below 16 rows of content the
+  window narrows to the active phrase alone and scrolls to follow the
+  cursor, so the active phrase is never silently truncated. `phrase_view`
+  returns plain data with no `Frame` or `Theme`, so all of this is unit
+  tested rather than screenshotted.
+
+  Neighbour rows get three signals that do not depend on a brightness ramp,
+  because under `nes` most foregrounds are named ANSI colours and there is
+  no computable "30% of `Color::Green`": a single declared `Theme::ghost`
+  ink for every field, blanks instead of `--- -- -- ---` so you read a
+  sparse silhouette, and the *phrase* index in the gutter instead of the
+  step index, which makes the boundary self-evident without spending a
+  separator row. In song mode neighbours come from the flattened order —
+  what actually plays next, including the wrap to the loop point — and an
+  intro before the loop point correctly has no predecessor.
+
+  `:set scroll=` picks the style. A terminal cell is the smallest unit of
+  vertical position, so "smooth" cannot mean sub-row motion; what it means
+  here is *what is pinned*. `jumpy` (the default) anchors the grid so step
+  07 is always on the same screen row, which is the LSDJ feel and today's
+  behaviour. `smooth` pins the playing row and flows the tape past it, so a
+  phrase boundary is a non-event. It only differs while playing, and
+  `:set still=on` forces `jumpy`.
+
+  **Context-aware help** landed in two halves. The modeline now says what a
+  half-finished command will accept next — after `d`, the motions and
+  objects; after `da`, the three object letters — which is vim's which-key
+  where your eyes already are. And the help screen scrolls (`j`/`k`, `g`/`G`,
+  PageUp/PageDown) with its position in the title, fixing a real defect:
+  it had no scrolling and no wrapping, so on a 24-row terminal most of the
+  reference was unreachable with no sign anything had been cut.
 
 ### Generators
 

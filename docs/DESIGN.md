@@ -54,6 +54,15 @@ The active step row has a **full-width horizontal highlight bar** that
 sweeps downward at the pattern rate when playing. Not a pulse — a
 sweep. When transport stops, it freezes on the current step.
 
+Shipped in Stage 30, with the row budget made honest. Three full phrases
+need 54 terminal rows; below that the neighbours get a proportional slice,
+and at 21 rows the active phrase takes the pane alone. "Dimmed to 30%
+brightness" is not computable against a named ANSI palette, so neighbours
+use a declared ghost ink, blank out empty cells and carry the phrase index
+in the gutter instead. And `smooth` cannot mean sub-row scrolling in a
+character grid: it means the playing row is pinned and the tape flows past
+it, where `jumpy` pins the grid instead.
+
 Each cell is 11 characters: `C#4 01 0F A04` — note, instrument, volume,
 effect. Empty cells are `--- -- -- ---` in the darkest possible grey.
 Active cells color-code by field: note by channel color, instrument in
@@ -100,9 +109,9 @@ log ("▸ scene B queued · step 0c · ch2 muted").
 > queue-drain bar and register thumbnail in Stage 28; the mode transitions,
 > border flash, phosphor scanlines and modeline event log in Stage 29. Ghost
 > command preview and diff mode land alongside in Stage 27. Still only
-> described here: the stacked three-phrase layout and the context-aware help
-> overlay. Where the terminal would not support what this document imagined,
-> the section says what shipped instead.
+> described here: nothing. The stacked layout and context-aware help landed
+> in Stage 30. Where the terminal would not support what this document
+> imagined, the section says what shipped instead.
 
 ### The playhead is a character, not a cursor
 
@@ -158,6 +167,12 @@ course.
 Pressing `?` drops a translucent overlay showing the keys valid *in
 the current mode and context*. Operator-pending after `d`? Only motion
 keys light up, everything else dims. vim's `which-key` plugin, native.
+
+Shipped in Stage 30 as two halves, neither of them an overlay. The
+modeline says what a half-finished command accepts next, which is where
+you are already looking for the pending-key indicator; and the help screen
+scrolls rather than clipping, which was the actual problem it had on a
+short terminal.
 
 ## Aesthetic
 
