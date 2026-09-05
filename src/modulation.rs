@@ -83,6 +83,8 @@ enum Source {
     Beat,
     Bar,
     SceneIndex,
+    ArrSlot,
+    ChainPos,
     Phrase,
     Tempo,
     Time,
@@ -170,6 +172,9 @@ pub(crate) struct EvalCtx<'a> {
     pub tempo: f32,
     pub scene_index: i32,
     pub phrase: i32,
+    /// Stage 23: arrangement slot and position-in-chain being played.
+    pub arr_slot: i32,
+    pub chain_pos: i32,
     pub time_s: f32,
     /// Seconds since the last note-on edge per channel. Very large when
     /// no note has fired yet, so `<ch>.age < 0.5`-style thresholds behave
@@ -240,6 +245,8 @@ fn eval(expr: &Expr, ctx: &EvalCtx) -> f32 {
                 }
                 Source::SceneIndex => ctx.scene_index as f32,
                 Source::Phrase => ctx.phrase as f32,
+                Source::ArrSlot => ctx.arr_slot as f32,
+                Source::ChainPos => ctx.chain_pos as f32,
                 Source::Tempo => ctx.tempo,
                 Source::Time => ctx.time_s,
                 Source::Playing => {
@@ -516,6 +523,8 @@ fn parse_source(name: &str) -> Result<Source> {
         "bar" => return Ok(Source::Bar),
         "scene.index" | "scene" => return Ok(Source::SceneIndex),
         "phrase" => return Ok(Source::Phrase),
+        "arr" | "arr.slot" => return Ok(Source::ArrSlot),
+        "chain.pos" | "chain" => return Ok(Source::ChainPos),
         "tempo" | "bpm" => return Ok(Source::Tempo),
         "time" | "t" => return Ok(Source::Time),
         "playing" => return Ok(Source::Playing),
@@ -549,7 +558,7 @@ mod tests {
     use crate::audio::{VizFrame, VoiceFrame};
 
     fn ctx_with_voices(voices: [VoiceFrame; CHANNELS]) -> (VizFrame, ()) {
-        (VizFrame { playing: true, step: 3, step_phase: 0.5, voices }, ())
+        (VizFrame { playing: true, step: 3, step_phase: 0.5, voices, ..Default::default() }, ())
     }
 
     fn run(expr_src: &str, frame: &VizFrame) -> f32 {
@@ -561,6 +570,8 @@ mod tests {
             tempo: 120.0,
             scene_index: 2,
             phrase: 2,
+            arr_slot: 0,
+            chain_pos: 0,
             time_s: 1.0,
             voice_ages: [0.25, 0.5, 1.0, 10.0, 0.0],
         };
@@ -627,9 +638,10 @@ mod tests {
             VoiceFrame::default(),
             VoiceFrame::default(),
         ];
-        let frame = VizFrame { playing: false, step: 0, step_phase: 0.0, voices };
+        let frame = VizFrame { playing: false, step: 0, step_phase: 0.0, voices, ..Default::default() };
         let ctx = EvalCtx {
             frame: &frame, tempo: 120.0, scene_index: 0, phrase: 0,
+            arr_slot: 0, chain_pos: 0,
             time_s: 0.0, voice_ages: [0.0; CHANNELS],
         };
         let eff = apply_bindings(&placements, &[b], &ctx);

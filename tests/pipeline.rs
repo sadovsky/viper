@@ -91,6 +91,58 @@ fn neutral_style_generates_a_song_that_compiles() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Stage 23: a song arranged with chains compiles to the flattened order,
+/// and the loop point lands on the arrangement's loop slot. Two chains
+/// (`00 01 00` and `01`) arranged `00 01 00` with loop slot 1 flatten to
+/// seven entries with the loop at entry 3; at 120 BPM a phrase is 120
+/// frames, so intro = 360 and loop = 480.
+#[test]
+fn chained_song_compiles_to_the_flattened_order() {
+    let tmp = std::env::temp_dir().join(format!("viper_chain_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = tmp.join("chained.vip");
+    std::fs::write(&vip, "\
+@song bpm=120
+@phrase 00
+  00  C-4:00:0F  ---  C-2:02:0F  ---  ---
+  08  E-4:00:0F  ---  ---  ---  ---
+@phrase 01
+  00  G-4:00:0F  ---  G-2:02:0F  ---  ---
+@chain 00  name=\"verse\"
+  00 01 00
+@chain 01
+  01
+@arrangement loop=01
+  00 01 00
+@length  pu1=8
+").unwrap();
+    let check = viper().args(["check"]).arg(&vip).output().unwrap();
+    let check_out = String::from_utf8_lossy(&check.stdout);
+    assert!(check.status.success() && check_out.contains("order 7 entries"), "{}", check_out);
+    let nsf = tmp.join("chained.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let render = viper().args(["render"]).arg(&nsf).arg("--vip").arg(&vip).arg("--log").arg(tmp.join("w.log")).output().unwrap();
+    let render_out = String::from_utf8_lossy(&render.stdout);
+    assert!(render_out.contains("intro 360 frames, loop 480 frames"), "{}", render_out);
+    // Polymeter lowering: PU1 wraps every 8 rows, so the E-4 at row 8 is
+    // replaced by C-4 again and every PU1 period-low write in the first
+    // phrase (120 frames) carries the same value. Without the wrap the
+    // second note-on would write E-4's period.
+    let log = std::fs::read_to_string(tmp.join("w.log")).unwrap();
+    let pu1_periods: Vec<&str> = log
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split(' ');
+            let frame: u32 = it.next()?.parse().ok()?;
+            (it.next()? == "4002" && (1..=120).contains(&frame)).then(|| it.next()).flatten()
+        })
+        .collect();
+    assert!(pu1_periods.len() >= 2, "expected two PU1 note-ons in the first phrase: {:?}", pu1_periods);
+    assert!(pu1_periods.iter().all(|p| *p == pu1_periods[0]), "row 8 should repeat row 0 on PU1: {:?}", pu1_periods);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Regression for the driver's order-list lookup: a song with more than
 /// 25 order entries must keep advancing. The RAM-state loop the renderer
 /// detects has to match the loop length computed from the source; when

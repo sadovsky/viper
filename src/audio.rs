@@ -62,6 +62,14 @@ pub struct Transport {
     /// back to the UI so the grid can follow.
     pub order_pos: usize,
     pub playing_phrase: usize,
+    /// Stage 23: per-16th sample offsets and per-channel wrap lengths.
+    /// Both shape the synth engine only; the APU path plays the NSF.
+    pub groove: [i16; 16],
+    pub channel_length: [u8; CHANNELS],
+    /// Stage 23: `(arrangement slot, position in chain)` per order entry,
+    /// mirrored into `VizFrame` so the song pane can highlight the live
+    /// slot. Empty without an arrangement.
+    pub arrangement_map: Vec<(usize, usize)>,
     /// Which engine drives pattern playback.
     pub engine: Engine,
     /// A compiled NSF for the APU engine, plus a generation counter so the
@@ -96,6 +104,12 @@ pub struct VizFrame {
     /// thread's sample counter. Lets the UI interpolate sub-step motion.
     pub step_phase: f32,
     pub voices: [VoiceFrame; CHANNELS],
+    /// Stage 23: where the transport is in the song — order position, and
+    /// the arrangement slot / chain position it maps to (0 without an
+    /// arrangement).
+    pub order_pos: usize,
+    pub arr_slot: usize,
+    pub chain_pos: usize,
 }
 
 impl Default for Transport {
@@ -115,6 +129,9 @@ impl Default for Transport {
             phrases: Vec::new(),
             order_pos: 0,
             playing_phrase: 0,
+            groove: [0; 16],
+            channel_length: [STEPS_PER_PHRASE as u8; CHANNELS],
+            arrangement_map: Vec::new(),
             engine: Engine::Synth,
             nsf: None,
             nsf_generation: 0,
@@ -364,13 +381,23 @@ impl AudioEngine {
 
 /// Gate every voice from a step's cells. Shared by the realtime callback
 /// and the offline bounce.
-fn gate_step(voices: &mut [Voice; CHANNELS], phrase: &Phrase, step: usize, instruments: &[Instrument; INSTRUMENTS], muted: &[bool; CHANNELS]) {
+/// Stage 23 polymeter: a channel with `channel_length[ch] < 16` reads
+/// `cells[step % len]`, cycling inside the phrase.
+fn gate_step(
+    voices: &mut [Voice; CHANNELS],
+    phrase: &Phrase,
+    step: usize,
+    instruments: &[Instrument; INSTRUMENTS],
+    muted: &[bool; CHANNELS],
+    channel_length: &[u8; CHANNELS],
+) {
     for (ch, v) in voices.iter_mut().enumerate() {
         if muted[ch] {
             v.gate_off();
             continue;
         }
-        let cell = phrase.cells[step][ch];
+        let len = (channel_length[ch].max(1) as usize).min(STEPS_PER_PHRASE);
+        let cell = phrase.cells[step % len][ch];
         if let Some(n) = cell.note {
             let idx = (cell.instr as usize).min(INSTRUMENTS - 1);
             // vol=0 is treated as "default/full" so notes entered in insert
@@ -384,11 +411,18 @@ fn gate_step(voices: &mut [Voice; CHANNELS], phrase: &Phrase, step: usize, instr
     }
 }
 
+/// Samples in a given 16th: the straight step length plus the groove
+/// offset for that step, never less than one sample so playback always
+/// advances.
+fn step_samples(base_spb: u32, groove: &[i16; 16], step: usize) -> u32 {
+    ((base_spb as i32) + groove[step % 16] as i32).max(1) as u32
+}
+
 /// Stage 15a: render a phrase sequence to 16-bit mono PCM WAV at `path`,
 /// offline. Mirrors the realtime step scheduler (same `spb`, same voice
-/// model), then keeps rendering after the last step until every voice is
-/// Idle or we hit a 2-second tail cap — ensures release tails finish
-/// cleanly. Returns the number of audio frames written.
+/// model, same groove and polymeter), then keeps rendering after the last
+/// step until every voice is Idle or we hit a 2-second tail cap — ensures
+/// release tails finish cleanly. Returns the number of audio frames written.
 pub fn bounce_to_wav(
     path: &Path,
     sequence: &[Phrase],
@@ -396,6 +430,8 @@ pub fn bounce_to_wav(
     bpm: u16,
     loops: u32,
     sample_rate: u32,
+    groove: &[i16; 16],
+    channel_length: &[u8; CHANNELS],
 ) -> Result<u32> {
     if loops == 0 {
         bail!("bounce: loops must be ≥ 1");
@@ -404,14 +440,14 @@ pub fn bounce_to_wav(
         bail!("bounce: nothing to render");
     }
     let sr_f = sample_rate as f32;
-    let spb = (sr_f * 60.0 / bpm.max(1) as f32 / 4.0).max(1.0) as u32;
+    let base_spb = (sr_f * 60.0 / bpm.max(1) as f32 / 4.0).max(1.0) as u32;
     let total_steps = (loops as usize).saturating_mul(STEPS_PER_PHRASE * sequence.len());
     let tail_cap = sample_rate * 2;
     let bank = dpcm::default_bank();
 
     let mut voices = new_voices();
     let mut samples: Vec<f32> = Vec::with_capacity(
-        (total_steps as u64 * spb as u64).min(u32::MAX as u64) as usize
+        (total_steps as u64 * base_spb as u64).min(u32::MAX as u64) as usize
     );
     let no_mute = [false; CHANNELS];
 
@@ -426,8 +462,8 @@ pub fn bounce_to_wav(
     for global_step in 0..total_steps {
         let step = global_step % STEPS_PER_PHRASE;
         let phrase = &sequence[(global_step / STEPS_PER_PHRASE) % sequence.len()];
-        gate_step(&mut voices, phrase, step, instruments, &no_mute);
-        for _ in 0..spb {
+        gate_step(&mut voices, phrase, step, instruments, &no_mute, channel_length);
+        for _ in 0..step_samples(base_spb, groove, step) {
             render_sample(&mut voices, &mut samples);
         }
     }
@@ -671,7 +707,9 @@ where
                 a.player.set_mask(mask);
             }
 
-            let spb = (sample_rate * 60.0 / tr.bpm.max(1) as f32 / 4.0).max(1.0) as u32;
+            let base_spb = (sample_rate * 60.0 / tr.bpm.max(1) as f32 / 4.0).max(1.0) as u32;
+            let groove = tr.groove;
+            let channel_length = tr.channel_length;
             for frame in data.chunks_mut(out_channels) {
                 let mut mix = 0.0f32;
                 if apu_active {
@@ -690,10 +728,10 @@ where
                         if tr.song_mode && !tr.order.is_empty() {
                             let pi = tr.playing_phrase.min(tr.phrases.len().saturating_sub(1));
                             if let Some(p) = tr.phrases.get(pi) {
-                                gate_step(&mut voices, p, step, &instruments, &muted);
+                                gate_step(&mut voices, p, step, &instruments, &muted, &channel_length);
                             }
                         } else {
-                            gate_step(&mut voices, &tr.phrase, step, &instruments, &muted);
+                            gate_step(&mut voices, &tr.phrase, step, &instruments, &muted, &channel_length);
                         }
                     }
                     for v in &mut voices {
@@ -708,7 +746,7 @@ where
                 }
                 if tr.playing && !apu_active {
                     sample_in_step += 1;
-                    if sample_in_step >= spb {
+                    if sample_in_step >= step_samples(base_spb, &groove, tr.step) {
                         sample_in_step = 0;
                         tr.step = (tr.step + 1) % STEPS_PER_PHRASE;
                         if tr.step == 0 && tr.song_mode && !tr.order.is_empty() {
@@ -758,13 +796,17 @@ where
                 let a = apu.as_ref().unwrap();
                 ((a.frames as f64 % tr.frames_per_row.max(1.0)) / tr.frames_per_row.max(1.0)) as f32
             } else {
-                (sample_in_step as f32 / spb as f32).min(1.0)
+                (sample_in_step as f32 / step_samples(base_spb, &groove, tr.step) as f32).min(1.0)
             };
+            let (arr_slot, chain_pos) = tr.arrangement_map.get(tr.order_pos).copied().unwrap_or((0, 0));
             tr.frame = VizFrame {
                 playing: tr.playing,
                 step: tr.step,
                 step_phase,
                 voices: voices_out,
+                order_pos: tr.order_pos,
+                arr_slot,
+                chain_pos,
             };
         },
         err_fn,
@@ -806,7 +848,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let instr = [Instrument::default(); INSTRUMENTS];
         let phrase = demo_phrase();
-        let frames = bounce_to_wav(&path, &[phrase], &instr, 140, 1, 44_100)
+        let frames = bounce_to_wav(&path, &[phrase], &instr, 140, 1, 44_100, &[0; 16], &[16; CHANNELS])
             .expect("bounce should succeed");
 
         // At 140 BPM, 16 steps = 60/140 * 4 = ~1.714 sec, plus release tail.
@@ -834,9 +876,38 @@ mod tests {
     fn bounce_rejects_zero_loops() {
         let path = std::env::temp_dir().join("viper_bounce_zero.wav");
         let instr = [Instrument::default(); INSTRUMENTS];
-        let err = bounce_to_wav(&path, &[Phrase::default()], &instr, 140, 0, 44_100)
+        let err = bounce_to_wav(&path, &[Phrase::default()], &instr, 140, 0, 44_100, &[0; 16], &[16; CHANNELS])
             .expect_err("zero loops should fail");
         assert!(err.to_string().contains("loops"));
+    }
+
+    #[test]
+    fn groove_shifts_steps_but_keeps_the_bar_length() {
+        let swing = crate::vip::swing_groove(300);
+        assert_eq!(step_samples(10_000, &swing, 0), 9_700);
+        assert_eq!(step_samples(10_000, &swing, 1), 10_300);
+        let bar: u32 = (0..16).map(|s| step_samples(10_000, &swing, s)).sum();
+        assert_eq!(bar, 160_000);
+        // A huge negative offset never stalls the clock.
+        assert_eq!(step_samples(10, &[-500; 16], 3), 1);
+    }
+
+    #[test]
+    fn polymeter_wraps_a_short_channel_inside_the_phrase() {
+        let mut p = Phrase::default();
+        p.cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        let instr = [Instrument::default(); INSTRUMENTS];
+        let mut len = [STEPS_PER_PHRASE as u8; CHANNELS];
+        len[0] = 4;
+        let mut voices = new_voices();
+        gate_step(&mut voices, &p, 4, &instr, &[false; CHANNELS], &len);
+        assert!(voices[0].held(), "PU1 with length 4 retriggers on step 4");
+        gate_step(&mut voices, &p, 5, &instr, &[false; CHANNELS], &len);
+        assert!(!voices[0].held());
+        // Full-length channel: step 4 is empty.
+        let mut voices = new_voices();
+        gate_step(&mut voices, &p, 4, &instr, &[false; CHANNELS], &[STEPS_PER_PHRASE as u8; CHANNELS]);
+        assert!(!voices[0].held());
     }
 
     #[test]

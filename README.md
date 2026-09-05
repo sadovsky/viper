@@ -181,9 +181,9 @@ mouse-driven DAWs never quite do.
 
 ## Status
 
-**Stages 1–13 are shipped.** You can:
+**Stages 1–23 are shipped.** You can:
 
-- edit a 16-step × 4-channel phrase with full vim motions, operators,
+- edit a 16-step × 5-channel phrase with full vim motions, operators,
   text objects, visual block selection, counts, undo/redo, and `.` repeat;
 - play it back with sample-accurate ADSR-driven pulse/triangle/noise
   synthesis via `cpal`;
@@ -198,13 +198,16 @@ mouse-driven DAWs never quite do.
   flip, and frame index to any audio source via a small expression
   language with note-on-triggered animations.
 
-Also: song mode (`:order`, `:song on`), and the NSF pipeline —
-`:compile` a `.vip` against a 6502 driver, `:engine apu` to play the
-result through an emulated 2A03 in the tracker, and `viper render` for
-deterministic per-channel stems and a register-write log (see
-[`docs/NSF.md`](docs/NSF.md)). Upcoming: the generator style interface,
-plugin voices. See [`docs/STAGES.md`](docs/STAGES.md) for the full
-roadmap.
+Also: song mode — a flat `:order` list, or chains sequenced by an
+arrangement (`:chain`, `:arr`, `:song` pane) with per-channel polymeter
+(`:len`) and swing (`:groove`); the NSF pipeline — `:compile` a `.vip`
+against a 6502 driver, `:engine apu` to play the result through an
+emulated 2A03 in the tracker, `viper render` for deterministic
+per-channel stems and a register-write log (see
+[`docs/NSF.md`](docs/NSF.md)); and `viper gen`, which composes whole
+songs from a style directory. Upcoming: more generators, verification
+against external emulators, plugin voices. See
+[`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
 
 ## Contributing
 

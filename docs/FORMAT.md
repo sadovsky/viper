@@ -92,6 +92,52 @@ where the colon-separated fields are `note:instr:volume:effect`. Any field
 may be `--` (or `---` for note) to mean empty/inherit. Whitespace between
 cells is arbitrary; alignment is writer's choice.
 
+## Song structure
+
+Two ways to sequence phrases. The flat form lives on `@song`:
+
+```
+@song  bpm=140  order=[00,01,00,02]  loop=01
+```
+
+The structured form (Stage 23) groups phrases into **chains** and
+sequences chains in an **arrangement**. Rows under `@chain` are hex phrase
+indices, rows under `@arrangement` are hex chain indices; `loop=` names the
+arrangement slot playback returns to after the last one.
+
+```
+@chain 00  name="verse"
+  00 01 00 01
+@chain 01  name="chorus"
+  02 03
+@arrangement  loop=01
+  00 01 01 00
+```
+
+Playback flattens arrangement → chains → phrases into one order list, so
+the NSF compiler and every exporter see exactly what `order=` would have
+said. A file with an arrangement never writes `order=` (and `order=` is
+ignored with a warning if both appear). Chains may be empty; every chain
+is written so arrangement indices stay stable.
+
+Two per-song timing tweaks sit beside them:
+
+```
+@length  pu1=16  pu2=16  tri=12  noi=8  dpcm=16
+@groove  swing=120
+@groove
+  -120 120 -120 120 -120 120 -120 120 -120 120 -120 120 -120 120 -120 120
+```
+
+`@length` is polymeter: a channel shorter than 16 steps reads
+`cells[step % length]` and cycles inside every phrase. It is honored by
+the synth engine, `:bounce`, and the NSF compiler (which unrolls it).
+`@groove` shifts each 16th by a signed number of samples on the synth
+step clock; `swing=N` is shorthand for `-N +N -N +N …`. The NSF driver's
+row clock is fixed, so groove is synth-only and the compiler warns when
+it is set. Both directives are omitted from the canonical output when
+they hold the defaults.
+
 ## Canonical writer output
 
 - Indent data rows with 2 spaces.
@@ -99,8 +145,9 @@ cells is arbitrary; alignment is writer's choice.
 - Always include a comment header row (`# step   PU1   PU2   TRI   NOI`)
   at the top of each phrase.
 - Empty rows between phrases (one blank line).
-- Sort directives in this order: `@song`, `@phrase` (by index), `@instr`
-  (by index), `@bind`.
+- Sort directives in this order: `@song`, `@meta`, `@driver`, `@dpcm`,
+  `@phrase` (by index), `@chain` (by index), `@arrangement`, `@groove`,
+  `@length`, `@instr` (by index).
 - Hex values lowercase in step indices, uppercase in volume/effect fields
   (tracker convention).
 - One trailing newline at EOF.
@@ -111,12 +158,14 @@ cells is arbitrary; alignment is writer's choice.
 |-----------|--------------------------------------------|-------|
 | `@song`   | global song parameters; `order=[..]` + `loop=NN` = song mode | 3.5 / 16 |
 | `@phrase` | phrase definition, followed by data rows   | 3.5   |
-| `@chain`  | ordered list of phrase indices per channel | 16    |
+| `@chain`  | `NN [name=".."]` + rows of phrase indices — see [Song structure](#song-structure) | 23 |
+| `@arrangement` | `[loop=NN]` + rows of chain indices; decides playback order | 23 |
+| `@length` | `pu1=16 pu2=16 tri=16 noi=16 dpcm=16` per-channel wrap length (polymeter) | 23 |
+| `@groove` | `swing=N`, or a row of 16 signed sample offsets (synth engine only) | 23 |
 | `@instr`  | instrument definition                      | 3     |
 | `@scene`  | named snapshot of chain state              | 7     |
 | `@bind`   | modulation binding                         | 12    |
 | `@sprite` | sprite sheet reference + palette           | 11    |
-| `@groove` | per-step timing offset table               | 16    |
 | `@meta`   | free-form key=value metadata (author, etc) | any   |
 | `@driver` | NSF driver binary/symbol map + expansion flag | 18    |
 | `@dpcm`   | `NN name=.. path=..` DPCM sample for note C-4+NN | 18    |
