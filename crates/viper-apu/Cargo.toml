@@ -1,0 +1,9 @@
+[package]
+name = "viper-apu"
+version = "0.1.0"
+edition = "2021"
+description = "Cycle-stepped 6502 + 2A03 APU host for rendering NSF files deterministically"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"

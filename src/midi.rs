@@ -47,14 +47,24 @@ enum EventKind {
     EndOfTrack,
 }
 
+/// DPCM column: C-4.. = sample index 0.. → GM kick / snare / closed hat /
+/// open hat / crash / tom.
+fn dpcm_to_gm_drum(pitch: u8) -> u8 {
+    const GM: [u8; 6] = [36, 38, 42, 46, 49, 45];
+    GM[crate::dpcm::note_to_sample(pitch).min(GM.len() - 1)]
+}
+
 pub fn export_phrase_to_midi(
     path: &Path,
-    phrase: &Phrase,
+    sequence: &[Phrase],
     _instruments: &[Instrument; INSTRUMENTS],
     bpm: u16,
     loops: u32,
 ) -> Result<()> {
     let loops = loops.max(1);
+    if sequence.is_empty() {
+        anyhow::bail!("midi: nothing to export");
+    }
     let f = File::create(path).with_context(|| format!("midi: create {}", path.display()))?;
     let mut w = BufWriter::new(f);
 
@@ -71,7 +81,7 @@ pub fn export_phrase_to_midi(
 
     // --- Instrument tracks (one per channel) ---
     for ch in 0..CHANNELS {
-        let events = collect_channel_events(phrase, ch, loops);
+        let events = collect_channel_events(sequence, ch, loops);
         write_track(&mut w, &events)?;
     }
 
@@ -79,21 +89,25 @@ pub fn export_phrase_to_midi(
     Ok(())
 }
 
-fn collect_channel_events(phrase: &Phrase, ch: usize, loops: u32) -> Vec<TrackEvent> {
+fn collect_channel_events(sequence: &[Phrase], ch: usize, loops: u32) -> Vec<TrackEvent> {
     let is_noi = ch == 3;
-    let midi_channel: u8 = if is_noi { 9 } else { ch as u8 };
+    let is_dpcm = ch == 4;
+    let midi_channel: u8 = if is_noi || is_dpcm { 9 } else { ch as u8 };
     let mut events: Vec<TrackEvent> = Vec::new();
+    let steps_per_loop = STEPS_PER_PHRASE as u32 * sequence.len() as u32;
 
     for loop_i in 0..loops {
-        let base_tick = loop_i * STEPS_PER_PHRASE as u32 * TICKS_PER_STEP;
-        for step in 0..STEPS_PER_PHRASE {
+        let base_tick = loop_i * steps_per_loop * TICKS_PER_STEP;
+        for gstep in 0..steps_per_loop as usize {
+            let phrase = &sequence[gstep / STEPS_PER_PHRASE];
+            let step = gstep % STEPS_PER_PHRASE;
             let cell: Cell = phrase.cells[step][ch];
             let Some(raw) = cell.note else { continue; };
-            let note = if is_noi { noi_to_gm_drum(raw) } else { raw };
+            let note = if is_noi { noi_to_gm_drum(raw) } else if is_dpcm { dpcm_to_gm_drum(raw) } else { raw };
             let vel = if cell.vol == 0 { 100 } else {
                 ((cell.vol as u32) * 127 / 15).min(127) as u8
             };
-            let on_tick = base_tick + step as u32 * TICKS_PER_STEP;
+            let on_tick = base_tick + gstep as u32 * TICKS_PER_STEP;
             let off_tick = on_tick + TICKS_PER_STEP;
             events.push(TrackEvent {
                 tick: on_tick,
@@ -233,21 +247,21 @@ mod tests {
         let path = std::env::temp_dir().join("viper_midi_test.mid");
         let _ = std::fs::remove_file(&path);
         let instr = [Instrument::default(); INSTRUMENTS];
-        export_phrase_to_midi(&path, &test_phrase(), &instr, 140, 1)
+        export_phrase_to_midi(&path, &[test_phrase()], &instr, 140, 1)
             .expect("midi export");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(&bytes[..4], b"MThd");
         // format = 1
         assert_eq!(bytes[8], 0);
         assert_eq!(bytes[9], 1);
-        // ntrks = 5 (conductor + 4)
+        // ntrks = conductor + one per channel
         assert_eq!(bytes[10], 0);
-        assert_eq!(bytes[11], 5);
+        assert_eq!(bytes[11], 1 + CHANNELS as u8);
         // division = 96
         assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), PPQN);
         // Exactly 5 MTrk markers in the file.
         let trk_count = bytes.windows(4).filter(|w| *w == b"MTrk").count();
-        assert_eq!(trk_count, 5);
+        assert_eq!(trk_count, 1 + CHANNELS);
         let _ = std::fs::remove_file(&path);
     }
 }

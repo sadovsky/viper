@@ -1,0 +1,172 @@
+//! Offline rendering. Deterministic: the same NSF and options produce
+//! bit-identical output.
+
+use crate::apu::{CH_ALL, CH_DMC, CH_NOI, CH_PU1, CH_PU2, CH_TRI};
+use crate::host::{Player, Trigger, TriggerKind};
+use crate::nsf::Nsf;
+use anyhow::Result;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub struct RenderOptions {
+    pub song: u8,
+    pub sample_rate: u32,
+    /// How many times through the detected loop. The song length is found
+    /// by hashing RAM at frame boundaries; if no loop is found within
+    /// `max_seconds`, the render stops there.
+    pub loops: u32,
+    pub max_seconds: f64,
+    /// Seconds of tail after the last loop.
+    pub tail_seconds: f64,
+    /// Render per-channel stems (and per-sample DPCM stems).
+    pub stems: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self { song: 0, sample_rate: 44_100, loops: 1, max_seconds: 300.0, tail_seconds: 1.0, stems: false }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Stem {
+    pub name: String,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub struct RenderResult {
+    pub mix: Vec<f32>,
+    pub stems: Vec<Stem>,
+    pub log: Vec<crate::host::RegWrite>,
+    pub triggers: Vec<Trigger>,
+    /// Frames in one loop (None if no loop was detected).
+    pub loop_frames: Option<u32>,
+    pub total_frames: u32,
+    /// DPCM `$4012` values in order of first use → stem index.
+    pub dpcm_samples: Vec<u8>,
+    pub sample_rate: u32,
+}
+
+/// First pass: find the song length by RAM-state hashing and gather the
+/// DPCM samples used. Returns (loop_start_frame, loop_len_frames) when
+/// the driver state repeats, plus the frame count to render.
+fn analyze(nsf: &Nsf, opts: &RenderOptions) -> Result<(Option<(u32, u32)>, Vec<u8>)> {
+    let mut p = Player::new(nsf.clone(), opts.sample_rate);
+    p.keep_log = false;
+    p.init(opts.song)?;
+    let max_frames = (opts.max_seconds * 60.0988) as u32;
+    let mut seen: HashMap<u64, u32> = HashMap::new();
+    let mut dpcm: Vec<u8> = Vec::new();
+    let mut found = None;
+    for f in 0..max_frames {
+        let h = p.ram_hash();
+        if let Some(&first) = seen.get(&h) {
+            found = Some((first, f - first));
+            break;
+        }
+        seen.insert(h, f);
+        p.frame()?;
+        p.samples.clear();
+        for t in p.triggers.drain(..) {
+            if let TriggerKind::Dpcm { addr_reg } = t.kind {
+                if !dpcm.contains(&addr_reg) {
+                    dpcm.push(addr_reg);
+                }
+            }
+        }
+    }
+    Ok((found, dpcm))
+}
+
+fn run(nsf: &Nsf, opts: &RenderOptions, frames: u32, mask: u8, dmc_filter: Option<u8>, keep_log: bool) -> Result<Player> {
+    let mut p = Player::new(nsf.clone(), opts.sample_rate);
+    p.keep_log = keep_log;
+    p.set_mask(mask);
+    p.apu.dmc_filter = dmc_filter;
+    p.init(opts.song)?;
+    for _ in 0..frames {
+        p.frame()?;
+    }
+    Ok(p)
+}
+
+pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
+    let (loop_info, dpcm_samples) = analyze(nsf, opts)?;
+    let fps = 60.0988;
+    let tail = (opts.tail_seconds * fps) as u32;
+    let (loop_frames, total_frames) = match loop_info {
+        Some((start, len)) => (Some(len), start + len * opts.loops.max(1) + tail),
+        None => (None, (opts.max_seconds * fps) as u32),
+    };
+
+    let full = run(nsf, opts, total_frames, CH_ALL, None, true)?;
+    let mut result = RenderResult {
+        mix: full.samples,
+        stems: Vec::new(),
+        log: full.log,
+        triggers: full.triggers,
+        loop_frames,
+        total_frames,
+        dpcm_samples: dpcm_samples.clone(),
+        sample_rate: opts.sample_rate,
+    };
+    if opts.stems {
+        for (name, mask) in [("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)] {
+            let p = run(nsf, opts, total_frames, mask, None, false)?;
+            result.stems.push(Stem { name: name.to_string(), samples: p.samples });
+        }
+        if dpcm_samples.is_empty() {
+            let p = run(nsf, opts, total_frames, CH_DMC, None, false)?;
+            result.stems.push(Stem { name: "dpcm".to_string(), samples: p.samples });
+        } else {
+            for (i, &addr) in dpcm_samples.iter().enumerate() {
+                let p = run(nsf, opts, total_frames, CH_DMC, Some(addr), false)?;
+                result.stems.push(Stem { name: format!("dpcm{}", i), samples: p.samples });
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Render exactly `frames` frames (no loop detection), with stems if
+/// requested. Used when the caller already knows the song length.
+pub fn render_frames(nsf: &Nsf, opts: &RenderOptions, frames: u32) -> Result<RenderResult> {
+    let (_, dpcm_samples) = analyze(nsf, &RenderOptions { max_seconds: frames as f64 / 60.0988 + 0.1, ..opts.clone() })?;
+    let full = run(nsf, opts, frames, CH_ALL, None, true)?;
+    let mut result = RenderResult {
+        mix: full.samples,
+        stems: Vec::new(),
+        log: full.log,
+        triggers: full.triggers,
+        loop_frames: None,
+        total_frames: frames,
+        dpcm_samples: dpcm_samples.clone(),
+        sample_rate: opts.sample_rate,
+    };
+    if opts.stems {
+        for (name, mask) in [("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)] {
+            let p = run(nsf, opts, frames, mask, None, false)?;
+            result.stems.push(Stem { name: name.to_string(), samples: p.samples });
+        }
+        if dpcm_samples.is_empty() {
+            let p = run(nsf, opts, frames, CH_DMC, None, false)?;
+            result.stems.push(Stem { name: "dpcm".to_string(), samples: p.samples });
+        } else {
+            for (i, &addr) in dpcm_samples.iter().enumerate() {
+                let p = run(nsf, opts, frames, CH_DMC, Some(addr), false)?;
+                result.stems.push(Stem { name: format!("dpcm{}", i), samples: p.samples });
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Format the register log as text: one `frame addr value` per line, hex.
+pub fn format_log(log: &[crate::host::RegWrite]) -> String {
+    let mut s = String::with_capacity(log.len() * 14);
+    for w in log {
+        s.push_str(&format!("{} {:04X} {:02X}\n", w.frame, w.addr, w.value));
+    }
+    s
+}

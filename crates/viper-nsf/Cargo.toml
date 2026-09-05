@@ -1,0 +1,9 @@
+[package]
+name = "viper-nsf"
+version = "0.1.0"
+edition = "2021"
+description = "Channel/frame event IR and NSF emitter that links against an external 6502 sound driver"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"

@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "A vim-keybound chiptune step sequencer for the terminal"
 
+[workspace]
+members = ["crates/*"]
+
 [dependencies]
+viper-nsf = { path = "crates/viper-nsf" }
+viper-apu = { path = "crates/viper-apu" }
 ratatui = "0.29"
 crossterm = "0.28"
 cpal = "0.15"

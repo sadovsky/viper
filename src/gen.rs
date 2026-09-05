@@ -43,6 +43,7 @@ pub enum Channel {
     Pu2,
     Tri,
     Noi,
+    Dpcm,
 }
 
 impl Channel {
@@ -52,6 +53,7 @@ impl Channel {
             "pu2" | "2" => Some(Self::Pu2),
             "tri" | "3" => Some(Self::Tri),
             "noi" | "4" => Some(Self::Noi),
+            "dpcm" | "dpc" | "5" => Some(Self::Dpcm),
             _ => None,
         }
     }
@@ -61,6 +63,7 @@ impl Channel {
             Self::Pu2 => 1,
             Self::Tri => 2,
             Self::Noi => 3,
+            Self::Dpcm => 4,
         }
     }
     pub fn label(self) -> &'static str {
@@ -69,6 +72,7 @@ impl Channel {
             Self::Pu2 => "PU2",
             Self::Tri => "TRI",
             Self::Noi => "NOI",
+            Self::Dpcm => "DPCM",
         }
     }
 }
@@ -165,6 +169,7 @@ pub enum Mode {
     Lydian,
     Mixolydian,
     Locrian,
+    HarmonicMinor,
     PentMajor,
     PentMinor,
     Blues,
@@ -180,6 +185,7 @@ impl Mode {
             "lydian" => Some(Self::Lydian),
             "mixolydian" => Some(Self::Mixolydian),
             "locrian" => Some(Self::Locrian),
+            "harmonic_minor" | "harmonic" => Some(Self::HarmonicMinor),
             "pent_major" | "pentmajor" => Some(Self::PentMajor),
             "pent_minor" | "pentminor" => Some(Self::PentMinor),
             "blues" => Some(Self::Blues),
@@ -195,6 +201,7 @@ impl Mode {
             Self::Lydian     => &[0, 2, 4, 6, 7, 9, 11],
             Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
             Self::Locrian    => &[0, 1, 3, 5, 6, 8, 10],
+            Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
             Self::PentMajor  => &[0, 2, 4, 7, 9],
             Self::PentMinor  => &[0, 3, 5, 7, 10],
             Self::Blues      => &[0, 3, 5, 6, 7, 10],
@@ -350,6 +357,7 @@ fn default_note_instr(ch: Channel) -> (u8, u8) {
         Channel::Pu2 => (64, 1), // E4
         Channel::Tri => (45, 2), // A2
         Channel::Noi => (60, 3),
+        Channel::Dpcm => (60, 0), // C-4 = kick
     }
 }
 
@@ -359,6 +367,7 @@ fn default_octaves(ch: Channel) -> (i32, i32) {
         Channel::Pu2 => (3, 4),
         Channel::Tri => (2, 3),
         Channel::Noi => (3, 4),
+        Channel::Dpcm => (4, 4), // C-4..B-4 = samples 0..11
     }
 }
 

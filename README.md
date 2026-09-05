@@ -20,11 +20,21 @@ A vim-keybound chiptune step sequencer for the terminal.
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-Four-voice (two pulse, one triangle, one noise) step sequencer in a
+Five-voice (two pulse, triangle, noise, DPCM) step sequencer in a
 single Rust binary, running inside your terminal, controlled entirely
 by vim-style modal keys. Write songs in a tracker grid, yank/paste
 patterns, script up drum patterns with `:gen`, save to a plain-text
-`.vip` file you can `grep` and diff.
+`.vip` file you can `grep` and diff — then compile it to a real NSF and
+hear it through a cycle-stepped 2A03 (see [`docs/NSF.md`](docs/NSF.md)).
+
+```sh
+viper song.vip                                   # open in the tracker
+viper check song.vip                             # parse + lowering report
+viper compile song.vip --driver driver.bin -o song.nsf
+viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
+             --log writes.txt --vip song.vip
+viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
+```
 
 ## Install & run
 
@@ -160,7 +170,7 @@ lossless:
 
 Full grammar lives in [`docs/FORMAT.md`](docs/FORMAT.md). Validate a
 file without opening the TUI by writing the parser test yourself —
-proper `viper --check path.vip` is on the roadmap.
+`viper check path.vip` does the same from the shell.
 
 ## Why?
 
@@ -188,9 +198,13 @@ mouse-driven DAWs never quite do.
   flip, and frame index to any audio source via a small expression
   language with note-on-triggered animations.
 
-Upcoming: color-domain modulation (rotate, hue, palette swap), WAV/MIDI
-export, song mode, plugin voices. See [`docs/STAGES.md`](docs/STAGES.md)
-for the full roadmap.
+Also: song mode (`:order`, `:song on`), and the NSF pipeline —
+`:compile` a `.vip` against a 6502 driver, `:engine apu` to play the
+result through an emulated 2A03 in the tracker, and `viper render` for
+deterministic per-channel stems and a register-write log (see
+[`docs/NSF.md`](docs/NSF.md)). Upcoming: the generator style interface,
+plugin voices. See [`docs/STAGES.md`](docs/STAGES.md) for the full
+roadmap.
 
 ## Contributing
 

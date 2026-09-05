@@ -1221,6 +1221,22 @@ dependencies = [
  "image",
  "ratatui",
  "ringbuf",
+ "viper-apu",
+ "viper-nsf",
+]
+
+[[package]]
+name = "viper-apu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
+name = "viper-nsf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

@@ -80,6 +80,7 @@ fn channel_name(ch: usize) -> &'static str {
         1 => "PU2",
         2 => "TRI",
         3 => "NOI",
+        4 => "DPC",
         _ => "???",
     }
 }
