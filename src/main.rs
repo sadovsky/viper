@@ -10,6 +10,7 @@ mod gen;
 mod midi;
 mod modulation;
 mod sprite;
+mod style;
 mod vip;
 mod viz;
 mod cli;
@@ -144,6 +145,8 @@ pub(crate) struct Song {
     pub title: String,
     pub artist: String,
     pub copyright: String,
+    /// `@meta key="E minor"` — informational, carried into manifests.
+    pub key_name: String,
     /// `@driver bin=.. sym=..` — the NSF driver to compile against,
     /// relative to the `.vip` file.
     pub driver: Option<(PathBuf, PathBuf)>,
@@ -167,6 +170,7 @@ impl Default for Song {
             title: String::new(),
             artist: String::new(),
             copyright: String::new(),
+            key_name: String::new(),
             driver: None,
             samples: Vec::new(),
             expansion: false,
@@ -2371,6 +2375,24 @@ fn execute_command(app: &mut App, cmd: &str) {
             Ok(n) if n >= 1 => midi_cmd(app, path, n),
             _ => app.status = format!("midi: bad loop count '{}'", loops),
         },
+        ["gen", "style", dir] | ["gen", "style", dir, _] => {
+            let seed: u64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
+            let base = app.current_file.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+            let dir_path = match &base { Some(b) if Path::new(dir).is_relative() => b.join(dir), _ => PathBuf::from(dir) };
+            match style::Style::load(&dir_path).and_then(|st| style::generate(&st, &style::GenParams { seed, ..Default::default() })) {
+                Ok(song) => {
+                    app.snapshot();
+                    let driver = app.song.driver.clone();
+                    app.song = song;
+                    app.song.driver = driver;
+                    app.song_mode = true;
+                    app.cursor_step = 0;
+                    app.dirty = true;
+                    app.status = format!("gen style {} seed {} → {} phrases, {} bars", dir, seed, app.song.phrases.len(), app.song.order.len());
+                }
+                Err(e) => app.status = format!("gen style: {:#}", e),
+            }
+        }
         ["gen", rest @ ..] => {
             app.snapshot();
             let seed = app.gen_seed;
@@ -3549,7 +3571,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "fmt" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "fmt" | "gen" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}

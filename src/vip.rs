@@ -19,10 +19,19 @@ const NOTE_NAMES: [&str; 12] = [
     "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
 ];
 
+/// Pitch-class name for headers/reports (sharps).
+pub fn key_name(pc: u8) -> &'static str {
+    ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][(pc % 12) as usize]
+}
+
 fn encode_note(n: u8) -> String {
     let pc = (n % 12) as usize;
     let oct = ((n as i32) / 12 - 1).clamp(0, 9);
     format!("{}{}", NOTE_NAMES[pc], oct)
+}
+
+pub fn decode_note_pub(s: &str) -> Option<u8> {
+    decode_note(s)
 }
 
 fn decode_note(s: &str) -> Option<u8> {
@@ -125,11 +134,12 @@ pub fn to_vip(song: &Song) -> String {
         write!(out, "  order=[{}]  loop={:02X}", list.join(","), song.loop_pos).unwrap();
     }
     out.push('\n');
-    if !song.title.is_empty() || !song.artist.is_empty() || !song.copyright.is_empty() {
+    if !song.title.is_empty() || !song.artist.is_empty() || !song.copyright.is_empty() || !song.key_name.is_empty() {
         write!(out, "@meta ").unwrap();
         if !song.title.is_empty() { write!(out, " title={:?}", song.title).unwrap(); }
         if !song.artist.is_empty() { write!(out, " artist={:?}", song.artist).unwrap(); }
         if !song.copyright.is_empty() { write!(out, " license={:?}", song.copyright).unwrap(); }
+        if !song.key_name.is_empty() { write!(out, " key={:?}", song.key_name).unwrap(); }
         out.push('\n');
     }
     if let Some((bin, sym)) = &song.driver {
@@ -279,6 +289,7 @@ fn parse_meta(song: &mut Song, args: &str) {
             "title" => song.title = v,
             "artist" | "composer" | "author" => song.artist = v,
             "license" | "copyright" => song.copyright = v,
+            "key" => song.key_name = v,
             _ => {}
         }
     }

@@ -219,7 +219,7 @@ lives in viper.
   --triggers out/drums.mid`: one deterministic WAV per channel (DPCM
   split per sample ID), plus a MIDI file with one note per drum hit for
   DAW sampler layering. Bit-identical output for the same NSF.
-- **Stage 22 — Style interface + `viper gen`.** Plug-in boundary in the
+- **Stage 22** ✅ — **Style interface + `viper gen`.** Plug-in boundary in the
   generation layer: a style directory supplies scales, riff templates,
   harmonization rules, drum vocabulary, form grammar, and album-level
   constraints. viper ships the interface and a neutral style; genre

@@ -38,6 +38,49 @@ Every generator emits a complete `Song`. The caller decides whether to
 merge it into the current song, replace the current phrase, or write to
 disk. Generation never mutates global state.
 
+## Styles (Stage 22)
+
+The form → phrase → note generator is driven by a **style**: a directory
+holding `style.vps`, written in the same `@directive key=value` grammar
+as `.vip`. viper ships `styles/neutral/`; a genre style lives with the
+music that uses it (nintendo-metal's `style/melodeath/`).
+
+```
+viper gen --style styles/neutral --seed 7 -o songs/        # one song
+viper gen --style DIR --seed 1 --count 40 -o candidates/   # a batch
+:gen style DIR [seed]                                      # in the tracker
+```
+
+Generation is deterministic per (style, seed, key, bpm). A style supplies:
+
+| directive | what it declares |
+|---|---|
+| `@tempo min= max=` | BPM range, sampled in steps of 5 |
+| `@keys E F# ...` | tonic candidates |
+| `@scale name 0 2 3 ...` / `@scales a b c` | custom scales and the ones in play (viper modes are known by name) |
+| `@progression [name=..] i VI VII` | roman numerals; `b`/`#` prefixes for chromatic roots (`bII`, `bV`) |
+| `@instr NN name=.. a= d= s= r= duty= vol=` | instruments, same syntax as `.vip` |
+| `@noise hat=C-6/03 open=G-5/03 crash=C-5/04` | NOI notes and instruments for the drum tokens |
+| `@riff name rhythm=x.xx.. contour= harmony= bass= lead= harm= bassi= pair= fx= octave=` | a riff template |
+| `@drums name noi=".." dpcm=".."` | 16 tokens each: `h o c` on NOI, `k s t` on DPCM |
+| `@section name bars=2,4 riffs=a,b drums=x,y repeat=2 motif=0.6 end=crash` | a section recipe |
+| `@form intro riffA verse ...` | a song form; several = weighted variation |
+| `@motif 0 2 3 2 0 -1 0 4` | scale-degree offsets of the shared motif |
+| `@title adj=.. noun=..` | title word lists |
+
+Contours: `walk` (scale random walk, `pair=` repeats each pitch for
+tremolo), `pedal` (chord root with jabs to the b2/tritone), `pedal_jumps`,
+`pedal_then_run`, `run` (scale run), `chord` (chord tones held),
+`melody` (chord tones on strong beats, steps between), `motif`.
+Harmony: `third`, `sixth` (diatonic, below the lead), `fifth` (power-chord
+pedal), `root`, `unison` (with a slide for detune), `none`. Bass:
+`octaves`, `gallop`, `roots`, `half`, `follow`, `walk`.
+
+Sections that recur in a form come back identical (the chorus is the
+chorus); the last bar of a multi-bar section gets a Euclidean snare
+fill and the next section opens on a crash. The loop point is the first
+section after the intro.
+
 ## Algorithmic generators
 
 ### `four_on_floor`

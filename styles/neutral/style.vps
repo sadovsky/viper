@@ -1,0 +1,46 @@
+# styles/neutral/style.vps — the style that ships with viper.
+#
+# Deliberately genre-less: major/minor, four-chord loops, arps and simple
+# melodies over four-on-the-floor. It exists to prove the interface and
+# to be copied. See docs/GENERATION.md → "Styles".
+
+@style   name=neutral  version=1
+@tempo   min=100  max=150
+@keys    C D E F G A
+@scales  major minor dorian mixolydian
+
+@progression name=four_chords  I V vi IV
+@progression name=doowop       I vi IV V
+@progression name=andalusian   i VII VI V
+@progression name=canon        I V vi iii IV I IV V
+
+@instr 00  name=lead   a=2   d=80   s=0.60  r=150  duty=0.50  vol=0.70
+@instr 01  name=arp    a=2   d=60   s=0.30  r=80   duty=0.25  vol=0.50
+@instr 02  name=bass   a=2   d=40   s=0.90  r=200  duty=0.50  vol=0.90
+@instr 03  name=hat    a=0   d=40   s=0.00  r=20   duty=0.50  vol=0.50
+@instr 04  name=crash  a=0   d=400  s=0.00  r=200  duty=0.50  vol=0.60
+@instr 05  name=pad    a=20  d=200  s=0.70  r=300  duty=0.50  vol=0.55
+
+@noise   hat=C-6/03  open=G-5/03  crash=C-5/04
+
+@riff  melody   rhythm=x.x.x.x.x.x.x.x.  contour=melody  harmony=third  bass=roots   lead=lead  harm=arp  octave=5
+@riff  arps     rhythm=xxxxxxxxxxxxxxxx  contour=chord   harmony=none   bass=roots   lead=arp   octave=5
+@riff  pad      rhythm=x.......x.......  contour=chord   harmony=third  bass=half    lead=pad   harm=pad  octave=5  fx=V42
+@riff  walk     rhythm=x.x.x.x.x.x.x.x.  contour=walk    harmony=sixth  bass=walk    lead=lead  harm=arp  octave=5
+@riff  run      rhythm=xxxxxxxxxxxxxxxx  contour=run     harmony=none   bass=roots   lead=lead  octave=5
+
+@drums four   noi="h h h h h h h h h h h h h h h h"  dpcm="k . . . s . . . k . . . s . . ."
+@drums eight  noi="h . h . h . h . h . h . h . h . "  dpcm="k . . . s . k . k . . . s . . ."
+@drums half   noi="h . . . h . . . h . . . h . . ."  dpcm="k . . . . . . . s . . . . . . ."
+
+@section intro   bars=2,4  riffs=pad,arps      drums=half
+@section verse   bars=4    riffs=melody,walk   drums=four  repeat=2
+@section chorus  bars=4    riffs=melody,arps   drums=eight repeat=2  motif=0.7
+@section bridge  bars=2,4  riffs=run,pad       drums=half
+@section outro   bars=2    riffs=pad           drums=half  end=crash
+
+@form intro verse chorus verse chorus bridge chorus outro
+@form intro verse chorus bridge chorus outro
+
+@motif 0 2 4 2 0 -1 0 4
+@title adj=Blue,Paper,Little,Neon,Quiet,Summer  noun=Machine,Garden,Signal,Window,Parade,Orbit
