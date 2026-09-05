@@ -184,7 +184,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
   rolled SMF writer, no midly dep — VLQ, MThd/MTrk chunks, note-offs
   ordered before note-ons at the same tick to survive same-tick retriggers.
 - Possible later: `:render out.mp4` recording the viz synced to the bounce.
-- **Stage 16 — Song mode.** Phrases → chains → song, groove/swing, per-channel track length (polymeter).
+- **Stage 16 — Song mode.** ✅ (lite) Global order list: `@song order=[..] loop=NN`, `:order`, `:song on|off`; the grid follows the playing phrase; `:bounce` / `:midi` render the order. Still planned: per-channel chains, groove/swing, polymeter.
 - **Stage 17 — Plugin voices.** Load external SID/VRC6/FDS emulator cores as additional voice types for that extended-chip flavor.
 
 ### NSF pipeline
@@ -196,7 +196,7 @@ consumer is [nintendo-metal](https://github.com/sadovsky/nintendo-metal),
 which owns the 6502 driver and the genre style; nothing album-specific
 lives in viper.
 
-- **Stage 18 — IR + NSF emitter (`viper-nsf`).** Lower `Song` to a
+- **Stage 18** ✅ — **IR + NSF emitter (`viper-nsf`).** Lower `Song` to a
   channel-indexed, frame-timestamped event IR (`note off vol duty retrig
   slide vibrato arp env_reset dpcm loop jump`), serialize it to a
   driver's bytecode, lay out period tables and `$C000`-aligned DPCM
@@ -206,16 +206,16 @@ lives in viper.
   in `FORMAT.md`. Channel table carries an `expansion` flag so VRC6 rows
   are just more channels. Exit: `projects/stress_melodeath.vip` compiles
   to an NSF that plays in Mesen.
-- **Stage 19 — APU-backed playback (`viper-apu`).** FFI to Nes_Snd_Emu.
+- **Stage 19** ✅ — **APU-backed playback (`viper-apu`).** Pure-Rust 2A03 core (decided over the Nes_Snd_Emu FFI: no C++ toolchain, deterministic, easy to test).
   `space` compiles on play, runs the driver in a minimal 6502 host, and
   feeds register writes to the APU core; the audio thread pulls PCM from
   it. The atomic beat counter stays the clock and `VizFrame` reads from
   APU-side state so the visualizer is untouched. Exit: the Stage 18 NSF
   plays in the TUI with the playhead locked to it.
-- **Stage 20 — Register-write log.** Every render dumps `(frame, addr,
-  value)` in NSFPlay's log format. Golden-log test for the stress song.
+- **Stage 20** ✅ — **Register-write log.** Every render dumps `(frame, addr,
+  value)` as text (`frame addr value` per line, hex). Golden-log test for the stress song.
   Exit: log diffs clean against NSFPlay headless.
-- **Stage 21 — Stems + triggers.** `viper render song.nsf --stems out/
+- **Stage 21** ✅ — **Stems + triggers.** `viper render song.nsf --stems out/
   --triggers out/drums.mid`: one deterministic WAV per channel (DPCM
   split per sample ID), plus a MIDI file with one note per drum hit for
   DAW sampler layering. Bit-identical output for the same NSF.

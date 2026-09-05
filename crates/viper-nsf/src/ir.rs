@@ -167,8 +167,35 @@ impl Song {
     pub fn total_rows(&self) -> usize {
         self.order.len() * self.rows_per_pattern as usize
     }
+    /// Exact frame count for `rows` rows under the driver's 8.8 row clock,
+    /// starting with an empty fractional accumulator.
+    pub fn frames_for_rows(&self, rows: usize) -> u32 {
+        let speed = (self.frames_per_row * 256.0).round() as i64;
+        let mut cnt: i64 = 0;
+        let mut frames: u32 = 0;
+        let mut done = 0usize;
+        loop {
+            if cnt >> 8 == 0 {
+                if done == rows {
+                    return frames;
+                }
+                done += 1;
+                cnt += speed;
+            }
+            cnt -= 256;
+            frames += 1;
+        }
+    }
+    /// Frames before the loop point (the intro) and frames per loop pass.
+    pub fn intro_and_loop_frames(&self) -> (u32, u32) {
+        let rpp = self.rows_per_pattern as usize;
+        let intro = self.frames_for_rows(self.loop_pos.min(self.order.len()) * rpp);
+        let looped = self.frames_for_rows((self.order.len() - self.loop_pos.min(self.order.len())) * rpp);
+        (intro, looped)
+    }
     pub fn total_frames(&self) -> u32 {
-        (self.total_rows() as f64 * self.frames_per_row).round() as u32
+        let (i, l) = self.intro_and_loop_frames();
+        i + l
     }
 }
 

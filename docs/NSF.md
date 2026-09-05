@@ -46,10 +46,13 @@ Three crates, in dependency order:
 
 ## IR (Stage 18)
 
-A channel-indexed event stream with tick timestamps. Ticks are 60 Hz
-NTSC frames; a `.vip` step maps to a whole number of frames given the
-song BPM and steps-per-beat (rounding policy: nearest frame, error
-carried forward so tempo stays exact over a phrase).
+A channel-indexed event stream, one event list per row per channel
+(`viper_nsf::Pattern`). Rows are the timestamps: the driver converts
+rows to 60 Hz frames with an 8.8 fixed-point accumulator (`900 / BPM`
+frames per row at 16th-note steps), so 220 BPM (4.09 frames/row) lands
+rows on alternating 4- and 5-frame boundaries and stays exact over a
+phrase. `Song::frames_for_rows` reproduces that clock so the compiler
+knows a song's length to the frame.
 
 Primitives, chosen for what fast minor-key music needs:
 
@@ -106,11 +109,14 @@ aren't already spec'd.
 
 ## APU-backed playback (Stages 19–20)
 
-Reference core: **Nes_Snd_Emu** (blargg), via FFI. Cycle-accurate,
-includes VRC6 / MMC5, battle-tested by every emulator that borrowed it.
-A pure-Rust core is a possible later swap if the FFI build friction is
-bad; the host loop only depends on a `write(addr, value)` /
-`end_frame()` / `read_samples()` surface, so the swap is contained.
+Core: a pure-Rust 2A03 in `viper-apu` (pulses with sweep muting,
+triangle with linear counter, 15-bit LFSR noise, DMC with memory fetch,
+4/5-step frame counter, the nesdev non-linear mixer as lookup tables,
+90 Hz high-pass + 14 kHz low-pass at the output). The plan's default
+was blargg's Nes_Snd_Emu over FFI; the Rust core was chosen to avoid a
+C++ build dependency and keep renders bit-exact across machines.
+Reference-grade accuracy is enforced downstream by the register-log
+diff against NSFPlay/Mesen, not by the core's pedigree.
 
 Playback in the TUI:
 
@@ -125,9 +131,11 @@ Playback in the TUI:
    visualizer keeps working unchanged.
 
 **Register-write log.** Every render emits `(frame, addr, value)`
-triples. Same log format as NSFPlay's, so `diff` is the verifier. Any
-divergence between viper-apu and NSFPlay on the same NSF is a viper bug
-until proven otherwise.
+triples as `frame addr value` text lines (decimal frame, hex address and
+value; INIT's writes are frame 0). A verifier normalizes another
+emulator's dump into the same shape and diffs. Any divergence between
+viper-apu and NSFPlay/Mesen on the same NSF is a viper bug until proven
+otherwise.
 
 ## Stem rendering (Stage 21)
 

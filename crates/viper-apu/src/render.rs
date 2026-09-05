@@ -129,6 +129,39 @@ pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
     Ok(result)
 }
 
+/// Render exactly `frames` frames (no loop detection), with stems if
+/// requested. Used when the caller already knows the song length.
+pub fn render_frames(nsf: &Nsf, opts: &RenderOptions, frames: u32) -> Result<RenderResult> {
+    let (_, dpcm_samples) = analyze(nsf, &RenderOptions { max_seconds: frames as f64 / 60.0988 + 0.1, ..opts.clone() })?;
+    let full = run(nsf, opts, frames, CH_ALL, None, true)?;
+    let mut result = RenderResult {
+        mix: full.samples,
+        stems: Vec::new(),
+        log: full.log,
+        triggers: full.triggers,
+        loop_frames: None,
+        total_frames: frames,
+        dpcm_samples: dpcm_samples.clone(),
+        sample_rate: opts.sample_rate,
+    };
+    if opts.stems {
+        for (name, mask) in [("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)] {
+            let p = run(nsf, opts, frames, mask, None, false)?;
+            result.stems.push(Stem { name: name.to_string(), samples: p.samples });
+        }
+        if dpcm_samples.is_empty() {
+            let p = run(nsf, opts, frames, CH_DMC, None, false)?;
+            result.stems.push(Stem { name: "dpcm".to_string(), samples: p.samples });
+        } else {
+            for (i, &addr) in dpcm_samples.iter().enumerate() {
+                let p = run(nsf, opts, frames, CH_DMC, Some(addr), false)?;
+                result.stems.push(Stem { name: format!("dpcm{}", i), samples: p.samples });
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Format the register log as text: one `frame addr value` per line, hex.
 pub fn format_log(log: &[crate::host::RegWrite]) -> String {
     let mut s = String::with_capacity(log.len() * 14);

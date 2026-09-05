@@ -20,11 +20,20 @@ A vim-keybound chiptune step sequencer for the terminal.
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-Four-voice (two pulse, one triangle, one noise) step sequencer in a
+Five-voice (two pulse, triangle, noise, DPCM) step sequencer in a
 single Rust binary, running inside your terminal, controlled entirely
 by vim-style modal keys. Write songs in a tracker grid, yank/paste
 patterns, script up drum patterns with `:gen`, save to a plain-text
-`.vip` file you can `grep` and diff.
+`.vip` file you can `grep` and diff — then compile it to a real NSF and
+hear it through a cycle-stepped 2A03 (see [`docs/NSF.md`](docs/NSF.md)).
+
+```sh
+viper song.vip                                   # open in the tracker
+viper check song.vip                             # parse + lowering report
+viper compile song.vip --driver driver.bin -o song.nsf
+viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
+             --log writes.txt --vip song.vip
+```
 
 ## Install & run
 
@@ -188,10 +197,13 @@ mouse-driven DAWs never quite do.
   flip, and frame index to any audio source via a small expression
   language with note-on-triggered animations.
 
-Upcoming: song mode, plugin voices, and the NSF pipeline — compile
-`.vip` to a real NSF, play it back through an emulated 2A03, render
-per-channel stems (see [`docs/NSF.md`](docs/NSF.md)). See
-[`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
+Also: song mode (`:order`, `:song on`), and the NSF pipeline —
+`:compile` a `.vip` against a 6502 driver, `:engine apu` to play the
+result through an emulated 2A03 in the tracker, and `viper render` for
+deterministic per-channel stems and a register-write log (see
+[`docs/NSF.md`](docs/NSF.md)). Upcoming: the generator style interface,
+plugin voices. See [`docs/STAGES.md`](docs/STAGES.md) for the full
+roadmap.
 
 ## Contributing
 

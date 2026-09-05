@@ -4,12 +4,15 @@
 //! Stage-2: cpal audio thread producing sound from the edited phrase.
 
 mod audio;
+mod compile;
+mod dpcm;
 mod gen;
 mod midi;
 mod modulation;
 mod sprite;
 mod vip;
 mod viz;
+mod cli;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -35,7 +38,9 @@ use ratatui::{
 // ---------- Data model ----------
 
 pub(crate) const STEPS_PER_PHRASE: usize = 16;
-pub(crate) const CHANNELS: usize = 4;
+pub(crate) const CHANNELS: usize = 5;
+/// Channel names in grid order.
+pub(crate) const CH_NAMES: [&str; CHANNELS] = ["PU1", "PU2", "TRI", "NOI", "DPCM"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Cell {
@@ -130,6 +135,23 @@ pub(crate) struct Song {
     /// One phrase loaded at a time for now.
     pub current_phrase: usize,
     pub instruments: [Instrument; INSTRUMENTS],
+    /// Song mode (Stage 16-lite): phrase indices in playback order. Empty
+    /// means "loop the current phrase".
+    pub order: Vec<usize>,
+    /// Order position to jump back to after the last entry.
+    pub loop_pos: usize,
+    /// `@meta` fields carried into the NSF header.
+    pub title: String,
+    pub artist: String,
+    pub copyright: String,
+    /// `@driver bin=.. sym=..` — the NSF driver to compile against,
+    /// relative to the `.vip` file.
+    pub driver: Option<(PathBuf, PathBuf)>,
+    /// `@dpcm NN name path` — sample files for the DPCM column, indexed by
+    /// note (C-4 = 00). Empty means the built-in kick/snare/hat bank.
+    pub samples: Vec<(String, PathBuf)>,
+    /// `@driver expansion=vrc6` — request expansion audio in the NSF header.
+    pub expansion: bool,
 }
 
 impl Default for Song {
@@ -140,6 +162,14 @@ impl Default for Song {
             phrases: vec![Phrase::default()],
             current_phrase: 0,
             instruments: [Instrument::default(); INSTRUMENTS],
+            order: Vec::new(),
+            loop_pos: 0,
+            title: String::new(),
+            artist: String::new(),
+            copyright: String::new(),
+            driver: None,
+            samples: Vec::new(),
+            expansion: false,
         }
     }
 }
@@ -392,6 +422,15 @@ struct App {
     /// Slot index (0..9) queued to launch on the next bar boundary while
     /// playing. `None` = no pending launch.
     queued_scene: Option<usize>,
+    /// Song mode follows `song.order`; off = loop the current phrase.
+    song_mode: bool,
+    /// Playback engine: internal synth or the APU (compiled NSF).
+    engine: audio::Engine,
+    /// Compiled NSF for APU playback, refreshed on play.
+    nsf_cache: Option<std::sync::Arc<Vec<u8>>>,
+    nsf_generation: u64,
+    nsf_frames_per_row: f64,
+    prev_playing: bool,
     /// `play_step` observed on the previous UI frame. We fire a queued
     /// launch only on the frame the audio thread actually crosses a bar,
     /// so scene changes land crisply on the downbeat.
@@ -471,6 +510,12 @@ impl App {
             muted: [false; CHANNELS],
             scenes: [None; 9],
             queued_scene: None,
+            song_mode: false,
+            engine: audio::Engine::Synth,
+            nsf_cache: None,
+            nsf_generation: 0,
+            nsf_frames_per_row: 4.0,
+            prev_playing: false,
             prev_play_step: usize::MAX,
             macros: HashMap::new(),
             recording_macro: None,
@@ -1010,7 +1055,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     // based highlighting reads as a ~one-step LED blink per hit.
     let mut header = vec![Span::raw("     ")];
     for ch in 0..CHANNELS {
-        let base = match ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
+        let base = CH_NAMES[ch];
         let muted = app.muted[ch];
         let label = if muted { format!("{} MUTE", base) } else { base.to_string() };
         // Stage 9: LED flash now reads the actual ADSR level published by the
@@ -1118,7 +1163,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         None => "[no name]".into(),
     };
     let dirty = if app.dirty { " [+]" } else { "" };
-    let ch_name = match app.cursor_ch { 0 => "PU1", 1 => "PU2", 2 => "TRI", 3 => "NOI", _ => "???" };
+    let ch_name = CH_NAMES[app.cursor_ch.min(CHANNELS - 1)];
     let cursor_cell = app.phrase().cells[app.cursor_step][app.cursor_ch];
     let (instr_txt, vol_txt) = match cursor_cell.note {
         Some(_) => (
@@ -1215,7 +1260,12 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
-        row(":mute [N]",        "toggle mute on cursor channel (or N: 1-4 / pu1..noi)"),
+        row(":mute [N]",        "toggle mute on cursor channel (or N: 1-5 / pu1..dpcm)"),
+        row(":order [A,B,..]",  "show / set song order (hex phrase indices); :order off clears"),
+        row(":song on|off",     "song mode: play through :order (on) or loop the phrase (off)"),
+        row(":engine apu|synth","play through the compiled NSF + 2A03 emulation, or the synth"),
+        row(":driver BIN SYM",  "set the NSF driver (paths relative to the .vip)"),
+        row(":compile PATH",    "compile the song to an NSF against the @driver"),
         row(":unmute [N|off]",  "unmute specific / all channels"),
         row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites)"),
         row(":sprite load P WxH [q]", "load PNG sheet (≤3 opaque colors, or 'q' to quantize)"),
@@ -2155,6 +2205,56 @@ fn execute_command(app: &mut App, cmd: &str) {
         }
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
+        ["order"] => {
+            let list: Vec<String> = app.song.order.iter().map(|i| format!("{:02X}", i)).collect();
+            app.status = if list.is_empty() {
+                "order: (none) — :order 00,01,.. to set".into()
+            } else {
+                format!("order: [{}] loop={:02X} song mode {}", list.join(","), app.song.loop_pos,
+                    if app.song_mode { "on" } else { "off" })
+            };
+        }
+        ["order", "off"] => { app.song.order.clear(); app.song_mode = false; app.dirty = true; app.status = "order cleared".into(); }
+        ["order", "loop", n] => match usize::from_str_radix(n, 16) {
+            Ok(i) if i < app.song.order.len().max(1) => { app.song.loop_pos = i; app.dirty = true; app.status = format!("loop point → {:02X}", i); }
+            _ => app.status = "order loop: index out of range".into(),
+        },
+        ["order", list] => match parse_order_list(list, app.song.phrases.len()) {
+            Ok(o) => {
+                app.song.order = o;
+                app.song.loop_pos = app.song.loop_pos.min(app.song.order.len().saturating_sub(1));
+                app.song_mode = true;
+                app.dirty = true;
+                app.status = format!("order set ({} entries), song mode on", app.song.order.len());
+            }
+            Err(e) => app.status = format!("order: {}", e),
+        },
+        ["song", "on"] => {
+            if app.song.order.is_empty() {
+                app.song.order = (0..app.song.phrases.len()).collect();
+                app.dirty = true;
+            }
+            app.song_mode = true;
+            app.status = "song mode on".into();
+        }
+        ["song", "off"] => { app.song_mode = false; app.status = "song mode off (looping current phrase)".into(); }
+        ["engine", "apu"] => {
+            app.engine = audio::Engine::Apu;
+            app.nsf_cache = None;
+            app.status = match &app.song.driver {
+                Some(_) => "engine: APU (compiles on play)".into(),
+                None => "engine: APU — set :driver BIN SYM first".into(),
+            };
+        }
+        ["engine", "synth"] => { app.engine = audio::Engine::Synth; app.status = "engine: synth".into(); }
+        ["engine"] => { app.status = format!("engine: {:?}", app.engine); }
+        ["driver", bin, sym] => {
+            app.song.driver = Some((PathBuf::from(bin), PathBuf::from(sym)));
+            app.nsf_cache = None;
+            app.dirty = true;
+            app.status = format!("driver: {} + {}", bin, sym);
+        }
+        ["compile", path] => compile_cmd(app, path),
         ["rec"] => { toggle_record_arm(app); }
         ["rec", "off"] => {
             app.disarm_all();
@@ -2478,7 +2578,7 @@ fn unmute_all(app: &mut App) {
     };
 }
 
-/// Parse "1".."4" or "pu1/pu2/tri/noi" into a channel index.
+/// Parse "1".."5" or "pu1/pu2/tri/noi/dpcm" into a channel index.
 fn parse_channel_token(tok: &str) -> Option<usize> {
     if let Ok(n) = tok.parse::<usize>() {
         if (1..=CHANNELS).contains(&n) {
@@ -2490,6 +2590,7 @@ fn parse_channel_token(tok: &str) -> Option<usize> {
         "pu2" => Some(1),
         "tri" => Some(2),
         "noi" => Some(3),
+        "dpcm" | "dpc" | "dmc" => Some(4),
         _ => None,
     }
 }
@@ -2500,6 +2601,7 @@ fn channel_name(ch: usize) -> &'static str {
         1 => "PU2",
         2 => "TRI",
         3 => "NOI",
+        4 => "DPCM",
         _ => "???",
     }
 }
@@ -2989,18 +3091,87 @@ fn delete_phrase_cmd(app: &mut App) {
 /// Stage 15a: offline WAV bounce of the current phrase. Resolves `~` and
 /// relative paths the same way sprite loading does, renders at 44.1kHz
 /// 16-bit mono, N loops of the phrase + release tail.
+/// The phrases `:bounce` / `:midi` render: the song order in song mode,
+/// otherwise the current phrase.
+fn playback_sequence(app: &App) -> Vec<Phrase> {
+    if app.song_mode && !app.song.order.is_empty() {
+        app.song.order.iter().filter_map(|&i| app.song.phrases.get(i).cloned()).collect()
+    } else {
+        app.song.phrases.get(app.song.current_phrase).cloned().into_iter().collect()
+    }
+}
+
+fn parse_order_list(list: &str, phrases: usize) -> Result<Vec<usize>> {
+    let mut out = Vec::new();
+    for tok in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let i = usize::from_str_radix(tok, 16).map_err(|_| anyhow::anyhow!("bad phrase index {:?}", tok))?;
+        if i >= phrases {
+            anyhow::bail!("phrase {:02X} does not exist", i);
+        }
+        out.push(i);
+    }
+    if out.is_empty() {
+        anyhow::bail!("empty order");
+    }
+    Ok(out)
+}
+
+/// Stage 18: `:compile PATH` — lower the song and emit an NSF against the
+/// `@driver`. Reports data size and any lowering warnings.
+fn compile_cmd(app: &mut App, path_str: &str) {
+    let path = resolve_sprite_path(app, Path::new(path_str));
+    let base = app.current_file.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+    let driver = match compile::load_song_driver(&app.song, base.as_deref()) {
+        Ok(d) => d,
+        Err(e) => { app.status = format!("compile: {}", e); return; }
+    };
+    match compile::compile(&app.song, &driver, base.as_deref()) {
+        Ok(c) => match std::fs::write(&path, &c.nsf) {
+            Ok(()) => {
+                app.status = format!(
+                    "compiled {} ({} bytes data, {} bytes samples, {} frames){}",
+                    path.display(), c.data_bytes, c.sample_bytes, c.total_frames,
+                    if c.warnings.is_empty() { String::new() } else { format!(" — {} warning(s): {}", c.warnings.len(), c.warnings[0]) }
+                );
+            }
+            Err(e) => app.status = format!("compile: write {}: {}", path.display(), e),
+        },
+        Err(e) => app.status = format!("compile: {}", e),
+    }
+}
+
+/// Compile the song for APU playback. Called on the play transition when
+/// the engine is APU; failures fall back to the synth with a status.
+fn refresh_nsf_for_playback(app: &mut App) {
+    if app.engine != audio::Engine::Apu {
+        return;
+    }
+    let base = app.current_file.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+    let driver = match compile::load_song_driver(&app.song, base.as_deref()) {
+        Ok(d) => d,
+        Err(e) => { app.status = format!("apu: {} — using synth", e); app.nsf_cache = None; return; }
+    };
+    match compile::compile(&app.song, &driver, base.as_deref()) {
+        Ok(c) => {
+            app.nsf_cache = Some(std::sync::Arc::new(c.nsf));
+            app.nsf_generation = app.nsf_generation.wrapping_add(1);
+            app.nsf_frames_per_row = c.frames_per_row;
+            app.status = "playing (APU)".into();
+        }
+        Err(e) => { app.status = format!("apu: {} — using synth", e); app.nsf_cache = None; }
+    }
+}
+
 fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
     let path = resolve_sprite_path(app, Path::new(path_str));
-    let phrase = match app.song.phrases.get(app.song.current_phrase) {
-        Some(p) => p.clone(),
-        None => {
-            app.status = "bounce: no phrase loaded".into();
-            return;
-        }
-    };
+    let sequence = playback_sequence(app);
+    if sequence.is_empty() {
+        app.status = "bounce: no phrase loaded".into();
+        return;
+    }
     const SR: u32 = 44100;
     match audio::bounce_to_wav(
-        &path, &phrase, &app.song.instruments, app.song.bpm, loops, SR,
+        &path, &sequence, &app.song.instruments, app.song.bpm, loops, SR,
     ) {
         Ok(frames) => {
             let secs = frames as f32 / SR as f32;
@@ -3019,15 +3190,13 @@ fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
 /// remap based on pitch.
 fn midi_cmd(app: &mut App, path_str: &str, loops: u32) {
     let path = resolve_sprite_path(app, Path::new(path_str));
-    let phrase = match app.song.phrases.get(app.song.current_phrase) {
-        Some(p) => p.clone(),
-        None => {
-            app.status = "midi: no phrase loaded".into();
-            return;
-        }
-    };
+    let sequence = playback_sequence(app);
+    if sequence.is_empty() {
+        app.status = "midi: no phrase loaded".into();
+        return;
+    }
     match midi::export_phrase_to_midi(
-        &path, &phrase, &app.song.instruments, app.song.bpm, loops,
+        &path, &sequence, &app.song.instruments, app.song.bpm, loops,
     ) {
         Ok(()) => {
             app.status = format!("midi: {} ({}× loop)", path.display(), loops);
@@ -3083,6 +3252,8 @@ fn edit_file(app: &mut App, path: &Path) {
     }
     match vip::load(path) {
         Ok((song, warnings)) => {
+            app.song_mode = !song.order.is_empty();
+            app.nsf_cache = None;
             app.song = song;
             app.current_file = Some(path.to_path_buf());
             app.cursor_step = 0;
@@ -3241,15 +3412,44 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         app.live_events.clear();
         return;
     };
+    // Play transition: compile for the APU engine before the audio thread
+    // sees `playing`.
+    if app.playing && !app.prev_playing {
+        refresh_nsf_for_playback(app);
+    }
+    app.prev_playing = app.playing;
     if let Ok(mut tr) = engine.transport.lock() {
         tr.bpm = app.song.bpm;
         tr.playing = app.playing;
         tr.phrase = app.phrase().clone();
         tr.instruments = app.song.instruments;
         tr.muted = app.muted;
+        tr.song_mode = app.song_mode && !app.song.order.is_empty();
+        if tr.song_mode {
+            tr.order = app.song.order.clone();
+            tr.loop_pos = app.song.loop_pos;
+            tr.phrases = app.song.phrases.clone();
+        } else {
+            tr.order.clear();
+            tr.phrases.clear();
+        }
+        tr.engine = app.engine;
+        tr.nsf = app.nsf_cache.clone();
+        tr.nsf_generation = app.nsf_generation;
+        tr.frames_per_row = app.nsf_frames_per_row;
+        if let Some(e) = tr.engine_error.take() {
+            app.status = format!("apu: {} — using synth", e);
+        }
         // Forward any live gate events queued since the last frame.
         tr.live_events.extend(app.live_events.drain(..));
         app.play_step = tr.step;
+        // Song mode: the grid follows the playing phrase.
+        if app.playing && tr.song_mode && tr.playing_phrase < app.song.phrases.len()
+            && app.song.current_phrase != tr.playing_phrase
+        {
+            app.song.current_phrase = tr.playing_phrase;
+            app.cursor_step = app.cursor_step.min(STEPS_PER_PHRASE - 1);
+        }
         // Stage 9: snapshot the viz state while we're inside the lock.
         app.viz_frame = tr.frame;
     }
@@ -3313,10 +3513,14 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
     app.prev_play_step = app.play_step;
 }
 
-fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine>) -> Result<()> {
+fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine>, open: Option<PathBuf>) -> Result<()> {
     let mut app = App::new();
     if audio.is_none() {
         app.status = "audio disabled (no output device)".into();
+    }
+    if let Some(path) = open {
+        edit_file(&mut app, &path);
+        app.show_splash = false;
     }
     loop {
         sync_audio(&mut app, audio);
@@ -3342,6 +3546,15 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = args.first() {
+        match first.as_str() {
+            "check" | "compile" | "render" | "info" | "--help" | "-h" | "help" => {
+                return cli::run(&args);
+            }
+            _ => {}
+        }
+    }
     // Initialise audio before entering raw mode so init errors print cleanly.
     let audio = match audio::AudioEngine::new() {
         Ok(a) => Some(a),
@@ -3357,7 +3570,8 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run(&mut terminal, audio.as_ref());
+    let open = args.first().map(PathBuf::from);
+    let res = run(&mut terminal, audio.as_ref(), open);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;

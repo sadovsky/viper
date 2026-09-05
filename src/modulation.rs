@@ -527,6 +527,7 @@ fn parse_source(name: &str) -> Result<Source> {
             "pu2" => 1,
             "tri" => 2,
             "noi" => 3,
+            "dpcm" | "dpc" => 4,
             _ => bail!("unknown source '{}'", name),
         };
         let f = match field {
@@ -547,7 +548,7 @@ mod tests {
     use super::*;
     use crate::audio::{VizFrame, VoiceFrame};
 
-    fn ctx_with_voices(voices: [VoiceFrame; 4]) -> (VizFrame, ()) {
+    fn ctx_with_voices(voices: [VoiceFrame; CHANNELS]) -> (VizFrame, ()) {
         (VizFrame { playing: true, step: 3, step_phase: 0.5, voices }, ())
     }
 
@@ -561,14 +562,14 @@ mod tests {
             scene_index: 2,
             phrase: 2,
             time_s: 1.0,
-            voice_ages: [0.25, 0.5, 1.0, 10.0],
+            voice_ages: [0.25, 0.5, 1.0, 10.0, 0.0],
         };
         eval(&expr, &ctx)
     }
 
     #[test]
     fn arithmetic() {
-        let (frame, _) = ctx_with_voices([VoiceFrame::default(); 4]);
+        let (frame, _) = ctx_with_voices([VoiceFrame::default(); CHANNELS]);
         assert_eq!(run("1 + 2 * 3", &frame), 7.0);
         assert_eq!(run("(1 + 2) * 3", &frame), 9.0);
         assert_eq!(run("10 % 3", &frame), 1.0);
@@ -584,6 +585,7 @@ mod tests {
             VoiceFrame { gate: true,  env_level: 0.8, freq: 440.0, vel: 1.0 },
             VoiceFrame { gate: false, env_level: 0.0, freq: 0.0,   vel: 0.0 },
             VoiceFrame { gate: true,  env_level: 0.5, freq: 220.0, vel: 0.5 },
+            VoiceFrame { gate: false, env_level: 0.0, freq: 0.0,   vel: 0.0 },
             VoiceFrame { gate: false, env_level: 0.0, freq: 0.0,   vel: 0.0 },
         ];
         let (frame, _) = ctx_with_voices(voices);
@@ -623,11 +625,12 @@ mod tests {
             VoiceFrame::default(),
             VoiceFrame { gate: true, env_level: 0.5, freq: 0.0, vel: 1.0 },
             VoiceFrame::default(),
+            VoiceFrame::default(),
         ];
         let frame = VizFrame { playing: false, step: 0, step_phase: 0.0, voices };
         let ctx = EvalCtx {
             frame: &frame, tempo: 120.0, scene_index: 0, phrase: 0,
-            time_s: 0.0, voice_ages: [0.0; 4],
+            time_s: 0.0, voice_ages: [0.0; CHANNELS],
         };
         let eff = apply_bindings(&placements, &[b], &ctx);
         assert_eq!(eff.len(), 1);
@@ -637,7 +640,7 @@ mod tests {
 
     #[test]
     fn voice_age() {
-        let (frame, _) = ctx_with_voices([VoiceFrame::default(); 4]);
+        let (frame, _) = ctx_with_voices([VoiceFrame::default(); CHANNELS]);
         // voice_ages in `run` ctx = [0.25, 0.5, 1.0, 10.0] → pu1/pu2/tri/noi.
         assert!((run("pu1.age", &frame) - 0.25).abs() < 1e-6);
         assert!((run("noi.age", &frame) - 10.0).abs() < 1e-6);

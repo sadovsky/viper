@@ -43,6 +43,7 @@ pub enum Channel {
     Pu2,
     Tri,
     Noi,
+    Dpcm,
 }
 
 impl Channel {
@@ -52,6 +53,7 @@ impl Channel {
             "pu2" | "2" => Some(Self::Pu2),
             "tri" | "3" => Some(Self::Tri),
             "noi" | "4" => Some(Self::Noi),
+            "dpcm" | "dpc" | "5" => Some(Self::Dpcm),
             _ => None,
         }
     }
@@ -61,6 +63,7 @@ impl Channel {
             Self::Pu2 => 1,
             Self::Tri => 2,
             Self::Noi => 3,
+            Self::Dpcm => 4,
         }
     }
     pub fn label(self) -> &'static str {
@@ -69,6 +72,7 @@ impl Channel {
             Self::Pu2 => "PU2",
             Self::Tri => "TRI",
             Self::Noi => "NOI",
+            Self::Dpcm => "DPCM",
         }
     }
 }
@@ -350,6 +354,7 @@ fn default_note_instr(ch: Channel) -> (u8, u8) {
         Channel::Pu2 => (64, 1), // E4
         Channel::Tri => (45, 2), // A2
         Channel::Noi => (60, 3),
+        Channel::Dpcm => (60, 0), // C-4 = kick
     }
 }
 
@@ -359,6 +364,7 @@ fn default_octaves(ch: Channel) -> (i32, i32) {
         Channel::Pu2 => (3, 4),
         Channel::Tri => (2, 3),
         Channel::Noi => (3, 4),
+        Channel::Dpcm => (4, 4), // C-4..B-4 = samples 0..11
     }
 }
 
