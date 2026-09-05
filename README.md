@@ -96,10 +96,17 @@ same song), composable, and fast enough to run on every keypress.
 :gen euclid pu1 5 16               # 5-hits-in-16 Euclidean rhythm on PU1
 :gen euclid noi 7 16 offset=2      # rotated Euclidean on NOI
 :gen scale pu2 A minor density=0.4 # random notes in A minor, 40% hit rate
+:gen chord_prog i iv V i key=Am    # voiced progression: PU1 / PU2 / TRI + hats
+:gen chord_prog doowop key=C       # bundled presets: 12bar doowop canon andalusian …
+:gen bassline Am Dm E Am style=walking
+:gen arp Cmaj7 updown 16 rate=2    # arpeggiator on PU2
+:gen drums breakbeat fills=2       # kick/snare on DPCM, hats on NOI
+:gen lsystem axiom=A rules=A=ABA,B=.A. iterations=4 map=A=C4,B=G3,.=-
+:gen cellular rule=30              # Wolfram meets Squarepusher
+:gen style styles/neutral 7        # a whole song from a style directory
 ```
 
-More generators (Markov chains, chord-progression voicing, basslines,
-arpeggiator, L-systems, cellular automata, LLM prompting) are planned —
+Markov chains over a corpus and LLM prompting are still on the list —
 see [`docs/GENERATION.md`](docs/GENERATION.md) for the full design.
 
 ## Live performance
