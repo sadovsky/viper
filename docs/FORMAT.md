@@ -168,7 +168,7 @@ they hold the defaults.
 | `@sprite` | sprite sheet reference + palette           | 11    |
 | `@meta`   | free-form key=value metadata (author, etc) | any   |
 | `@driver` | NSF driver binary/symbol map + expansion flag | 18    |
-| `@dpcm`   | `NN name=.. path=..` DPCM sample for note C-4+NN | 18    |
+| `@dpcm`   | `NN name=.. path=.. [rate=15]` DPCM sample for note C-4+NN; `rate` is the $4010 index it was encoded at | 18    |
 
 ## Effect column
 

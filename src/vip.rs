@@ -148,8 +148,12 @@ pub fn to_vip(song: &Song) -> String {
         writeln!(out, "@driver  bin={}  sym={}  expansion={}", bin.display(), sym.display(),
             if song.expansion { "vrc6" } else { "none" }).unwrap();
     }
-    for (i, (name, path)) in song.samples.iter().enumerate() {
-        writeln!(out, "@dpcm {:02X}  name={}  path={}", i, name, path.display()).unwrap();
+    for (i, r) in song.samples.iter().enumerate() {
+        write!(out, "@dpcm {:02X}  name={}  path={}", i, r.name, r.path.display()).unwrap();
+        if r.rate != 15 {
+            write!(out, "  rate={}", r.rate).unwrap();
+        }
+        out.push('\n');
     }
     out.push('\n');
 
@@ -500,18 +504,25 @@ fn parse_dpcm(song: &mut Song, args: &str) -> Result<()> {
     }
     let mut name = format!("sample{:02X}", idx);
     let mut path = None;
+    let mut rate = 15u8;
     for (k, v) in kv_quoted(rest) {
         match k.as_str() {
             "name" => name = v,
             "path" | "file" => path = Some(PathBuf::from(v)),
+            "rate" => {
+                rate = v.parse().context("rate")?;
+                if rate > 15 {
+                    bail!("rate {} out of range 0..=15", rate);
+                }
+            }
             _ => {}
         }
     }
     let path = path.ok_or_else(|| anyhow!("@dpcm needs path="))?;
     while song.samples.len() <= idx {
-        song.samples.push((String::new(), PathBuf::new()));
+        song.samples.push(crate::DpcmRef { name: String::new(), path: PathBuf::new(), rate: 15 });
     }
-    song.samples[idx] = (name, path);
+    song.samples[idx] = crate::DpcmRef { name, path, rate };
     Ok(())
 }
 
@@ -722,7 +733,7 @@ mod tests {
         song.title = "Blast Furnace".into();
         song.artist = "viper".into();
         song.driver = Some(("driver/build/driver.bin".into(), "driver/build/driver.sym".into()));
-        song.samples.push(("kick".into(), "samples/kick.dmc".into()));
+        song.samples.push(crate::DpcmRef { name: "kick".into(), path: "samples/kick.dmc".into(), rate: 13 });
         song.phrases[1].cells[3][4] = Cell { note: Some(61), instr: 0, vol: 0, fx: None };
         let text = to_vip(&song);
         let (back, warns) = from_vip(&text).unwrap();
@@ -732,7 +743,10 @@ mod tests {
         assert_eq!(back.title, "Blast Furnace");
         assert_eq!(back.artist, "viper");
         assert_eq!(back.driver.as_ref().unwrap().1, Path::new("driver/build/driver.sym"));
-        assert_eq!(back.samples[0].0, "kick");
+        assert_eq!(back.samples[0].name, "kick");
+        assert_eq!(back.samples[0].rate, 13);
+        let (again, _) = from_vip("@dpcm 00 name=k path=k.dmc\n").unwrap();
+        assert_eq!(again.samples[0].rate, 15);
         assert_eq!(back.phrases[1].cells[3][4].note, Some(61));
     }
 

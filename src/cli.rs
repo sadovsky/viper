@@ -35,6 +35,11 @@ usage:
       the loop is detected from the driver's RAM state, which can overshoot
       by up to one pass.
   viper info song.nsf
+  viper dpcm encode in.wav -o out.dmc [--rate 15] [--gain 1.0] [--level 64]
+                   [--mode trellis|greedy] [--hp 20] [--trim -60|off] [--max-bytes 4081]
+  viper dpcm decode in.dmc -o out.wav [--rate 15] [--level 64]   # through the DMC model
+  viper dpcm info a.dmc [b.dmc ...] [--rate 15]                  # sizes, levels, drift, budget
+  viper dpcm synth kick|snare|hat|tom -o out.wav [--rate 15]     # built-in recipes as WAV
   viper verify song.nsf|writes.log --against other.log [--vip song.vip]
                 [--loops N | --frames N] [--song N] [-o normalized.log]
       diff viper's register-write log against another emulator's dump
@@ -92,6 +97,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let a = Args::parse(&args[1..]);
     match cmd {
         "check" => check(&a),
+        "dpcm" => dpcm_cmd(&a),
         "gen" => gen(&a),
         "fmt" => fmt(&a),
         "compile" => compile_cmd(&a),
@@ -188,6 +194,94 @@ fn gen(a: &Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `viper dpcm encode|decode|info|synth` — the sample workbench.
+fn dpcm_cmd(a: &Args) -> Result<()> {
+    use crate::dpcm;
+    let sub = a.positional.first().map(String::as_str).unwrap_or("");
+    let rate: u8 = a.num::<u8>("rate")?.unwrap_or(15);
+    if rate > 15 {
+        bail!("--rate must be 0..=15");
+    }
+    let level: u8 = a.num::<u8>("level")?.unwrap_or(64).min(127);
+    match sub {
+        "encode" => {
+            let input = a.positional.get(1).map(PathBuf::from).context("dpcm encode: need an input .wav")?;
+            let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| input.with_extension("dmc"));
+            let (src_hz, wave) = viper_apu::wav::read_wav(&std::fs::read(&input).with_context(|| format!("read {}", input.display()))?)
+                .with_context(|| format!("{}", input.display()))?;
+            let opts = dpcm::EncodeOptions {
+                rate,
+                gain: a.num::<f32>("gain")?.unwrap_or(1.0),
+                level,
+                mode: match a.get("mode") {
+                    None | Some("trellis") => dpcm::Mode::Trellis,
+                    Some("greedy") => dpcm::Mode::Greedy,
+                    Some(m) => bail!("--mode {}: want trellis or greedy", m),
+                },
+                hp_hz: a.num::<f32>("hp")?.unwrap_or(20.0),
+                trim_db: match a.get("trim") {
+                    Some("off") => None,
+                    Some(v) => Some(v.parse::<f32>().map_err(|_| anyhow!("--trim wants dB or off"))?),
+                    None => Some(-60.0),
+                },
+                max_bytes: a.num::<usize>("max-bytes")?.unwrap_or(4081),
+            };
+            let e = dpcm::encode(&wave, src_hz as f32, &opts)?;
+            std::fs::write(&out, &e.data).with_context(|| format!("write {}", out.display()))?;
+            let s = &e.stats;
+            println!(
+                "{} → {}: {} bytes ({:.0}% of 4081), {:.1} ms @ rate {} ({:.0} Hz), levels {}..{}, {} clamped, SNR trellis {:.1} dB / greedy {:.1} dB",
+                input.display(), out.display(), s.bytes, s.bytes as f32 * 100.0 / 4081.0, s.seconds * 1000.0, rate,
+                dpcm::rate_hz(rate), s.min_level, s.max_level, s.clamps, s.snr_db, s.snr_greedy_db
+            );
+            Ok(())
+        }
+        "decode" => {
+            let input = a.positional.get(1).map(PathBuf::from).context("dpcm decode: need an input .dmc")?;
+            let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| input.with_extension("wav"));
+            let data = std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+            let wave = dpcm::decode_wave(&data, rate, level);
+            let f = std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
+            viper_apu::wav::write_wav(std::io::BufWriter::new(f), dpcm::rate_hz(rate).round() as u32, &wave)?;
+            println!("{} → {}: {} samples at {:.0} Hz", input.display(), out.display(), wave.len(), dpcm::rate_hz(rate));
+            Ok(())
+        }
+        "info" => {
+            if a.positional.len() < 2 {
+                bail!("dpcm info: need one or more .dmc files");
+            }
+            let mut total_aligned = 0usize;
+            for p in &a.positional[1..] {
+                let data = std::fs::read(p).with_context(|| format!("read {}", p))?;
+                let levels = viper_apu::apu::decode_dmc(&data, rate, level);
+                let (lo, hi) = (levels.iter().copied().min().unwrap_or(level), levels.iter().copied().max().unwrap_or(level));
+                let end = levels.last().copied().unwrap_or(level);
+                let mean: f32 = levels.iter().map(|&l| l as f32).sum::<f32>() / levels.len().max(1) as f32;
+                let ok = data.len() % 16 == 1 && data.len() <= 4081;
+                total_aligned += (data.len() + 63) & !63;
+                println!(
+                    "{:<40} {:>5} bytes {} {:6.1} ms  levels {:>3}..{:<3} start {} → end {} (drift {:+})  DC {:+.1}",
+                    p, data.len(), if ok { "ok  " } else { "BAD " }, data.len() as f32 * 8.0 / dpcm::rate_hz(rate) * 1000.0,
+                    lo, hi, level, end, end as i32 - level as i32, mean - level as f32
+                );
+            }
+            println!("total {} bytes 64-byte aligned = {:.1}% of the 16 KB DPCM window", total_aligned, total_aligned as f32 * 100.0 / 16384.0);
+            Ok(())
+        }
+        "synth" => {
+            let name = a.positional.get(1).map(String::as_str).context("dpcm synth: need kick|snare|hat|tom")?;
+            let hz = dpcm::rate_hz(rate);
+            let wave = dpcm::synth(name, hz).ok_or_else(|| anyhow!("unknown recipe {:?} (have {})", name, dpcm::SYNTH_NAMES.join(", ")))?;
+            let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("{}.wav", name)));
+            let f = std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
+            viper_apu::wav::write_wav(std::io::BufWriter::new(f), hz.round() as u32, &wave)?;
+            println!("{} → {} ({:.0} ms at {:.0} Hz)", name, out.display(), wave.len() as f32 / hz * 1000.0, hz);
+            Ok(())
+        }
+        _ => bail!("usage: viper dpcm encode|decode|info|synth ... (see viper --help)"),
+    }
 }
 
 fn fmt(a: &Args) -> Result<()> {

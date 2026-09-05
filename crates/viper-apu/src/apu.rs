@@ -24,7 +24,8 @@ const DUTY: [[u8; 8]; 4] = [
     [1, 0, 0, 1, 1, 1, 1, 1],
 ];
 const NOISE_PERIOD: [u16; 16] = [4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068];
-const DMC_RATE: [u16; 16] = [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
+/// DMC timer periods in CPU cycles per output bit, indexed by the $4010 rate.
+pub const DMC_RATE: [u16; 16] = [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
 
 #[derive(Clone, Default)]
 struct Envelope {
@@ -527,5 +528,59 @@ impl Apu {
     /// Timer periods for the visualizer: (pu1, pu2, tri, noi_index).
     pub fn periods(&self) -> [u16; 4] {
         [self.pu1.timer, self.pu2.timer, self.tri.timer, self.noi.timer]
+    }
+}
+
+/// Play a DPCM sample through the real DMC model and return the 7-bit
+/// output level once per output bit (i.e. at the sample's own rate). The
+/// sample is placed at $C000; `start_level` is what $4011 held before the
+/// hit. Length is taken from the data (16n+1 rule applied by the caller).
+pub fn decode_dmc(data: &[u8], rate_idx: u8, start_level: u8) -> Vec<u8> {
+    let mut apu = Apu::new();
+    let period = DMC_RATE[(rate_idx & 15) as usize] as u32;
+    apu.write(0x4010, rate_idx & 15);
+    apu.write(0x4011, start_level & 0x7F);
+    apu.write(0x4012, 0);
+    let len_reg = (data.len().saturating_sub(1) / 16) as u8;
+    apu.write(0x4013, len_reg);
+    apu.write(0x4015, 0x10);
+    let total_bits = data.len() * 8;
+    // The output unit starts with an empty shift register: the first
+    // byte's bits play after one 8-bit silence cycle. Run that plus every
+    // data bit, one sample per timer period, then drop the lead-in.
+    const LEAD: usize = 8;
+    let mut out = Vec::with_capacity(total_bits + LEAD);
+    let mut cycles: u32 = 0;
+    let mut next_sample = period;
+    while out.len() < total_bits + LEAD {
+        apu.clock(|a| data.get((a as usize).wrapping_sub(0xC000)).copied().unwrap_or(0x55));
+        cycles += 1;
+        if cycles == next_sample {
+            next_sample += period;
+            out.push(apu.dmc.level);
+        }
+    }
+    out.drain(..LEAD);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_dmc_matches_hardware_rules() {
+        let up = decode_dmc(&[0xFF; 17], 15, 64);
+        assert!(up.len() >= 8);
+        // eight 1-bits from 64 reach 80 within the first byte's samples
+        assert!(up[..16].contains(&80), "{:?}", &up[..16]);
+        let down = decode_dmc(&[0x00; 17], 15, 64);
+        assert!(down[..16].contains(&48), "{:?}", &down[..16]);
+        let top = decode_dmc(&[0xFF; 17], 15, 126);
+        assert!(top.iter().all(|&l| l == 126), "clamps at 126");
+        let bottom = decode_dmc(&[0x00; 17], 15, 0);
+        assert!(bottom.iter().all(|&l| l == 0), "clamps at 0");
+        let toggle = decode_dmc(&[0x55; 17], 15, 64);
+        assert_eq!(*toggle.last().unwrap(), 64, "0x55 nets zero");
     }
 }

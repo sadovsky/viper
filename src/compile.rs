@@ -57,13 +57,17 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
             samples.push(DpcmSample { name: s.name.to_string(), data: dpcm::encode_dmc(&s.wave), rate: dpcm::RATE_INDEX, loop_: false });
         }
     } else {
-        for (name, path) in &song.samples {
+        for r in &song.samples {
             let p = match base_dir {
-                Some(d) if path.is_relative() => d.join(path),
-                _ => path.clone(),
+                Some(d) if r.path.is_relative() => d.join(&r.path),
+                _ => r.path.clone(),
             };
-            let data = std::fs::read(&p).with_context(|| format!("@dpcm {}: read {}", name, p.display()))?;
-            samples.push(DpcmSample { name: name.clone(), data, rate: dpcm::RATE_INDEX, loop_: false });
+            let data = std::fs::read(&p).with_context(|| format!("@dpcm {}: read {}", r.name, p.display()))?;
+            samples.push(DpcmSample { name: r.name.clone(), data, rate: r.rate, loop_: false });
+        }
+        let aligned: usize = samples.iter().map(|s| (s.data.len() + 63) & !63).sum();
+        if aligned > 14 * 1024 {
+            warnings.push(format!("DPCM samples take {} bytes of the 16 KB window; under 2 KB left for song data past $C000", aligned));
         }
     }
 

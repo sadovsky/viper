@@ -82,9 +82,21 @@ pub struct ChordSym {
     pub minor: bool,
 }
 
+/// A `@dpcm NN name= path= rate= token=` line: a bank slot the generated
+/// songs reference, and the `@drums` token that triggers it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleSample {
+    pub name: String,
+    pub path: PathBuf,
+    pub rate: u8,
+    pub token: Option<char>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Style {
     pub name: String,
+    /// DPCM bank, indexed by slot (note C-4 + slot). Empty = built-in bank.
+    pub samples: Vec<StyleSample>,
     pub version: String,
     pub tempo_min: u16,
     pub tempo_max: u16,
@@ -357,6 +369,36 @@ impl Style {
                     }
                     st.sections.push(s);
                 }
+                "dpcm" => {
+                    let (idx_tok, rest) = match args.find(char::is_whitespace) {
+                        Some(i) => (&args[..i], args[i..].trim()),
+                        None => bail!("{}: want NN name= path= [rate=] [token=]", ctx()),
+                    };
+                    let idx = usize::from_str_radix(idx_tok, 16).with_context(ctx)?;
+                    if idx > 63 {
+                        bail!("{}: slot {:X} out of range (max 3F)", ctx(), idx);
+                    }
+                    let mut smp = StyleSample { name: format!("sample{:02X}", idx), path: PathBuf::new(), rate: 15, token: None };
+                    for (k, v) in kv(rest) {
+                        match k.as_str() {
+                            "name" => smp.name = v,
+                            "path" | "file" => smp.path = PathBuf::from(v),
+                            "rate" => {
+                                smp.rate = v.parse().with_context(ctx)?;
+                                if smp.rate > 15 { bail!("{}: rate out of range 0..=15", ctx()); }
+                            }
+                            "token" => smp.token = v.chars().next(),
+                            _ => {}
+                        }
+                    }
+                    if smp.path.as_os_str().is_empty() {
+                        bail!("{}: needs path=", ctx());
+                    }
+                    while st.samples.len() <= idx {
+                        st.samples.push(StyleSample { name: String::new(), path: PathBuf::new(), rate: 15, token: None });
+                    }
+                    st.samples[idx] = smp;
+                }
                 "form" => st.forms.push(args.split_whitespace().map(String::from).collect()),
                 "motif" => st.motif = args.split_whitespace().map(|t| t.parse::<i32>()).collect::<Result<_, _>>().with_context(ctx)?,
                 "title" => {
@@ -390,8 +432,29 @@ impl Style {
         Ok(st)
     }
 
+    /// DPCM note for a `@drums` token: with a declared bank, the slot whose
+    /// `token=` matches; without one, the built-in layout k/s/t → 0/1/2.
+    pub fn dpcm_note(&self, token: char) -> Option<u8> {
+        if self.samples.is_empty() {
+            return match token { 'k' => Some(60), 's' => Some(61), 't' => Some(62), _ => None };
+        }
+        self.samples.iter().position(|s| s.token == Some(token)).map(|i| 60 + i as u8)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.keys.is_empty() { bail!("style has no @keys"); }
+        for (i, s) in self.samples.iter().enumerate() {
+            if s.path.as_os_str().is_empty() {
+                bail!("@dpcm slot {:02X} is missing (slots must be contiguous)", i);
+            }
+        }
+        for d in &self.drums {
+            for &c in &d.dpcm {
+                if c != '.' && self.dpcm_note(c).is_none() {
+                    bail!("@drums {} uses DPCM token {:?} with no @dpcm token= for it", d.name, c);
+                }
+            }
+        }
         if self.scales.is_empty() { bail!("style has no @scales"); }
         if self.progressions.is_empty() { bail!("style has no @progression"); }
         if self.riffs.is_empty() { bail!("style has no @riff"); }
@@ -693,23 +756,19 @@ fn drum_cells(style: &Style, d: &Drums, fill: bool, crash_start: bool, rng: &mut
             'c' => Some(style.crash),
             _ => None,
         };
-        dpcm[s] = match d.dpcm[s] {
-            'k' => Some(60),
-            's' => Some(61),
-            't' => Some(62),
-            _ => None,
-        };
+        dpcm[s] = if d.dpcm[s] == '.' { None } else { style.dpcm_note(d.dpcm[s]) };
     }
     if fill {
         // Euclidean snare fill over the last 8 steps.
         let k = 3 + rng.range(0, 3) as usize;
         let mask = euclid_mask(k, 8, rng.range(0, 8) as usize);
+        let snare = style.dpcm_note('s').unwrap_or(61);
         for (i, hit) in mask.iter().enumerate() {
             if *hit {
-                dpcm[8 + i] = Some(61);
+                dpcm[8 + i] = Some(snare);
             }
         }
-        dpcm[15] = Some(61);
+        dpcm[15] = Some(snare);
     }
     if crash_start {
         noi[0] = Some(style.crash);
@@ -871,6 +930,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
     song.artist = p.artist.clone();
     song.driver = p.driver.clone();
     song.key_name = format!("{} {}", crate::vip::key_name(key), scale_name);
+    song.samples = style.samples.iter().map(|s| crate::DpcmRef { name: s.name.clone(), path: s.path.clone(), rate: s.rate }).collect();
     let info = GenInfo { key, scale: scale_name, progression: prog_name, form: form_idx, motif: motif_section.is_some() };
     let _ = ctx.motif_on;
     Ok((song, info))
@@ -960,6 +1020,28 @@ mod tests {
         }
         assert!(shifted > 0);
         assert_eq!(split_transpose("chorus-2"), ("chorus", -2));
+    }
+
+    #[test]
+    fn style_dpcm_bank_maps_tokens_and_reaches_generated_songs() {
+        let text = NEUTRAL.replace("@noise   hat=C-6/03  open=G-5/03  crash=C-5/04",
+            "@noise   hat=C-6/03  open=G-5/03  crash=C-5/04\n@dpcm 00 name=kick path=../samples/kick.dmc token=k\n@dpcm 01 name=snare path=../samples/snare.dmc rate=13 token=s\n@dpcm 02 name=tom path=../samples/tom.dmc token=t");
+        let st = Style::parse(&text).unwrap();
+        assert_eq!(st.dpcm_note('s'), Some(61));
+        assert_eq!(st.dpcm_note('t'), Some(62));
+        assert_eq!(st.dpcm_note('x'), None);
+        let song = generate(&st, &GenParams { seed: 2, ..Default::default() }).unwrap();
+        assert_eq!(song.samples.len(), 3);
+        assert_eq!(song.samples[1].rate, 13);
+        let out = crate::vip::to_vip(&song);
+        assert!(out.contains("@dpcm 01  name=snare  path=../samples/snare.dmc  rate=13"), "{}", out);
+        // legacy: no @dpcm keeps k/s/t
+        let plain = Style::parse(NEUTRAL).unwrap();
+        assert_eq!(plain.dpcm_note('k'), Some(60));
+        // a drums line with an unmapped token is rejected
+        let bad = text.replace("@drums half   noi=\"h . . . h . . . h . . . h . . .\"  dpcm=\"k . . . . . . . s . . . . . . .\"",
+            "@drums half   noi=\"h . . . h . . . h . . . h . . .\"  dpcm=\"k . . . . . . . c . . . . . . .\"");
+        assert!(Style::parse(&bad).unwrap_err().to_string().contains("token"));
     }
 
     #[test]

@@ -61,6 +61,7 @@ Generation is deterministic per (style, seed, key, bpm). A style supplies:
 | `@progression [name=..] i VI VII` | roman numerals; `b`/`#` prefixes for chromatic roots (`bII`, `bV`) |
 | `@instr NN name=.. a= d= s= r= duty= vol=` | instruments, same syntax as `.vip` |
 | `@noise hat=C-6/03 open=G-5/03 crash=C-5/04` | NOI notes and instruments for the drum tokens |
+| `@dpcm NN name=kick path=../samples/kick.dmc rate=15 token=k` | a DPCM bank slot; generated songs get matching `@dpcm` lines and `@drums` tokens map through `token=`. No `@dpcm` = built-in bank with k/s/t → slots 0/1/2 |
 | `@riff name rhythm=x.xx.. contour= harmony= bass= lead= harm= bassi= pair= fx= octave= accent=FA slide=0.1` | a riff template; `accent` = on-beat/off-beat volumes, `slide` = chance a lead hit portamentos in |
 | `@drums name noi=".." dpcm=".."` | 16 tokens each: `h o c` on NOI, `k s t` on DPCM |
 | `@section name bars=2,4 riffs=a,b drums=x,y repeat=2 motif=0.6 end=crash swell=1` | a section recipe; `swell` ramps volume across its bars |
@@ -75,6 +76,18 @@ tremolo), `pedal` (chord root with jabs to the b2/tritone), `pedal_jumps`,
 Harmony: `third`, `sixth` (diatonic, below the lead), `fifth` (power-chord
 pedal), `root`, `unison` (with a slide for detune), `none`. Bass:
 `octaves`, `gallop`, `roots`, `half`, `follow`, `walk`.
+
+Making a bank is `viper dpcm synth kick -o kick.wav` (or any WAV) then
+`viper dpcm encode kick.wav -o kick.dmc [--rate 15] [--gain 1.0]`: the
+encoder trims, resamples to the DMC rate, normalizes, and runs a Viterbi
+search over the DAC levels so the sample tracks the source as well as
+1-bit delta modulation allows and ends at the level it started on (the
+driver never rewrites `$4011`, so a bank whose samples drift would
+accumulate DC across hits). `viper dpcm decode` plays a `.dmc` back
+through the emulator's DMC for proof listening; `viper dpcm info`
+reports sizes, level range, drift, and the bank's share of the 16 KB
+window (rate 15 costs ~4.1 KB per second; a sample tops out at 4081
+bytes).
 
 Sections that recur in a form come back identical (the chorus is the
 chorus); the last bar of a multi-bar section gets a Euclidean snare

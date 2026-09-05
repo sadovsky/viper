@@ -159,9 +159,9 @@ pub(crate) struct Song {
     /// `@driver bin=.. sym=..` — the NSF driver to compile against,
     /// relative to the `.vip` file.
     pub driver: Option<(PathBuf, PathBuf)>,
-    /// `@dpcm NN name path` — sample files for the DPCM column, indexed by
-    /// note (C-4 = 00). Empty means the built-in kick/snare/hat bank.
-    pub samples: Vec<(String, PathBuf)>,
+    /// `@dpcm NN name= path= rate=` — sample files for the DPCM column,
+    /// indexed by note (C-4 = 00). Empty means the built-in kick/snare/hat bank.
+    pub samples: Vec<DpcmRef>,
     /// `@driver expansion=vrc6` — request expansion audio in the NSF header.
     pub expansion: bool,
     /// Stage 23: chains and the arrangement that sequences them. When
@@ -220,6 +220,14 @@ impl Song {
     pub fn has_groove(&self) -> bool {
         self.groove.iter().any(|&g| g != 0)
     }
+}
+
+/// One `@dpcm` entry: a .dmc file and the DMC rate it was encoded for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DpcmRef {
+    pub name: String,
+    pub path: PathBuf,
+    pub rate: u8,
 }
 
 impl Default for Song {
@@ -506,6 +514,9 @@ struct App {
     engine: audio::Engine,
     /// Compiled NSF for APU playback, refreshed on play.
     nsf_cache: Option<std::sync::Arc<Vec<u8>>>,
+    /// DPCM preview bank for the synth engine (see `reload_bank`).
+    bank: std::sync::Arc<Vec<dpcm::Sample>>,
+    bank_generation: u64,
     nsf_generation: u64,
     nsf_frames_per_row: f64,
     prev_playing: bool,
@@ -536,6 +547,10 @@ struct App {
     /// Free-running counter bumped every UI tick. Scope uses it to animate
     /// phase so waveforms scroll instead of snapshot-freezing at rest.
     viz_tick: u32,
+    /// `:set still=on` — freeze the tempo-locked breathing animations.
+    /// Signal-driven feedback (channel LEDs, the playhead) stays live;
+    /// only the decorative pulses stop. See [`Breath`].
+    still: bool,
     /// Stage 11: loaded sprite sheets, keyed by their `name` (file stem
     /// by default, overrideable at load time).
     sprite_sheets: HashMap<String, sprite::SpriteSheet>,
@@ -593,6 +608,8 @@ impl App {
             show_song: false,
             engine: audio::Engine::Synth,
             nsf_cache: None,
+            bank: std::sync::Arc::new(dpcm::default_bank()),
+            bank_generation: 0,
             nsf_generation: 0,
             nsf_frames_per_row: 4.0,
             prev_playing: false,
@@ -606,6 +623,7 @@ impl App {
             show_viz: false,
             viz_kind: viz::VizKind::Bars,
             viz_tick: 0,
+            still: false,
             sprite_sheets: HashMap::new(),
             sprite_placements: Vec::new(),
             sprite_palettes: HashMap::new(),
@@ -1092,6 +1110,120 @@ impl Theme {
     }
 }
 
+// ---------- Breath: tempo-locked animation ----------
+
+/// Interpolate `from` → `to` by `t` (0..1).
+///
+/// Two RGB colors mix numerically. Anything else — named ANSI colors,
+/// `Reset` — switches at the halfway point instead of being resolved to
+/// fixed RGB, so the user's terminal palette keeps deciding what "yellow"
+/// means. Every animated color in the UI goes through here.
+fn mix(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+            Color::Rgb(l(r1, r2), l(g1, g2), l(b1, b2))
+        }
+        _ if t >= 0.5 => to,
+        _ => from,
+    }
+}
+
+/// The brighter sibling of a color: an ANSI base color's `Light` variant
+/// (so the terminal palette still picks the shade), or an RGB color moved
+/// a quarter of the way to white.
+fn brighter(c: Color) -> Color {
+    use Color::*;
+    match c {
+        Black => DarkGray,
+        Red => LightRed,
+        Green => LightGreen,
+        Yellow => LightYellow,
+        Blue => LightBlue,
+        Magenta => LightMagenta,
+        Cyan => LightCyan,
+        Gray => White,
+        DarkGray => Gray,
+        Rgb(r, g, b) => {
+            let up = |v: u8| (v as f32 + (255.0 - v as f32) * 0.25).round() as u8;
+            Rgb(up(r), up(g), up(b))
+        }
+        other => other,
+    }
+}
+
+/// DESIGN.md's "breath and pulse": one oscillator that every animated
+/// element reads, so the whole interface breathes together instead of
+/// each widget inventing its own timer.
+///
+/// Phase comes from the audio thread's step counter and its sub-step
+/// phase — never wall clock — so a brightening border lands on the same
+/// sample as the note that caused it. Stopped, there is no audio position
+/// to read, so the phase free-runs at the song's tempo off the UI tick;
+/// the rate is what the eye reads, and it picks straight back up when the
+/// transport rolls.
+///
+/// `:set still=on` collapses every accessor to a constant, for anyone who
+/// would rather the screen held still.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Breath {
+    /// Position in 16th-note steps, fractional.
+    pos: f32,
+    still: bool,
+}
+
+impl Breath {
+    fn new(app: &App) -> Self {
+        let pos = if app.playing {
+            app.play_step as f32 + app.viz_frame.step_phase.clamp(0.0, 1.0)
+        } else {
+            // Steps per second = (bpm / 60) beats × 4 sixteenths.
+            app.viz_tick as f32 / 60.0 * (app.song.bpm.max(1) as f32 / 15.0)
+        };
+        Self { pos, still: app.still }
+    }
+
+    /// Smooth 0 → 1 → 0 over a `steps`-long cycle. For things that swell.
+    fn wave(&self, steps: f32) -> f32 {
+        if self.still {
+            return 0.0;
+        }
+        let frac = (self.pos / steps.max(0.001)).rem_euclid(1.0);
+        (1.0 - (frac * std::f32::consts::TAU).cos()) * 0.5
+    }
+
+    /// 1.0 on the downbeat of a `steps`-long cycle, decaying to 0 across
+    /// it. For things that land on a beat and fade.
+    fn pulse(&self, steps: f32) -> f32 {
+        if self.still {
+            return 0.0;
+        }
+        let frac = (self.pos / steps.max(0.001)).rem_euclid(1.0);
+        (1.0 - frac).powi(2)
+    }
+
+    /// Active pane border, brightening on the downbeat of every bar.
+    fn pane(&self) -> f32 {
+        self.pulse(16.0)
+    }
+
+    /// Mode chip, pulsing every half bar (beats 1 and 3).
+    fn mode(&self) -> f32 {
+        self.pulse(8.0)
+    }
+
+    /// Cursor, breathing at half-beat rate.
+    fn cursor(&self) -> f32 {
+        self.wave(2.0)
+    }
+
+    /// `● REC`, breathing once per beat — a breath, not a hard blink.
+    fn rec(&self) -> f32 {
+        self.wave(4.0)
+    }
+}
+
 // ---------- Rendering ----------
 
 fn note_name(n: Option<u8>) -> String {
@@ -1176,6 +1308,7 @@ fn render_song_pane(f: &mut Frame, area: Rect, app: &App) {
 fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     let p = app.phrase();
     let theme = &app.theme;
+    let breath = Breath::new(app);
     let mut lines: Vec<Line> = Vec::with_capacity(STEPS_PER_PHRASE + 2);
 
     // Visual-mode rectangle (inclusive on both axes).
@@ -1207,10 +1340,13 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         // Stage 9: LED flash now reads the actual ADSR level published by the
         // audio thread — lights up for pattern *and* live gates, fades with
         // release. The 0.05 floor kills flicker from deep-release voices.
-        let triggered = !muted && app.viz_frame.voices[ch].env_level > 0.05;
+        let lit = if muted { 0.0 } else { app.viz_frame.voices[ch].env_level.clamp(0.0, 1.0) };
+        let triggered = lit > 0.05;
         let mut style = Style::default().add_modifier(Modifier::BOLD);
         if triggered {
-            style = style.fg(theme.mode_fg).bg(theme.label);
+            // The chip rides the envelope rather than switching on and off,
+            // so a release tail visibly decays instead of cutting.
+            style = style.fg(theme.mode_fg).bg(mix(theme.viz_bg, theme.label, 0.35 + 0.65 * lit));
         } else if muted {
             style = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
             if ch == app.cursor_ch {
@@ -1227,15 +1363,38 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(header));
     lines.push(Line::from(""));
 
+    // DESIGN.md: "the playhead is a character, not a cursor." A diamond
+    // travels down the gutter leaving a two-step trail that fades into the
+    // ground, the row strikes bright at the top of each step and settles
+    // across it (read from the audio thread's sub-step phase, so the strike
+    // lands with the note), and a row that actually gates something flashes
+    // brighter still.
+    let strike = 1.0 - app.viz_frame.step_phase.clamp(0.0, 1.0);
     for (i, row) in p.cells.iter().enumerate() {
-        let is_playhead = app.playing && i == app.play_step;
-        let row_bg = if is_playhead { Some(theme.playhead_bg) } else { None };
-        let label_style = if is_playhead {
-            Style::default().fg(theme.playhead_label).add_modifier(Modifier::BOLD)
+        let behind = if app.playing {
+            (app.play_step + STEPS_PER_PHRASE - i) % STEPS_PER_PHRASE
         } else {
-            Style::default().fg(theme.dim)
+            usize::MAX
         };
-        let mut spans = vec![Span::styled(format!(" {:02X}  ", i), label_style)];
+        let row_bg = match behind {
+            0 => {
+                let gates = row.iter().any(|c| c.note.is_some());
+                let heat = 0.20 * strike + if gates { 0.22 } else { 0.0 };
+                Some(mix(theme.playhead_bg, theme.playhead_label, heat))
+            }
+            1 => Some(mix(theme.playhead_bg, theme.viz_bg, 0.55)),
+            2 => Some(mix(theme.playhead_bg, theme.viz_bg, 0.80)),
+            _ => None,
+        };
+        let (glyph, label_style) = match behind {
+            0 => ('◆', Style::default().fg(theme.playhead_label).add_modifier(Modifier::BOLD)),
+            1 => ('◇', Style::default().fg(mix(theme.playhead_label, theme.viz_bg, 0.45))),
+            2 => ('·', Style::default().fg(mix(theme.playhead_label, theme.viz_bg, 0.70))),
+            _ => (' ', Style::default().fg(theme.dim)),
+        };
+        // Gutter stays 5 columns wide (glyph, space, 2 hex, space) so the
+        // grid lines up with the header's 5-space lead.
+        let mut spans = vec![Span::styled(format!("{} {:02X} ", glyph, i), label_style)];
         for (c, cell) in row.iter().enumerate() {
             let has_note = cell.note.is_some();
             let note_text = note_name(cell.note);
@@ -1263,7 +1422,8 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
 
             // Background precedence: cursor > selection > playhead row > column tint.
             let bg = if is_cursor {
-                Some(theme.cursor_bg)
+                // Breathes at half-beat rate, never far enough to lose it.
+                Some(mix(theme.cursor_bg, brighter(theme.cursor_bg), breath.cursor()))
             } else if in_selection {
                 Some(theme.selection_bg)
             } else if let Some(r) = row_bg {
@@ -1328,7 +1488,12 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         app.song.bpm,
         if app.playing { "● PLAY" } else { "■ STOP" },
     );
-    let block = Block::default().title(title).borders(Borders::ALL);
+    // The frame brightens on the downbeat of every bar — the whole pane
+    // taking a breath with the music.
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(mix(theme.hint, theme.accent, breath.pane())));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1643,9 +1808,14 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Live => theme.mode_live,
     };
 
+    let breath = Breath::new(app);
     let mut left_spans = vec![
+        // The mode chip pulses on beats 1 and 3.
         Span::styled(format!(" {} ", mode_str),
-            Style::default().bg(mode_color).fg(theme.mode_fg).add_modifier(Modifier::BOLD)),
+            Style::default()
+                .bg(mix(mode_color, brighter(mode_color), breath.mode()))
+                .fg(theme.mode_fg)
+                .add_modifier(Modifier::BOLD)),
     ];
     // Stage 6: ● REC badge listing armed channels, pulsing red while playing.
     if app.any_recording() {
@@ -1654,9 +1824,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
             .map(channel_name)
             .collect();
         left_spans.push(Span::raw(" "));
+        // A breath once per beat rather than a hard blink.
         left_spans.push(Span::styled(
             format!(" ● REC {} ", armed.join(" ")),
-            Style::default().bg(theme.mode_live).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(mix(theme.mode_live, brighter(theme.mode_live), breath.rec()))
+                .fg(theme.mode_fg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     // Stage 8: macro-recording badge. `q<letter>` is on, captured op count ticks up.
@@ -2588,6 +2762,7 @@ fn execute_command(app: &mut App, cmd: &str) {
                     let driver = app.song.driver.clone();
                     app.song = song;
                     app.song.driver = driver;
+                    reload_bank(app);
                     app.song_mode = true;
                     app.cursor_step = 0;
                     app.dirty = true;
@@ -2655,6 +2830,15 @@ fn execute_command(app: &mut App, cmd: &str) {
                         app.status = format!("theme = {}", t.name);
                     }
                     None => app.status = format!("unknown theme: {:?} (try nes or phosphor)", v),
+                },
+                "still" => match v {
+                    "on" | "1" | "yes" => { app.still = true; app.status = "still = on (animations frozen)".into(); }
+                    "off" | "0" | "no" => { app.still = false; app.status = "still = off (breathing)".into(); }
+                    "toggle" => {
+                        app.still = !app.still;
+                        app.status = format!("still = {}", if app.still { "on" } else { "off" });
+                    }
+                    _ => app.status = format!("still: expected on / off / toggle, got {:?}", v),
                 },
                 _ => { app.status = format!("unknown setting: {}", k); }
             }
@@ -3646,6 +3830,21 @@ fn refresh_nsf_for_playback(app: &mut App) {
     }
 }
 
+/// Rebuild the DPCM preview bank from the song's `@dpcm` files (decoded
+/// through the DMC model) or the built-in bank. Failures fall back to the
+/// built-in bank with a status line.
+fn reload_bank(app: &mut App) {
+    let base = app.current_file.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+    match dpcm::load_bank(&app.song, base.as_deref()) {
+        Ok(b) => app.bank = std::sync::Arc::new(b),
+        Err(e) => {
+            app.status = format!("dpcm: {:#} — previewing with the built-in bank", e);
+            app.bank = std::sync::Arc::new(dpcm::default_bank());
+        }
+    }
+    app.bank_generation = app.bank_generation.wrapping_add(1);
+}
+
 fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
     let path = resolve_sprite_path(app, Path::new(path_str));
     let sequence = playback_sequence(app);
@@ -3655,7 +3854,7 @@ fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
     }
     const SR: u32 = 44100;
     match audio::bounce_to_wav(
-        &path, &sequence, &app.song.instruments, app.song.bpm, loops, SR,
+        &path, &sequence, &app.song.instruments, app.song.bpm, loops, SR, &app.bank,
         &app.song.groove, &app.song.channel_length,
     ) {
         Ok(frames) => {
@@ -3741,6 +3940,7 @@ fn edit_file(app: &mut App, path: &Path) {
             app.nsf_cache = None;
             app.song = song;
             app.current_file = Some(path.to_path_buf());
+            reload_bank(app);
             app.cursor_step = 0;
             app.cursor_ch = 0;
             app.play_step = 0;
@@ -3927,6 +4127,10 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tr.nsf = app.nsf_cache.clone();
         tr.nsf_generation = app.nsf_generation;
         tr.frames_per_row = app.nsf_frames_per_row;
+        if tr.bank_generation != app.bank_generation {
+            tr.bank = app.bank.clone();
+            tr.bank_generation = app.bank_generation;
+        }
         if let Some(e) = tr.engine_error.take() {
             app.status = format!("apu: {} — using synth", e);
         }
@@ -4041,7 +4245,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}
@@ -4069,4 +4273,128 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn playing_app(step: usize, phase: f32) -> App {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.playing = true;
+        app.play_step = step;
+        app.viz_frame.step_phase = phase;
+        app
+    }
+
+    /// Render the phrase pane and return one row's symbols.
+    fn row_symbols(app: &App, y: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| render_phrase(f, f.area(), app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area().width)
+            .map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn mix_blends_rgb_and_switches_named_colors_at_the_halfway_point() {
+        let a = Color::Rgb(0, 0, 0);
+        let b = Color::Rgb(100, 200, 40);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), Color::Rgb(50, 100, 20));
+        // Out-of-range factors clamp rather than overshooting into garbage.
+        assert_eq!(mix(a, b, 2.0), b);
+        assert_eq!(mix(a, b, -1.0), a);
+        // Named colors are never resolved to fixed RGB — the terminal
+        // palette keeps deciding what they look like.
+        assert_eq!(mix(Color::Yellow, Color::Red, 0.4), Color::Yellow);
+        assert_eq!(mix(Color::Yellow, Color::Red, 0.6), Color::Red);
+    }
+
+    #[test]
+    fn brighter_prefers_the_terminals_own_light_variants() {
+        assert_eq!(brighter(Color::Red), Color::LightRed);
+        assert_eq!(brighter(Color::Cyan), Color::LightCyan);
+        assert_eq!(brighter(Color::DarkGray), Color::Gray);
+        assert_eq!(brighter(Color::Rgb(0, 0, 0)), Color::Rgb(64, 64, 64));
+        assert_eq!(brighter(Color::LightRed), Color::LightRed, "already bright, left alone");
+    }
+
+    #[test]
+    fn breath_is_bounded_and_lands_on_the_downbeat() {
+        // Step 0 with no sub-step phase is the top of the bar: every pulse
+        // is at full, and they decay from there.
+        let top = Breath::new(&playing_app(0, 0.0));
+        assert!((top.pane() - 1.0).abs() < 1e-6);
+        assert!((top.mode() - 1.0).abs() < 1e-6);
+        let later = Breath::new(&playing_app(8, 0.0));
+        assert!(later.pane() < top.pane(), "the bar pulse decays across the bar");
+        assert!((later.mode() - 1.0).abs() < 1e-6, "the half-bar pulse restarts on beat 3");
+
+        for step in 0..STEPS_PER_PHRASE {
+            for phase in [0.0, 0.25, 0.5, 0.75] {
+                let b = Breath::new(&playing_app(step, phase));
+                for v in [b.pane(), b.mode(), b.cursor(), b.rec()] {
+                    assert!((0.0..=1.0).contains(&v), "step {} phase {}: {}", step, phase, v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_freezes_every_animation() {
+        let mut app = playing_app(0, 0.0);
+        app.still = true;
+        let b = Breath::new(&app);
+        assert_eq!((b.pane(), b.mode(), b.cursor(), b.rec()), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn breath_free_runs_at_tempo_while_stopped() {
+        // Stopped, phase comes off the UI tick at the song's tempo: at 150
+        // BPM a sixteenth is 10 sixteenths per second, so 60 ticks (one
+        // second of UI) advances exactly ten steps — back on the downbeat.
+        let mut app = App::new();
+        app.playing = false;
+        app.song.bpm = 150;
+        app.viz_tick = 0;
+        assert!((Breath::new(&app).pane() - 1.0).abs() < 1e-6);
+        app.viz_tick = 30;
+        assert!(Breath::new(&app).pane() < 1.0);
+        app.viz_tick = 96; // 16 steps = one full bar
+        assert!((Breath::new(&app).pane() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn playhead_draws_a_diamond_with_a_two_step_fading_trail() {
+        let app = playing_app(4, 0.0);
+        // Step rows: border, header, blank, then step 00 — so step N is at
+        // y = N + 3.
+        let head = row_symbols(&app, 4 + 3);
+        assert_eq!(head[1], "◆");
+        assert_eq!((head[3].as_str(), head[4].as_str()), ("0", "4"), "gutter reads the step index");
+        assert_eq!(row_symbols(&app, 3 + 3)[1], "◇", "one step behind");
+        assert_eq!(row_symbols(&app, 2 + 3)[1], "·", "two steps behind");
+        assert_eq!(row_symbols(&app, 1 + 3)[1], " ", "the trail is only two steps long");
+        assert_eq!(row_symbols(&app, 5 + 3)[1], " ", "nothing ahead of the playhead");
+    }
+
+    #[test]
+    fn the_playhead_glyph_does_not_shift_the_grid() {
+        // The gutter is a fixed five columns whether or not a glyph is in
+        // it, so every cell column lands in the same place stopped as
+        // playing. Compare a row's symbols with only the glyph masked out.
+        let playing = playing_app(4, 0.0);
+        let mut stopped = playing_app(4, 0.0);
+        stopped.playing = false;
+        let with = row_symbols(&playing, 4 + 3);
+        let without = row_symbols(&stopped, 4 + 3);
+        assert_eq!(with[2..], without[2..]);
+        assert_ne!(with[1], without[1]);
+    }
 }
