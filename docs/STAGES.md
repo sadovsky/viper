@@ -79,6 +79,12 @@ Command mode:
 - `:gen four` — four-on-floor drums on NOI
 - `:gen euclid <ch> <k> <n> [off]` — Euclidean rhythm on channel
 - `:gen scale <ch> <key> [mode] [density]` — random notes in a mode
+- `:gen chord_prog <preset|chords…> [key=Am] [steps=4]` — voiced progression on PU1/PU2/TRI with hats on NOI
+- `:gen bassline <preset|chords…> [style=walking|arpeggio|root_fifth|octaves|roots] [key=Am] [steps=4]` — TRI bassline
+- `:gen arp <chord> [up|down|updown|random] [len] [rate=1] [ch=pu2] [octaves=2]` — arpeggiator
+- `:gen drums <preset> [fills=N] [dpcm=off]` — kick/snare on DPCM, hats on NOI (`:gen drums` lists presets)
+- `:gen lsystem axiom=A rules=A=ABA,B=.A. [iterations=4] [map=A=C4,B=G3,.=-] [ch=pu1]` — L-system
+- `:gen cellular [rule=30] [ch=pu1] [key=Am] [seed=center|random]` — elementary cellular automaton
 - `:gen style <dir> [seed]` — compose a whole song from a style directory (Stage 22)
 - `:bounce <path> [loops]` / `:midi <path> [loops]` — offline WAV render / SMF export of the playback sequence
 - `:bind <sheet>[.N|*] <target> = <expr>` / `:bind list|clear|del N` — sprite modulation bindings
@@ -268,3 +274,13 @@ lives in viper.
   (including FCEUX's merged INIT + PLAY 1 frame), compares INIT writes as
   a set and PLAY frames exactly, and exits 1 at the first divergence. See
   `NSF.md` § Verification.
+
+### Generators
+
+- **Stage 25** ✅ — **Pattern generators from `GENERATION.md`.** `:gen
+  chord_prog`, `bassline`, `arp`, `drums`, `lsystem`, `cellular`, sharing
+  one chord-symbol parser (roman numerals relative to `key=`, or absolute
+  names) and the bundled progression and drum presets. Deterministic per
+  seed; each writes the current phrase (progressions flow into following
+  phrases). Deferred: `markov` (needs a corpus loader) and the LLM
+  backend. Details in `GENERATION.md` § Staging.

@@ -340,12 +340,23 @@ The last test is the payoff. Programmatic songs + deterministic rendering
 
 Split across the main roadmap:
 
-- **Stage 3.5** — `.vip` read/write, `gen::four_on_floor`,
+- **Stage 3.5** ✅ — `.vip` read/write, `gen::four_on_floor`,
   `gen::euclid`, `gen::random_in_scale`, `:gen` ex command.
-- **Stage 6.5** — `gen::markov`, `gen::chord_prog`, `gen::bassline`,
-  `gen::arp`, `gen::drums` (preset library).
-- **Stage 13.5** — LLM backend, `:gen "<natural language>"`.
-- **Stage 14.5** — `gen::lsystem`, `gen::cellular` (viz-reactive demos).
+- **Stage 22** ✅ — the style interface and `viper gen` / `:gen style`.
+- **Stage 25** ✅ — `gen::chord_prog`, `gen::bassline`, `gen::arp`,
+  `gen::drums` (preset library), `gen::lsystem`, `gen::cellular`. Chord
+  symbols are shared: roman numerals relative to `key=Am` (case sets the
+  third, the scale sets fifth and seventh; `V7`, `bVII`) or absolute names
+  (`Am`, `Cmaj7`, `F#dim7`, `E5`). Progressions accept a preset name
+  (`12bar doowop canon andalusian royal_road four_chords gothenburg`) or
+  chord tokens; `steps=N` is the steps per chord (default 4, so a phrase
+  holds four chords; longer progressions flow into the following phrases).
+  Drums put kick/snare on DPCM and hats on NOI unless `dpcm=off`.
+  `lsystem` maps one symbol per step (unmapped letters walk the scale);
+  `cellular` hits when the centre cell is alive and pitches by live-cell
+  count. All deterministic per `:gen` seed.
+- **Later** — `gen::markov` (needs a corpus loader), the LLM backend
+  (`:gen "<natural language>"`).
 
 ## Open design questions
 

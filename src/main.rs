@@ -1448,6 +1448,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":gen four",       "kick/snare/hat on NOI"),
         row(":gen euclid …",   "<ch> <k> <n> [off] — Euclidean rhythm"),
         row(":gen scale …",    "<ch> <key> [mode] [density] — random in scale"),
+        row(":gen chord_prog …", "<preset|i iv V i> [key=Am] [steps=4] — voiced on PU1/PU2/TRI + hats"),
+        row(":gen bassline …", "<preset|chords> [style=walking|arpeggio|root_fifth|octaves] [key=Am]"),
+        row(":gen arp …",      "<chord> [up|down|updown|random] [len] [rate=1] [ch=pu2] [octaves=2]"),
+        row(":gen drums …",    "<four|breakbeat|amen|trap|gameboy|dnb|halftime|dbeat|blast> [fills=N] [dpcm=off]"),
+        row(":gen lsystem …",  "axiom=A rules=A=ABA,B=.A. [iterations=4] [map=A=C4,B=G3,.=-] [ch=pu1]"),
+        row(":gen cellular …", "[rule=30] [ch=pu1] [key=Am] [seed=center|random] — Wolfram automaton"),
+        row(":gen style DIR [seed]", "compose a whole song from a style directory"),
         Line::from(""),
         Line::from(Span::styled(
             "  press q, Esc, or ? to close help",
