@@ -6,6 +6,7 @@
 //! * [`host`] — `Player`: INIT/PLAY at frame rate, register-write log, audio
 //! * [`render`] — offline rendering: full mix, per-channel stems, triggers
 //! * [`wav`], [`midi`] — tiny writers, no dependencies
+//! * [`verify`] — diff a register-write log against another emulator's
 
 pub mod apu;
 pub mod cpu;
@@ -13,6 +14,7 @@ pub mod host;
 pub mod midi;
 pub mod nsf;
 pub mod render;
+pub mod verify;
 pub mod wav;
 
 pub use host::{Player, RegWrite, Trigger, TriggerKind};

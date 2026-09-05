@@ -256,3 +256,15 @@ lives in viper.
   `chain.pos` expose the live position. MIDI export ignores both.
   Salvaged from an unmerged Stage 16 prototype, along with five pastiche
   songs in `projects/` (espresso, ff_prelude, mario, metroid, zelda).
+
+### Verification
+
+- **Stage 24** ✅ — **Verification receipts.** `tests/golden/` holds
+  viper-apu's register-write log for the stress song (a render must
+  reproduce it byte for byte) and an FCEUX 2.6.6 dump of the same NSF
+  captured with `tools/fceux_apu_log.lua`; all 196 PLAY frames match.
+  `viper verify song.nsf --against other.log` (`viper_apu::verify`) reads
+  any `frame addr value`-shaped dump, lines the frame numbering up
+  (including FCEUX's merged INIT + PLAY 1 frame), compares INIT writes as
+  a set and PLAY frames exactly, and exits 1 at the first divergence. See
+  `NSF.md` § Verification.

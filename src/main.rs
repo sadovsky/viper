@@ -4034,7 +4034,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "fmt" | "gen" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}

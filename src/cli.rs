@@ -35,6 +35,12 @@ usage:
       the loop is detected from the driver's RAM state, which can overshoot
       by up to one pass.
   viper info song.nsf
+  viper verify song.nsf|writes.log --against other.log [--vip song.vip]
+                [--loops N | --frames N] [--song N] [-o normalized.log]
+      diff viper's register-write log against another emulator's dump
+      (NSFPlay, Mesen, FCEUX Lua — any `frame addr value` shape); exits 1
+      on the first PLAY frame that differs. -o writes the other log in
+      viper's canonical form.
   viper gen --style DIR [--seed N] [--count N] [-o DIR|FILE] [--key E] [--bpm 200]
             [--scale NAME] [--motif on|off] [--form N] [--driver BIN --sym SYM]
             [--artist NAME] [--prefix NAME]
@@ -91,6 +97,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "compile" => compile_cmd(&a),
         "render" => render(&a),
         "info" => info(&a),
+        "verify" => verify(&a),
         _ => {
             print!("{}", USAGE);
             Ok(())
@@ -284,6 +291,63 @@ fn info(a: &Args) -> Result<()> {
         println!("  {:>2}. {:<28} {}:{:02}", i + 1, t, ms / 60000, (ms / 1000) % 60);
     }
     Ok(())
+}
+
+/// Stage 24: `viper verify song.nsf --against other.log`. Our log comes
+/// from rendering the NSF (same `--vip` / `--frames` / `--loops` rules as
+/// `render`) or, when the positional is not an NSF, from a saved log.
+fn verify(a: &Args) -> Result<()> {
+    let path = a.positional.first().map(PathBuf::from).context("verify: need an .nsf or a viper .log")?;
+    let against = a.get("against").map(PathBuf::from).context("verify: need --against other.log")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let ours: Vec<viper_apu::RegWrite> = if bytes.starts_with(b"NESM\x1A") || bytes.starts_with(b"NSFE") {
+        let nsf = viper_apu::Nsf::parse(&bytes)?;
+        let mut opts = viper_apu::RenderOptions {
+            song: a.num::<u8>("song")?.unwrap_or(0),
+            loops: a.num::<u32>("loops")?.unwrap_or(1),
+            tail_seconds: a.num::<f64>("tail")?.unwrap_or(0.0),
+            ..Default::default()
+        };
+        let mut fixed_frames = a.num::<u32>("frames")?;
+        if let Some(vp) = a.get("vip") {
+            let vp = PathBuf::from(vp);
+            let (song, _) = load_song(&vp)?;
+            let lowered = compile::lower(&song, vp.parent())?;
+            let (intro, looped) = lowered.module.songs[0].intro_and_loop_frames();
+            fixed_frames = Some(intro + looped * opts.loops.max(1) + (opts.tail_seconds * 60.0988) as u32);
+        }
+        let r = match fixed_frames {
+            Some(frames) => {
+                opts.max_seconds = frames as f64 / 60.0988;
+                viper_apu::render::render_frames(&nsf, &opts, frames)?
+            }
+            None => viper_apu::render(&nsf, &opts)?,
+        };
+        println!("viper: {} frames, {} writes", r.total_frames, r.log.len());
+        r.log
+    } else {
+        let log = viper_apu::verify::parse_log(&String::from_utf8_lossy(&bytes));
+        println!("viper log {}: {} writes", path.display(), log.len());
+        log
+    };
+    let other_text = std::fs::read_to_string(&against).with_context(|| format!("read {}", against.display()))?;
+    let theirs = viper_apu::verify::parse_log(&other_text);
+    if theirs.is_empty() {
+        bail!("verify: no register writes recognised in {}", against.display());
+    }
+    println!("other log {}: {} writes", against.display(), theirs.len());
+    if let Some(out) = a.get("out") {
+        std::fs::write(out, viper_apu::verify::format_log(&theirs)).with_context(|| format!("write {}", out))?;
+        println!("normalized → {}", out);
+    }
+    let report = viper_apu::verify::compare(&ours, &theirs);
+    print!("{}", report.summary());
+    if report.ok() {
+        println!("ok");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }
 
 fn render(a: &Args) -> Result<()> {
