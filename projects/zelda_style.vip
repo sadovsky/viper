@@ -1,0 +1,43 @@
+# zelda_style.vip
+#
+# Heroic fanfare pastiche — triumphant dotted-rhythm melody, harmonized
+# below, stately triangle bass, timpani-ish noise hits on downbeats.
+# The "someone just found the sword in the cave" vibe.
+#
+# Not a transcription. D major was picked because it's a natural
+# trumpet/horn key for anything that wants to sound heroic, and most
+# of the genre's iconic overworld themes lean on it.
+#
+# Load: :e projects/zelda_style.vip
+# Play: <space>
+
+@meta  title="adventure fanfare pastiche"  style="NES adventure"  key="D major"
+
+@song  bpm=124  edit_step=1  current=00  order=[00]  loop=00
+
+# Instruments
+@instr 00  a=2   d=100  s=0.85  r=220  duty=0.50  vol=0.80   # heroic lead
+@instr 01  a=2   d=80   s=0.60  r=180  duty=0.25  vol=0.55   # harmony pulse
+@instr 02  a=4   d=40   s=0.95  r=280  duty=0.50  vol=0.90   # stately triangle
+@instr 03  a=0   d=80   s=0.00  r=60   duty=0.50  vol=0.65   # timpani noise
+
+# Phrase 00 — fanfare. I–V–V–I cadence, melody arcs D→A→D→A high and
+# resolves down. The gaps are intentional — this style breathes.
+@phrase 00
+  # step   PU1        PU2         TRI         NOI
+  00       D-5        D-4:01      D-3:02      G-2:03
+  01       ---        ---         ---         ---
+  02       D-5        D-4:01      ---         ---
+  03       F#5        A-4:01      A-2:02      ---
+  04       A-5        D-5:01      D-3:02      G-2:03
+  05       ---        ---         ---         ---
+  06       A-5        D-5:01      ---         ---
+  07       B-5        D-5:01      A-2:02      C-3:03
+  08       D-6        F#5:01      G-2:02      G-2:03
+  09       ---        ---         ---         ---
+  0a       C#6        F#5:01      ---         ---
+  0b       B-5        D-5:01      D-3:02      ---
+  0c       A-5        C#5:01      A-2:02      G-2:03
+  0d       F#5        D-5:01      ---         ---
+  0e       E-5        B-4:01      D-3:02      C-3:03
+  0f       D-5        A-4:01      ---         ---

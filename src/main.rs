@@ -127,6 +127,15 @@ impl Instrument {
     }
 }
 
+/// Stage 23 (full song mode): a named list of phrase indices. The
+/// arrangement sequences chains; playback flattens arrangement → chains →
+/// phrases into the `order` list everything downstream already consumes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Chain {
+    pub phrases: Vec<u8>,
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Song {
     pub bpm: u16,
@@ -155,6 +164,62 @@ pub(crate) struct Song {
     pub samples: Vec<(String, PathBuf)>,
     /// `@driver expansion=vrc6` — request expansion audio in the NSF header.
     pub expansion: bool,
+    /// Stage 23: chains and the arrangement that sequences them. When
+    /// `arrangement` is non-empty it is the source of truth for playback
+    /// order (see [`Song::flat_order`]) and `order` is not written to disk.
+    pub chains: Vec<Chain>,
+    pub arrangement: Vec<u8>,
+    /// Arrangement slot to jump back to after the last one.
+    pub arr_loop: usize,
+    /// Per-16th signed sample offset added to the step clock (synth engine
+    /// only). `[0; 16]` = straight time.
+    pub groove: [i16; 16],
+    /// Per-channel wrap length in steps (1..=16). A channel shorter than
+    /// the phrase cycles inside it — polymeter.
+    pub channel_length: [u8; CHANNELS],
+}
+
+impl Song {
+    /// The flat playback order and loop position. Expands the arrangement
+    /// when one exists, otherwise returns the explicit `order` list.
+    /// Entries that point at missing chains or phrases are skipped.
+    pub fn flat_order(&self) -> (Vec<usize>, usize) {
+        if self.arrangement.is_empty() {
+            return (self.order.clone(), self.loop_pos.min(self.order.len().saturating_sub(1)));
+        }
+        let mut order = Vec::new();
+        let mut loop_pos = 0;
+        for (slot, &ci) in self.arrangement.iter().enumerate() {
+            if slot == self.arr_loop {
+                loop_pos = order.len();
+            }
+            if let Some(chain) = self.chains.get(ci as usize) {
+                order.extend(chain.phrases.iter().map(|&p| p as usize).filter(|&p| p < self.phrases.len()));
+            }
+        }
+        let loop_pos = loop_pos.min(order.len().saturating_sub(1));
+        (order, loop_pos)
+    }
+
+    /// For each flat order position, the `(arrangement slot, position in
+    /// chain)` it came from. Empty when there is no arrangement.
+    pub fn arrangement_map(&self) -> Vec<(usize, usize)> {
+        let mut map = Vec::new();
+        for (slot, &ci) in self.arrangement.iter().enumerate() {
+            if let Some(chain) = self.chains.get(ci as usize) {
+                for (pos, &p) in chain.phrases.iter().enumerate() {
+                    if (p as usize) < self.phrases.len() {
+                        map.push((slot, pos));
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    pub fn has_groove(&self) -> bool {
+        self.groove.iter().any(|&g| g != 0)
+    }
 }
 
 impl Default for Song {
@@ -173,6 +238,11 @@ impl Default for Song {
             key_name: String::new(),
             driver: None,
             samples: Vec::new(),
+            chains: Vec::new(),
+            arrangement: Vec::new(),
+            arr_loop: 0,
+            groove: [0; 16],
+            channel_length: [STEPS_PER_PHRASE as u8; CHANNELS],
             expansion: false,
         }
     }
@@ -428,6 +498,10 @@ struct App {
     queued_scene: Option<usize>,
     /// Song mode follows `song.order`; off = loop the current phrase.
     song_mode: bool,
+    /// Stage 23: chain that `:chain add` / `:chain pop` operate on, and
+    /// whether the song pane (arrangement + chains) is shown.
+    current_chain: usize,
+    show_song: bool,
     /// Playback engine: internal synth or the APU (compiled NSF).
     engine: audio::Engine,
     /// Compiled NSF for APU playback, refreshed on play.
@@ -515,6 +589,8 @@ impl App {
             scenes: [None; 9],
             queued_scene: None,
             song_mode: false,
+            current_chain: 0,
+            show_song: false,
             engine: audio::Engine::Synth,
             nsf_cache: None,
             nsf_generation: 0,
@@ -1031,6 +1107,72 @@ fn note_name(n: Option<u8>) -> String {
     }
 }
 
+/// Rows the song pane wants: border + arrangement row + chain rows (≤10)
+/// + the length/groove summary.
+fn song_pane_height(app: &App) -> u16 {
+    (4 + app.song.chains.len().min(10)) as u16
+}
+
+/// Stage 23: arrangement + chain view with the live slot highlighted.
+fn render_song_pane(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let live = app.playing && app.song_mode && !app.song.arrangement.is_empty();
+    let hot = Style::default().fg(theme.playhead_label).bg(theme.playhead_bg);
+    let plain = Style::default().fg(theme.label);
+    let mut lines: Vec<Line> = Vec::new();
+
+    let mut arr_spans = vec![Span::styled("ARR ", Style::default().fg(theme.accent))];
+    if app.song.arrangement.is_empty() {
+        arr_spans.push(Span::styled(" (empty — :arr add NN)", Style::default().fg(theme.dim)));
+    }
+    for (i, &ci) in app.song.arrangement.iter().enumerate() {
+        let style = if live && i == app.viz_frame.arr_slot { hot } else { plain };
+        let mark = if i == app.song.arr_loop { "↺" } else { " " };
+        arr_spans.push(Span::styled(format!("{}{:02X}", mark, ci), style));
+    }
+    lines.push(Line::from(arr_spans));
+
+    let play_chain = app.song.arrangement.get(app.viz_frame.arr_slot).copied().unwrap_or(u8::MAX) as usize;
+    for (ci, chain) in app.song.chains.iter().enumerate().take(10) {
+        let selected = ci == app.current_chain;
+        let mut spans = vec![Span::styled(
+            format!("{}{:02X} ", if selected { ">" } else { " " }, ci),
+            Style::default().fg(if selected { theme.accent } else { theme.label }),
+        )];
+        for (pos, &pi) in chain.phrases.iter().enumerate() {
+            let is_live = live && ci == play_chain && pos == app.viz_frame.chain_pos;
+            spans.push(Span::styled(format!(" {:02X}", pi), if is_live { hot } else { plain }));
+        }
+        if chain.phrases.is_empty() {
+            spans.push(Span::styled(" (empty)", Style::default().fg(theme.dim)));
+        }
+        if let Some(n) = &chain.name {
+            spans.push(Span::styled(format!("  {}", n), Style::default().fg(theme.dim)));
+        }
+        lines.push(Line::from(spans));
+    }
+    if app.song.chains.len() > 10 {
+        lines.push(Line::from(Span::styled(format!(" … {} more", app.song.chains.len() - 10), Style::default().fg(theme.dim))));
+    }
+
+    let lens: Vec<String> = (0..CHANNELS).map(|i| format!("{}={}", channel_name(i), app.song.channel_length[i])).collect();
+    let groove_on = app.song.has_groove();
+    lines.push(Line::from(vec![
+        Span::styled("LEN ", Style::default().fg(theme.accent)),
+        Span::styled(lens.join(" "), plain),
+        Span::raw("   "),
+        Span::styled(if groove_on { "GROOVE on" } else { "GROOVE straight" },
+            Style::default().fg(if groove_on { theme.accent } else { theme.dim })),
+    ]));
+
+    let title = format!(" SONG  {} phrases · {} chains · {} slots ",
+        app.song.phrases.len(), app.song.chains.len(), app.song.arrangement.len());
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(theme.accent)))
+        .borders(Borders::ALL);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     let p = app.phrase();
     let theme = &app.theme;
@@ -1267,6 +1409,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":mute [N]",        "toggle mute on cursor channel (or N: 1-5 / pu1..dpcm)"),
         row(":order [A,B,..]",  "show / set song order (hex phrase indices); :order off clears"),
         row(":song on|off",     "song mode: play through :order (on) or loop the phrase (off)"),
+        row(":song",            "toggle the song pane (arrangement + chains)"),
+        row(":chain new/del/sel NN", "create / delete / select a chain ('>' marks the selected one)"),
+        row(":chain add NN / pop", "append phrase NN to the selected chain / drop its last phrase"),
+        row(":arr add NN / del [pos]", "append chain NN to the arrangement / drop a slot"),
+        row(":arr loop pos / clear", "set the loop slot / empty the arrangement"),
+        row(":len <ch> N",      "polymeter: channel wraps every N steps (1–16); :len all N"),
+        row(":groove swing N",  "±N-sample swing on alternate 16ths; :groove straight; :groove <16 ints>"),
         row(":engine apu|synth","play through the compiled NSF + 2A03 emulation, or the synth"),
         row(":driver BIN SYM",  "set the NSF driver (paths relative to the .vip)"),
         row(":compile PATH",    "compile the song to an NSF against the @driver"),
@@ -1577,7 +1726,20 @@ fn ui(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Help => render_help(f, chunks[0], &app.theme),
         Mode::Instrument => render_instrument(f, chunks[0], app),
-        _ => render_phrase(f, main_area, app),
+        _ => {
+            // Stage 23: the song pane sits above the grid when toggled on.
+            if app.show_song && main_area.height >= 14 {
+                let rows = song_pane_height(app).min(main_area.height.saturating_sub(10));
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(rows), Constraint::Min(10)])
+                    .split(main_area);
+                render_song_pane(f, split[0], app);
+                render_phrase(f, split[1], app);
+            } else {
+                render_phrase(f, main_area, app);
+            }
+        }
     }
     if let Some(area) = viz_area {
         let ctx = viz::VizCtx {
@@ -2210,31 +2372,56 @@ fn execute_command(app: &mut App, cmd: &str) {
         ["play"] => { app.playing = true; app.status = "playing".into(); }
         ["stop"] => { app.playing = false; app.status = "stopped".into(); }
         ["order"] => {
-            let list: Vec<String> = app.song.order.iter().map(|i| format!("{:02X}", i)).collect();
+            let (order, loop_pos) = app.song.flat_order();
+            let list: Vec<String> = order.iter().map(|i| format!("{:02X}", i)).collect();
+            let from = if app.song.arrangement.is_empty() { "" } else { " (from arrangement)" };
             app.status = if list.is_empty() {
                 "order: (none) — :order 00,01,.. to set".into()
             } else {
-                format!("order: [{}] loop={:02X} song mode {}", list.join(","), app.song.loop_pos,
+                format!("order: [{}] loop={:02X}{} song mode {}", list.join(","), loop_pos, from,
                     if app.song_mode { "on" } else { "off" })
             };
         }
-        ["order", "off"] => { app.song.order.clear(); app.song_mode = false; app.dirty = true; app.status = "order cleared".into(); }
+        ["order", "off"] => {
+            app.snapshot();
+            app.song.order.clear();
+            app.song.chains.clear();
+            app.song.arrangement.clear();
+            app.song.arr_loop = 0;
+            app.song_mode = false;
+            app.dirty = true;
+            app.status = "order cleared".into();
+        }
         ["order", "loop", n] => match usize::from_str_radix(n, 16) {
+            Ok(i) if !app.song.arrangement.is_empty() => {
+                if i < app.song.arrangement.len() {
+                    app.song.arr_loop = i; app.dirty = true;
+                    app.status = format!("arrangement loop slot → {:02X}", i);
+                } else {
+                    app.status = "order loop: slot out of range (use :arr loop N)".into();
+                }
+            }
             Ok(i) if i < app.song.order.len().max(1) => { app.song.loop_pos = i; app.dirty = true; app.status = format!("loop point → {:02X}", i); }
             _ => app.status = "order loop: index out of range".into(),
         },
         ["order", list] => match parse_order_list(list, app.song.phrases.len()) {
             Ok(o) => {
+                app.snapshot();
+                let replaced = !app.song.arrangement.is_empty();
+                app.song.chains.clear();
+                app.song.arrangement.clear();
+                app.song.arr_loop = 0;
                 app.song.order = o;
                 app.song.loop_pos = app.song.loop_pos.min(app.song.order.len().saturating_sub(1));
                 app.song_mode = true;
                 app.dirty = true;
-                app.status = format!("order set ({} entries), song mode on", app.song.order.len());
+                app.status = format!("order set ({} entries), song mode on{}", app.song.order.len(),
+                    if replaced { " — arrangement replaced" } else { "" });
             }
             Err(e) => app.status = format!("order: {}", e),
         },
         ["song", "on"] => {
-            if app.song.order.is_empty() {
+            if app.song.flat_order().0.is_empty() {
                 app.song.order = (0..app.song.phrases.len()).collect();
                 app.dirty = true;
             }
@@ -2242,6 +2429,15 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.status = "song mode on".into();
         }
         ["song", "off"] => { app.song_mode = false; app.status = "song mode off (looping current phrase)".into(); }
+        ["song"] => {
+            app.show_song = !app.show_song;
+            app.status = if app.show_song { "song pane on (:song again to hide)".into() } else { "song pane off".into() };
+        }
+        ["song", "show"] => song_show(app),
+        ["chain", rest @ ..] => chain_cmd(app, rest),
+        ["arr", rest @ ..] | ["arrangement", rest @ ..] => arr_cmd(app, rest),
+        ["len", rest @ ..] | ["length", rest @ ..] => len_cmd(app, rest),
+        ["groove", rest @ ..] => groove_cmd(app, rest),
         ["engine", "apu"] => {
             app.engine = audio::Engine::Apu;
             app.nsf_cache = None;
@@ -2601,6 +2797,264 @@ fn unmute_all(app: &mut App) {
 }
 
 /// Parse "1".."5" or "pu1/pu2/tri/noi/dpcm" into a channel index.
+// ---------- Stage 23: chains, arrangement, groove, polymeter ----------
+
+fn song_show(app: &mut App) {
+    let arr: Vec<String> = app.song.arrangement.iter().map(|c| format!("{:02X}", c)).collect();
+    let (order, _) = app.song.flat_order();
+    app.status = format!(
+        "song: {} phrases, {} chains, arr=[{}] loop={:02X} → {} order entries, chain {:02X} selected",
+        app.song.phrases.len(), app.song.chains.len(), arr.join(","), app.song.arr_loop,
+        order.len(), app.current_chain,
+    );
+}
+
+/// `:chain show | new | del [NN] | sel NN | add NN | pop | name TEXT`
+fn chain_cmd(app: &mut App, rest: &[&str]) {
+    match rest {
+        [] | ["show"] => {
+            if app.song.chains.is_empty() {
+                app.status = "chains: (none) — :chain new to start one".into();
+                return;
+            }
+            let summary: Vec<String> = app.song.chains.iter().enumerate().map(|(i, c)| {
+                let phrases: Vec<String> = c.phrases.iter().map(|p| format!("{:02X}", p)).collect();
+                let marker = if i == app.current_chain { ">" } else { " " };
+                let name = c.name.as_deref().map(|n| format!(" {}", n)).unwrap_or_default();
+                format!("{}{:02X}{}:[{}]", marker, i, name, phrases.join(","))
+            }).collect();
+            app.status = format!("chains: {}", summary.join(" "));
+        }
+        ["new"] => {
+            app.snapshot();
+            app.song.chains.push(Chain::default());
+            app.current_chain = app.song.chains.len() - 1;
+            app.dirty = true;
+            app.status = format!("chain {:02X} new (empty) — :chain add NN to fill it", app.current_chain);
+        }
+        ["del"] | ["delete"] => chain_delete(app, app.current_chain),
+        ["del", idx] | ["delete", idx] => match usize::from_str_radix(idx, 16) {
+            Ok(i) => chain_delete(app, i),
+            Err(_) => app.status = format!("chain: bad index {:?}", idx),
+        },
+        ["sel", idx] | ["select", idx] => match usize::from_str_radix(idx, 16) {
+            Ok(i) if i < app.song.chains.len() => {
+                app.current_chain = i;
+                app.status = format!("chain {:02X} selected", i);
+            }
+            Ok(i) => app.status = format!("chain: no such chain {:02X}", i),
+            Err(_) => app.status = format!("chain: bad index {:?}", idx),
+        },
+        ["add", idx] => match usize::from_str_radix(idx, 16) {
+            Ok(pi) if pi < app.song.phrases.len() => {
+                app.snapshot();
+                if app.song.chains.is_empty() {
+                    app.song.chains.push(Chain::default());
+                }
+                let c = app.current_chain.min(app.song.chains.len() - 1);
+                app.song.chains[c].phrases.push(pi as u8);
+                app.current_chain = c;
+                app.dirty = true;
+                app.status = format!("chain {:02X}: +phrase {:02X} (len {})", c, pi, app.song.chains[c].phrases.len());
+            }
+            Ok(pi) => app.status = format!("chain: no such phrase {:02X}", pi),
+            Err(_) => app.status = format!("chain: bad phrase index {:?}", idx),
+        },
+        ["pop"] => {
+            let Some(c) = app.current_chain.checked_sub(0).filter(|&c| c < app.song.chains.len()) else {
+                app.status = "chain: no chains".into();
+                return;
+            };
+            match app.song.chains[c].phrases.last().copied() {
+                Some(p) => {
+                    app.snapshot();
+                    app.song.chains[c].phrases.pop();
+                    app.dirty = true;
+                    app.status = format!("chain {:02X}: popped phrase {:02X}", c, p);
+                }
+                None => app.status = format!("chain {:02X}: already empty", c),
+            }
+        }
+        ["name", name @ ..] if !name.is_empty() && app.current_chain < app.song.chains.len() => {
+            app.snapshot();
+            app.song.chains[app.current_chain].name = Some(name.join(" "));
+            app.dirty = true;
+            app.status = format!("chain {:02X} named {:?}", app.current_chain, name.join(" "));
+        }
+        _ => app.status = "usage: :chain show | new | del [NN] | sel NN | add NN | pop | name TEXT".into(),
+    }
+}
+
+fn chain_delete(app: &mut App, idx: usize) {
+    if idx >= app.song.chains.len() {
+        app.status = format!("chain: no such chain {:02X}", idx);
+        return;
+    }
+    app.snapshot();
+    app.song.chains.remove(idx);
+    // Drop arrangement slots that pointed at it and shift the rest down so
+    // the remaining chains keep their slots.
+    app.song.arrangement.retain(|&c| c as usize != idx);
+    for c in app.song.arrangement.iter_mut() {
+        if *c as usize > idx {
+            *c -= 1;
+        }
+    }
+    if app.song.arr_loop >= app.song.arrangement.len() {
+        app.song.arr_loop = 0;
+    }
+    if app.current_chain >= app.song.chains.len() {
+        app.current_chain = app.song.chains.len().saturating_sub(1);
+    }
+    app.dirty = true;
+    app.status = format!("chain {:02X} deleted", idx);
+}
+
+/// `:arr show | add NN | del [pos] | loop pos | clear`
+fn arr_cmd(app: &mut App, rest: &[&str]) {
+    match rest {
+        [] | ["show"] => {
+            let s: Vec<String> = app.song.arrangement.iter().enumerate()
+                .map(|(i, c)| if i == app.song.arr_loop { format!("[{:02X}]", c) } else { format!("{:02X}", c) })
+                .collect();
+            app.status = if s.is_empty() {
+                "arr: (none) — :arr add NN appends chain NN".into()
+            } else {
+                format!("arr: {} ([..] = loop slot)", s.join(" "))
+            };
+        }
+        ["add", idx] => match usize::from_str_radix(idx, 16) {
+            Ok(ci) if ci < app.song.chains.len() => {
+                app.snapshot();
+                app.song.arrangement.push(ci as u8);
+                app.song_mode = true;
+                app.dirty = true;
+                app.status = format!("arr: +chain {:02X} (slot {}), song mode on", ci, app.song.arrangement.len() - 1);
+            }
+            Ok(ci) => app.status = format!("arr: no such chain {:02X}", ci),
+            Err(_) => app.status = format!("arr: bad chain index {:?}", idx),
+        },
+        ["del"] | ["pop"] => match app.song.arrangement.pop() {
+            Some(c) => {
+                app.snapshot();
+                if app.song.arr_loop >= app.song.arrangement.len() { app.song.arr_loop = 0; }
+                app.dirty = true;
+                app.status = format!("arr: popped chain {:02X}", c);
+            }
+            None => app.status = "arr: already empty".into(),
+        },
+        ["del", pos] => match pos.parse::<usize>() {
+            Ok(p) if p < app.song.arrangement.len() => {
+                app.snapshot();
+                let c = app.song.arrangement.remove(p);
+                if app.song.arr_loop >= app.song.arrangement.len() { app.song.arr_loop = 0; }
+                app.dirty = true;
+                app.status = format!("arr: removed slot {} (chain {:02X})", p, c);
+            }
+            Ok(p) => app.status = format!("arr: no such slot {}", p),
+            Err(_) => app.status = format!("arr: bad slot {:?}", pos),
+        },
+        ["loop", pos] => match pos.parse::<usize>() {
+            Ok(p) if p < app.song.arrangement.len() => {
+                app.song.arr_loop = p;
+                app.dirty = true;
+                app.status = format!("arr: loop slot → {}", p);
+            }
+            _ => app.status = "arr loop: slot out of range".into(),
+        },
+        ["clear"] => {
+            app.snapshot();
+            app.song.arrangement.clear();
+            app.song.arr_loop = 0;
+            app.dirty = true;
+            app.status = "arr: cleared (chains kept)".into();
+        }
+        _ => app.status = "usage: :arr show | add NN | del [pos] | loop pos | clear".into(),
+    }
+}
+
+/// `:len show | all N | <ch> N` — per-channel polymeter length (1–16).
+fn len_cmd(app: &mut App, rest: &[&str]) {
+    let parse_n = |v: &str| -> Result<u8, String> {
+        match v.parse::<u8>() {
+            Ok(n) if (1..=STEPS_PER_PHRASE as u8).contains(&n) => Ok(n),
+            _ => Err(format!("length must be 1–{}, got {:?}", STEPS_PER_PHRASE, v)),
+        }
+    };
+    match rest {
+        [] | ["show"] => {
+            let s: Vec<String> = (0..CHANNELS)
+                .map(|i| format!("{}={}", channel_name(i), app.song.channel_length[i]))
+                .collect();
+            app.status = format!("len: {}", s.join(" "));
+        }
+        ["all", n] => match parse_n(n) {
+            Ok(v) => {
+                app.snapshot();
+                app.song.channel_length = [v; CHANNELS];
+                app.dirty = true;
+                app.status = format!("len: all = {}", v);
+            }
+            Err(e) => app.status = format!("len: {}", e),
+        },
+        [ch, n] => match (parse_channel_token(ch), parse_n(n)) {
+            (Some(c), Ok(v)) => {
+                app.snapshot();
+                app.song.channel_length[c] = v;
+                app.dirty = true;
+                app.status = format!("len {} = {}", channel_name(c), v);
+            }
+            (None, _) => app.status = format!("len: bad channel {:?}", ch),
+            (_, Err(e)) => app.status = format!("len: {}", e),
+        },
+        _ => app.status = "usage: :len show | all N | <ch> N".into(),
+    }
+}
+
+/// `:groove show | straight | swing N | <16 ints>` — per-16th sample
+/// offsets on the synth step clock.
+fn groove_cmd(app: &mut App, rest: &[&str]) {
+    match rest {
+        [] | ["show"] => {
+            let joined: Vec<String> = app.song.groove.iter().map(|v| v.to_string()).collect();
+            app.status = format!("groove: {}{}", joined.join(" "),
+                if app.song.has_groove() { "" } else { " (straight)" });
+        }
+        ["straight"] | ["off"] | ["reset"] => {
+            app.snapshot();
+            app.song.groove = [0; 16];
+            app.dirty = true;
+            app.status = "groove: straight".into();
+        }
+        ["swing", n] => match n.parse::<i16>() {
+            Ok(amt) => {
+                app.snapshot();
+                app.song.groove = vip::swing_groove(amt);
+                app.dirty = true;
+                app.status = format!("groove: swing ±{} samples", amt);
+            }
+            Err(_) => app.status = format!("groove: bad swing amount {:?}", n),
+        },
+        vals if vals.len() == 16 => {
+            let mut g = [0i16; 16];
+            for (i, tok) in vals.iter().enumerate() {
+                match tok.parse::<i16>() {
+                    Ok(v) => g[i] = v,
+                    Err(_) => {
+                        app.status = format!("groove: bad value {:?} at step {}", tok, i);
+                        return;
+                    }
+                }
+            }
+            app.snapshot();
+            app.song.groove = g;
+            app.dirty = true;
+            app.status = "groove: set (16 values)".into();
+        }
+        _ => app.status = "usage: :groove show | straight | swing N | <16 ints>".into(),
+    }
+}
+
 fn parse_channel_token(tok: &str) -> Option<usize> {
     if let Ok(n) = tok.parse::<usize>() {
         if (1..=CHANNELS).contains(&n) {
@@ -3116,8 +3570,9 @@ fn delete_phrase_cmd(app: &mut App) {
 /// The phrases `:bounce` / `:midi` render: the song order in song mode,
 /// otherwise the current phrase.
 fn playback_sequence(app: &App) -> Vec<Phrase> {
-    if app.song_mode && !app.song.order.is_empty() {
-        app.song.order.iter().filter_map(|&i| app.song.phrases.get(i).cloned()).collect()
+    let (order, _) = app.song.flat_order();
+    if app.song_mode && !order.is_empty() {
+        order.iter().filter_map(|&i| app.song.phrases.get(i).cloned()).collect()
     } else {
         app.song.phrases.get(app.song.current_phrase).cloned().into_iter().collect()
     }
@@ -3194,6 +3649,7 @@ fn bounce_cmd(app: &mut App, path_str: &str, loops: u32) {
     const SR: u32 = 44100;
     match audio::bounce_to_wav(
         &path, &sequence, &app.song.instruments, app.song.bpm, loops, SR,
+        &app.song.groove, &app.song.channel_length,
     ) {
         Ok(frames) => {
             let secs = frames as f32 / SR as f32;
@@ -3446,15 +3902,20 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tr.phrase = app.phrase().clone();
         tr.instruments = app.song.instruments;
         tr.muted = app.muted;
-        tr.song_mode = app.song_mode && !app.song.order.is_empty();
+        let (order, loop_pos) = app.song.flat_order();
+        tr.song_mode = app.song_mode && !order.is_empty();
         if tr.song_mode {
-            tr.order = app.song.order.clone();
-            tr.loop_pos = app.song.loop_pos;
+            tr.order = order;
+            tr.loop_pos = loop_pos;
             tr.phrases = app.song.phrases.clone();
+            tr.arrangement_map = app.song.arrangement_map();
         } else {
             tr.order.clear();
             tr.phrases.clear();
+            tr.arrangement_map.clear();
         }
+        tr.groove = app.song.groove;
+        tr.channel_length = app.song.channel_length;
         tr.engine = app.engine;
         tr.nsf = app.nsf_cache.clone();
         tr.nsf_generation = app.nsf_generation;
@@ -3500,6 +3961,8 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         tempo: app.song.bpm as f32,
         scene_index: app.song.current_phrase as i32,
         phrase: app.song.current_phrase as i32,
+        arr_slot: app.viz_frame.arr_slot as i32,
+        chain_pos: app.viz_frame.chain_pos as i32,
         time_s,
         voice_ages,
     };

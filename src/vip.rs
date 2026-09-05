@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::{Cell, Phrase, Song, CHANNELS, INSTRUMENTS, STEPS_PER_PHRASE};
+use crate::{Cell, Chain, Phrase, Song, CHANNELS, INSTRUMENTS, STEPS_PER_PHRASE};
 
 const NOTE_NAMES: [&str; 12] = [
     "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
@@ -129,7 +129,9 @@ pub fn to_vip(song: &Song) -> String {
         song.bpm, song.edit_step, song.current_phrase
     )
     .unwrap();
-    if !song.order.is_empty() {
+    // With an arrangement the order is derived (Song::flat_order), so only
+    // the explicit list is written — never both.
+    if song.arrangement.is_empty() && !song.order.is_empty() {
         let list: Vec<String> = song.order.iter().map(|i| format!("{:02X}", i)).collect();
         write!(out, "  order=[{}]  loop={:02X}", list.join(","), song.loop_pos).unwrap();
     }
@@ -166,6 +168,38 @@ pub fn to_vip(song: &Song) -> String {
         out.push('\n');
     }
 
+    // Stage 23: chains + arrangement. Every chain is written, empty ones
+    // included, so arrangement entries keep pointing at the same ids.
+    if !song.chains.is_empty() || !song.arrangement.is_empty() {
+        for (ci, chain) in song.chains.iter().enumerate() {
+            match &chain.name {
+                Some(n) if !n.is_empty() => writeln!(out, "@chain {:02X}  name={:?}", ci, n).unwrap(),
+                _ => writeln!(out, "@chain {:02X}", ci).unwrap(),
+            }
+            let list: Vec<String> = chain.phrases.iter().map(|p| format!("{:02X}", p)).collect();
+            if !list.is_empty() {
+                writeln!(out, "  {}", list.join(" ")).unwrap();
+            }
+        }
+        writeln!(out, "@arrangement  loop={:02X}", song.arr_loop).unwrap();
+        let arr: Vec<String> = song.arrangement.iter().map(|c| format!("{:02X}", c)).collect();
+        if !arr.is_empty() {
+            writeln!(out, "  {}", arr.join(" ")).unwrap();
+        }
+        out.push('\n');
+    }
+    // Groove and per-channel lengths are only written when they deviate
+    // from straight time / full-length, keeping simple files tidy.
+    if song.has_groove() {
+        writeln!(out, "@groove").unwrap();
+        let tokens: Vec<String> = song.groove.iter().map(|g| g.to_string()).collect();
+        writeln!(out, "  {}\n", tokens.join(" ")).unwrap();
+    }
+    if song.channel_length != [STEPS_PER_PHRASE as u8; CHANNELS] {
+        let l = song.channel_length;
+        writeln!(out, "@length  pu1={}  pu2={}  tri={}  noi={}  dpcm={}\n", l[0], l[1], l[2], l[3], l[4]).unwrap();
+    }
+
     for (i, inst) in song.instruments.iter().enumerate() {
         writeln!(
             out,
@@ -179,18 +213,27 @@ pub fn to_vip(song: &Song) -> String {
 
 // ---------- Parser ----------
 
+/// Which directive the following data rows belong to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    None,
+    Phrase(usize),
+    Chain(usize),
+    Arrangement,
+    Groove,
+}
+
 pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
     let mut song = Song::default();
     song.phrases.clear();
-    let mut current_phrase: Option<usize> = None;
+    let mut section = Section::None;
+    let mut groove_pos = 0usize;
     let mut warnings: Vec<String> = Vec::new();
 
     // Directives reserved in FORMAT.md but not yet implemented; parsing them
     // shouldn't error, but silently dropping them has burned us in hand-edited
     // files, so warn.
-    const RESERVED: &[&str] = &[
-        "chain", "scene", "bind", "sprite", "groove",
-    ];
+    const RESERVED: &[&str] = &["scene", "bind", "sprite"];
 
     for (line_no, raw) in text.lines().enumerate() {
         let line_num = line_no + 1;
@@ -202,22 +245,67 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
         if let Some(rest) = line.strip_prefix('@') {
             let (dir, args) = split_once_ws(rest);
             match dir {
-                "song" => parse_song(&mut song, args)
-                    .with_context(|| format!("line {}: @song", line_num))?,
+                "song" => {
+                    parse_song(&mut song, args)
+                        .with_context(|| format!("line {}: @song", line_num))?;
+                    section = Section::None;
+                }
                 "phrase" => {
                     let idx = parse_phrase_idx(args)
                         .with_context(|| format!("line {}: @phrase", line_num))?;
                     while song.phrases.len() <= idx {
                         song.phrases.push(Phrase::default());
                     }
-                    current_phrase = Some(idx);
+                    section = Section::Phrase(idx);
                 }
-                "instr" => parse_instr(&mut song, args)
-                    .with_context(|| format!("line {}: @instr", line_num))?,
-                "meta" => parse_meta(&mut song, args),
-                "driver" => parse_driver(&mut song, args),
-                "dpcm" => parse_dpcm(&mut song, args)
-                    .with_context(|| format!("line {}: @dpcm", line_num))?,
+                "chain" => {
+                    let (idx, name) = parse_chain_header(args)
+                        .with_context(|| format!("line {}: @chain", line_num))?;
+                    while song.chains.len() <= idx {
+                        song.chains.push(Chain::default());
+                    }
+                    song.chains[idx].name = name;
+                    section = Section::Chain(idx);
+                }
+                "arrangement" | "arr" => {
+                    for (k, v) in kv_iter(args) {
+                        if k == "loop" {
+                            song.arr_loop = usize::from_str_radix(v, 16)
+                                .with_context(|| format!("line {}: @arrangement loop", line_num))?;
+                        }
+                    }
+                    section = Section::Arrangement;
+                }
+                "groove" => {
+                    // Inline form: `@groove swing=N` (±N samples on alternate 16ths).
+                    let mut inline = false;
+                    for (k, v) in kv_iter(args) {
+                        if k == "swing" {
+                            let n: i16 = v.parse().with_context(|| format!("line {}: @groove swing", line_num))?;
+                            song.groove = swing_groove(n);
+                            inline = true;
+                        }
+                    }
+                    groove_pos = 0;
+                    section = if inline { Section::None } else { Section::Groove };
+                }
+                "length" | "len" => {
+                    parse_length(&mut song, args)
+                        .with_context(|| format!("line {}: @length", line_num))?;
+                    section = Section::None;
+                }
+                "instr" => {
+                    parse_instr(&mut song, args)
+                        .with_context(|| format!("line {}: @instr", line_num))?;
+                    section = Section::None;
+                }
+                "meta" => { parse_meta(&mut song, args); section = Section::None; }
+                "driver" => { parse_driver(&mut song, args); section = Section::None; }
+                "dpcm" => {
+                    parse_dpcm(&mut song, args)
+                        .with_context(|| format!("line {}: @dpcm", line_num))?;
+                    section = Section::None;
+                }
                 d if RESERVED.contains(&d) => {
                     warnings.push(format!(
                         "line {}: @{} reserved but not implemented — ignored",
@@ -232,11 +320,38 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
                 }
             }
         } else {
-            let pi = current_phrase.ok_or_else(|| {
-                anyhow!("line {}: data row appears before any @phrase directive", line_num)
-            })?;
-            parse_data_row(&mut song.phrases[pi], line)
-                .with_context(|| format!("line {}", line_num))?;
+            match section {
+                Section::Phrase(pi) => parse_data_row(&mut song.phrases[pi], line)
+                    .with_context(|| format!("line {}", line_num))?,
+                Section::Chain(ci) => {
+                    for tok in line.split_whitespace() {
+                        let p = u8::from_str_radix(tok, 16)
+                            .with_context(|| format!("line {}: chain phrase {:?}", line_num, tok))?;
+                        song.chains[ci].phrases.push(p);
+                    }
+                }
+                Section::Arrangement => {
+                    for tok in line.split_whitespace() {
+                        let c = u8::from_str_radix(tok, 16)
+                            .with_context(|| format!("line {}: arrangement chain {:?}", line_num, tok))?;
+                        song.arrangement.push(c);
+                    }
+                }
+                Section::Groove => {
+                    for tok in line.split_whitespace() {
+                        if groove_pos >= 16 {
+                            bail!("line {}: @groove has more than 16 values", line_num);
+                        }
+                        song.groove[groove_pos] = tok.parse::<i16>()
+                            .with_context(|| format!("line {}: groove value {:?}", line_num, tok))?;
+                        groove_pos += 1;
+                    }
+                }
+                Section::None => bail!(
+                    "line {}: data row appears before any @phrase / @chain / @arrangement / @groove directive",
+                    line_num
+                ),
+            }
         }
     }
 
@@ -255,7 +370,73 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
     if song.loop_pos >= song.order.len() {
         song.loop_pos = 0;
     }
+    // Stage 23: chains may only reference existing phrases, the arrangement
+    // only existing chains.
+    for (ci, chain) in song.chains.iter_mut().enumerate() {
+        let before = chain.phrases.len();
+        chain.phrases.retain(|&p| (p as usize) < n);
+        if chain.phrases.len() != before {
+            warnings.push(format!("@chain {:02X} references phrases that do not exist — dropped", ci));
+        }
+    }
+    let nc = song.chains.len();
+    let before = song.arrangement.len();
+    song.arrangement.retain(|&c| (c as usize) < nc);
+    if song.arrangement.len() != before {
+        warnings.push("@arrangement references chains that do not exist — dropped".into());
+    }
+    if song.arr_loop >= song.arrangement.len() {
+        song.arr_loop = 0;
+    }
+    if !song.arrangement.is_empty() && !song.order.is_empty() {
+        warnings.push("@song order= ignored: the @arrangement decides playback".into());
+        song.order.clear();
+        song.loop_pos = 0;
+    }
     Ok((song, warnings))
+}
+
+/// `@groove swing=N` and `:groove swing N`: every off-16th lands N samples
+/// late and every on-16th N samples early, keeping the bar length exact.
+pub fn swing_groove(n: i16) -> [i16; 16] {
+    let mut g = [0i16; 16];
+    for (i, v) in g.iter_mut().enumerate() {
+        *v = if i % 2 == 0 { -n } else { n };
+    }
+    g
+}
+
+/// `@chain NN [name="..."]`
+fn parse_chain_header(args: &str) -> Result<(usize, Option<String>)> {
+    let (idx_tok, rest) = split_once_ws(args);
+    let idx = usize::from_str_radix(idx_tok, 16).context("chain index")?;
+    let mut name = None;
+    for (k, v) in kv_quoted(rest) {
+        if k == "name" && !v.is_empty() {
+            name = Some(v);
+        }
+    }
+    Ok((idx, name))
+}
+
+/// `@length pu1=16 pu2=16 tri=12 noi=8 dpcm=16` — any subset.
+fn parse_length(song: &mut Song, args: &str) -> Result<()> {
+    for (k, v) in kv_iter(args) {
+        let n: u8 = v.parse().with_context(|| format!("length {}={}", k, v))?;
+        if n == 0 || n as usize > STEPS_PER_PHRASE {
+            bail!("length {}={} out of range (1..={})", k, n, STEPS_PER_PHRASE);
+        }
+        let ch = match k {
+            "pu1" => 0,
+            "pu2" => 1,
+            "tri" => 2,
+            "noi" => 3,
+            "dpcm" => 4,
+            _ => bail!("length: unknown channel {:?}", k),
+        };
+        song.channel_length[ch] = n;
+    }
+    Ok(())
 }
 
 /// `key=value` pairs where a value may be double-quoted to contain spaces.
@@ -525,10 +706,10 @@ mod tests {
 
     #[test]
     fn reserved_directive_warns() {
-        let text = "@song bpm=120\n@phrase 00\n@groove swing=10\n@bogus foo=bar\n";
+        let text = "@song bpm=120\n@phrase 00\n@scene 1 phrase=00\n@bogus foo=bar\n";
         let (_, warns) = from_vip(text).unwrap();
         assert_eq!(warns.len(), 2);
-        assert!(warns[0].contains("@groove"));
+        assert!(warns[0].contains("@scene"));
         assert!(warns[1].contains("@bogus"));
     }
 
@@ -561,6 +742,61 @@ mod tests {
         let (song, _) = from_vip(text).unwrap();
         assert_eq!(song.phrases[0].cells[0][3].note, Some(43));
         assert_eq!(song.phrases[0].cells[0][4].note, None);
+    }
+
+    #[test]
+    fn chains_and_arrangement_round_trip_and_flatten() {
+        let mut song = Song::default();
+        song.phrases.push(Phrase::default());
+        song.phrases.push(Phrase::default());
+        song.chains = vec![
+            Chain { phrases: vec![0, 1, 0], name: Some("intro riff".into()) },
+            Chain { phrases: vec![2, 1], name: None },
+        ];
+        song.arrangement = vec![0, 1, 0];
+        song.arr_loop = 1;
+        let text = to_vip(&song);
+        assert!(!text.contains("order="), "arrangement songs must not also write order=\n{}", text);
+        let (back, warns) = from_vip(&text).unwrap();
+        assert!(warns.is_empty(), "unexpected warnings: {:?}", warns);
+        assert_eq!(back.chains, song.chains);
+        assert_eq!(back.arrangement, vec![0, 1, 0]);
+        assert_eq!(back.arr_loop, 1);
+        assert_eq!(back.flat_order(), (vec![0, 1, 0, 2, 1, 0, 1, 0], 3));
+        assert_eq!(back.arrangement_map()[3], (1, 0));
+        // Second pass is byte-stable.
+        assert_eq!(to_vip(&back), text);
+    }
+
+    #[test]
+    fn groove_and_length_round_trip_and_defaults_are_omitted() {
+        let plain = to_vip(&Song::default());
+        assert!(!plain.contains("@groove") && !plain.contains("@length") && !plain.contains("@chain"));
+
+        let mut song = Song::default();
+        song.groove = swing_groove(120);
+        song.channel_length = [16, 16, 12, 8, 16];
+        let text = to_vip(&song);
+        let (back, warns) = from_vip(&text).unwrap();
+        assert!(warns.is_empty(), "{:?}", warns);
+        assert_eq!(back.groove, song.groove);
+        assert_eq!(back.channel_length, song.channel_length);
+
+        let (inline, _) = from_vip("@song bpm=120\n@groove swing=7\n@phrase 00\n").unwrap();
+        assert_eq!(inline.groove, swing_groove(7));
+    }
+
+    #[test]
+    fn bad_chain_and_arrangement_references_are_dropped_with_warnings() {
+        let text = "@song bpm=120 order=[00]\n@phrase 00\n@chain 00\n  00 05\n@chain 01\n  00\n@arrangement loop=03\n  00 07 01\n";
+        let (song, warns) = from_vip(text).unwrap();
+        assert_eq!(song.chains[0].phrases, vec![0]);
+        assert_eq!(song.arrangement, vec![0, 1]);
+        assert_eq!(song.arr_loop, 0);
+        assert!(song.order.is_empty(), "order= gives way to the arrangement");
+        assert!(warns.iter().any(|w| w.contains("@chain 00")));
+        assert!(warns.iter().any(|w| w.contains("@arrangement")));
+        assert!(warns.iter().any(|w| w.contains("order= ignored")));
     }
 
     #[test]

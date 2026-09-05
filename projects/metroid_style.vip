@@ -1,0 +1,45 @@
+# metroid_style.vip
+#
+# Cold, isolating, dissonant-minor pastiche — the "alone on an alien
+# planet" vibe. Wide intervals, chromatic creep, tritone tension, very
+# sparse percussion. PU1 floats above a slow triangle drone while PU2
+# answers a bar late like a distant echo.
+#
+# Not a transcription. The ingredients (minor key, long sustains, wide
+# leaps, half-step chromatic motion) are genre-defining but uncopyrightable.
+#
+# Load: :e projects/metroid_style.vip
+# Play: <space>
+
+@meta  title="alien planet pastiche"  style="NES atmospheric"  key="F# minor"
+
+@song  bpm=90  edit_step=1  current=00  order=[00]  loop=00
+
+# Instruments — everything is long and slow here. High attack on the
+# pulses for that "rising from the dark" swell.
+@instr 00  a=20  d=200  s=0.60  r=400  duty=0.25  vol=0.70   # cold lead
+@instr 01  a=40  d=300  s=0.35  r=500  duty=0.12  vol=0.45   # ghostly echo
+@instr 02  a=10  d=60   s=0.95  r=500  duty=0.50  vol=0.80   # sub drone
+@instr 03  a=5   d=40   s=0.00  r=100  duty=0.50  vol=0.40   # distant noise
+
+# Phrase 00 — F# minor with a tritone scare (C-6 against the F# root)
+# right before resolving down. The empty cells are load-bearing — this
+# style is *built* out of silence.
+@phrase 00
+  # step   PU1        PU2         TRI         NOI
+  00       F#4        ---         F#2:02      ---
+  01       ---        ---         ---         ---
+  02       ---        C#5:01      ---         ---
+  03       ---        ---         ---         ---
+  04       A-5        ---         E-2:02      ---
+  05       ---        ---         ---         ---
+  06       ---        F#5:01      ---         ---
+  07       ---        ---         ---         ---
+  08       C#6        ---         D-2:02      C-3:03
+  09       ---        ---         ---         ---
+  0a       ---        A-5:01      ---         ---
+  0b       ---        ---         ---         ---
+  0c       B-5        ---         B-2:02      ---
+  0d       C-6        ---         ---         ---
+  0e       ---        F-5:01      ---         ---
+  0f       ---        ---         ---         ---

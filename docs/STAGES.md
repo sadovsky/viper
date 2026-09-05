@@ -79,6 +79,18 @@ Command mode:
 - `:gen four` — four-on-floor drums on NOI
 - `:gen euclid <ch> <k> <n> [off]` — Euclidean rhythm on channel
 - `:gen scale <ch> <key> [mode] [density]` — random notes in a mode
+- `:gen style <dir> [seed]` — compose a whole song from a style directory (Stage 22)
+- `:bounce <path> [loops]` / `:midi <path> [loops]` — offline WAV render / SMF export of the playback sequence
+- `:bind <sheet>[.N|*] <target> = <expr>` / `:bind list|clear|del N` — sprite modulation bindings
+- `:order [A,B,..]` / `:order off` / `:order loop N` — flat song order (hex phrase indices)
+- `:song on|off` — song mode: play through the order, or loop the current phrase
+- `:song` / `:song show` — toggle the song pane (arrangement + chains) / print a summary
+- `:chain new|del [NN]|sel NN|add NN|pop|name TEXT` — edit chains (`>` marks the selected chain)
+- `:arr add NN|del [pos]|loop pos|clear` — edit the arrangement; adding a slot turns song mode on
+- `:len <ch> N` / `:len all N` — per-channel polymeter length (1–16)
+- `:groove swing N` / `:groove straight` / `:groove <16 ints>` — per-16th sample offsets (synth engine)
+- `:driver BIN SYM` / `:compile PATH` — set the NSF driver / compile the song to an NSF
+- `:engine apu|synth` — play through the compiled NSF on the 2A03 core, or the internal synth
 
 Instrument editor mode:
 - `j` / `k` (arrows) — select parameter
@@ -184,7 +196,7 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
   rolled SMF writer, no midly dep — VLQ, MThd/MTrk chunks, note-offs
   ordered before note-ons at the same tick to survive same-tick retriggers.
 - Possible later: `:render out.mp4` recording the viz synced to the bounce.
-- **Stage 16 — Song mode.** ✅ (lite) Global order list: `@song order=[..] loop=NN`, `:order`, `:song on|off`; the grid follows the playing phrase; `:bounce` / `:midi` render the order. Still planned: per-channel chains, groove/swing, polymeter.
+- **Stage 16** ✅ — Song mode (lite). Global order list: `@song order=[..] loop=NN`, `:order`, `:song on|off`; the grid follows the playing phrase; `:bounce` / `:midi` render the order. Chains, groove and polymeter landed as Stage 23.
 - **Stage 17 — Plugin voices.** Load external SID/VRC6/FDS emulator cores as additional voice types for that extended-chip flavor.
 
 ### NSF pipeline
@@ -225,3 +237,22 @@ lives in viper.
   constraints. viper ships the interface and a neutral style; genre
   styles live downstream. `viper gen --style <dir> --seed N` is
   deterministic and records seed + style version in `@meta`.
+
+### Song structure
+
+- **Stage 23** ✅ — **Full song mode: chains, arrangement, groove,
+  polymeter.** `Chain { phrases, name }` and `Song::arrangement` (a list
+  of chain indices with a loop slot) sit on top of the Stage 16 order
+  list: `Song::flat_order()` expands arrangement → chains → phrases, and
+  the transport, `:bounce`, `:midi`, and the NSF compiler all consume that
+  flat order, so nothing downstream learned a new shape. `.vip` gains
+  `@chain NN [name=".."]`, `@arrangement [loop=NN]`, `@length`, and
+  `@groove` (see `FORMAT.md`); a file with an arrangement never writes
+  `order=`. Commands: `:song` (pane with the live slot highlighted),
+  `:chain`, `:arr`, `:len`, `:groove`. Polymeter (`channel_length`) wraps a
+  channel inside each phrase and is unrolled by the compiler, so it plays
+  on hardware; groove shifts the synth step clock per 16th and is
+  synth-only (the compiler warns). Modulation sources `arr` and
+  `chain.pos` expose the live position. MIDI export ignores both.
+  Salvaged from an unmerged Stage 16 prototype, along with five pastiche
+  songs in `projects/` (espresso, ff_prelude, mario, metroid, zelda).

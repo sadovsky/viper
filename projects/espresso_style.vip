@@ -1,0 +1,45 @@
+# espresso_style.vip
+#
+# Modern-disco-pop pastiche in the same lane as Sabrina Carpenter's
+# "Espresso": A-minor vamp, four-on-the-floor kick, octave-jumping
+# disco bass, syncopated 16th-note vocal-shaped hook in parallel
+# thirds, offbeat noise as the open hat.
+#
+# Not a transcription. The ingredients (i–VI–III–VII vamp, disco
+# octave bass, 4-on-the-floor, vocal rides the upbeats) have been
+# pop-music furniture since the 70s — none of it is hers to own.
+#
+# Load: :e projects/espresso_style.vip
+# Play: <space>
+
+@meta  title="modern disco-pop pastiche"  style="disco pop"  key="A minor"
+
+@song  bpm=104  edit_step=1  current=00  order=[00]  loop=00
+
+# Instruments — tight, punchy, pop-radio-friendly envelopes.
+@instr 00  a=2   d=50   s=0.70  r=90   duty=0.50  vol=0.75   # vocal lead
+@instr 01  a=2   d=40   s=0.50  r=70   duty=0.25  vol=0.55   # backing harmony
+@instr 02  a=0   d=30   s=0.80  r=60   duty=0.50  vol=0.90   # disco bass
+@instr 03  a=0   d=15   s=0.00  r=25   duty=0.50  vol=0.60   # drum noise
+
+# Phrase 00 — vamp on Am | F | C | G (i–VI–III–VII, the "sensitive
+# female" / "axis of awesome" pop cycle). Bass jumps root to octave
+# each beat. Kick on every downbeat, hat on the "&" of each beat.
+@phrase 00
+  # step   PU1        PU2         TRI         NOI
+  00       E-5        C-5:01      A-2:02      G-2:03
+  01       ---        ---         A-3:02      ---
+  02       A-5        E-5:01      A-2:02      C-3:03
+  03       ---        ---         A-3:02      ---
+  04       G-5        E-5:01      F-2:02      G-2:03
+  05       ---        ---         F-3:02      ---
+  06       F-5        C-5:01      F-2:02      C-3:03
+  07       E-5        C-5:01      F-3:02      ---
+  08       G-5        E-5:01      C-3:02      G-2:03
+  09       ---        ---         C-4:02      ---
+  0a       E-5        C-5:01      C-3:02      C-3:03
+  0b       G-5        E-5:01      C-4:02      ---
+  0c       A-5        E-5:01      G-2:02      G-2:03
+  0d       G-5        E-5:01      G-3:02      ---
+  0e       E-5        C-5:01      G-2:02      C-3:03
+  0f       D-5        A-4:01      G-3:02      ---

@@ -76,8 +76,11 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
             let mut cur_instr: Option<u8> = None;
             let mut cur_vol: Option<u8> = None;
             let mut sounding = false;
+            // Stage 23 polymeter: a channel shorter than the phrase cycles
+            // inside it; the NSF gets the unrolled result.
+            let len = (song.channel_length[ch].max(1) as usize).min(STEPS_PER_PHRASE);
             for step in 0..STEPS_PER_PHRASE {
-                let cell = phrase.cells[step][ch];
+                let cell = phrase.cells[step % len][ch];
                 let ev = &mut pat.rows[step][ch];
                 match cell.note {
                     Some(n) => {
@@ -132,12 +135,16 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
         patterns.push(pat);
     }
 
-    let order: Vec<usize> = if song.order.is_empty() {
+    let (flat_order, flat_loop) = song.flat_order();
+    let (order, loop_pos) = if flat_order.is_empty() {
         warnings.push("no order list; playing all phrases in index order".into());
-        (0..song.phrases.len()).collect()
+        ((0..song.phrases.len()).collect::<Vec<usize>>(), 0)
     } else {
-        song.order.clone()
+        (flat_order, flat_loop)
     };
+    if song.has_groove() {
+        warnings.push("@groove is synth-only; the driver's row clock is fixed, so the NSF plays straight".into());
+    }
     if low_notes > 0 {
         warnings.push(format!("{} pulse notes below A-1 clamp to the lowest 2A03 period", low_notes));
     }
@@ -152,7 +159,7 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
         rows_per_pattern: STEPS_PER_PHRASE as u8,
         patterns,
         order,
-        loop_pos: song.loop_pos.min(song.order.len().saturating_sub(1)),
+        loop_pos,
         instruments,
         samples,
     };

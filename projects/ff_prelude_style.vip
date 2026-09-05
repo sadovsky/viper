@@ -1,0 +1,45 @@
+# ff_prelude_style.vip
+#
+# JRPG-title-screen pastiche — continuous ascending-then-descending
+# pulse arpeggios with a sustained melody floating above. The genre's
+# signature move: harp-like perpetual motion on PU1, held chord tone
+# on PU2, slow root on TRI, no drums (no drums ever).
+#
+# Not a transcription. The arpeggio-as-accompaniment texture is a
+# Renaissance-era technique adopted by the entire JRPG genre; the
+# specific notes here are a plain I–iii–IV–V in C major.
+#
+# Load: :e projects/ff_prelude_style.vip
+# Play: <space>
+
+@meta  title="title-screen prelude pastiche"  style="JRPG"  key="C major"
+
+@song  bpm=100  edit_step=1  current=00  order=[00]  loop=00
+
+# Instruments — soft attacks, long releases, no noise channel used.
+@instr 00  a=1   d=40   s=0.60  r=80   duty=0.50  vol=0.60   # arp pulse
+@instr 01  a=15  d=80   s=0.85  r=320  duty=0.50  vol=0.65   # held melody
+@instr 02  a=5   d=50   s=0.90  r=260  duty=0.50  vol=0.80   # root bass
+@instr 03  a=0   d=0    s=0.00  r=0    duty=0.50  vol=0.00   # unused
+
+# Phrase 00 — one full measure, four chords, PU1 arpeggiates each
+# chord as 1-3-5-8 ascending, PU2 holds the top of the chord for color,
+# TRI anchors the root on the downbeat. Empty drums by design.
+@phrase 00
+  # step   PU1        PU2         TRI         NOI
+  00       C-4        E-5:01      C-3:02      ---
+  01       E-4        ---         ---         ---
+  02       G-4        ---         ---         ---
+  03       C-5        ---         ---         ---
+  04       E-4        G-5:01      E-3:02      ---
+  05       G-4        ---         ---         ---
+  06       B-4        ---         ---         ---
+  07       E-5        ---         ---         ---
+  08       F-4        A-5:01      F-3:02      ---
+  09       A-4        ---         ---         ---
+  0a       C-5        ---         ---         ---
+  0b       F-5        ---         ---         ---
+  0c       G-4        B-5:01      G-3:02      ---
+  0d       B-4        ---         ---         ---
+  0e       D-5        ---         ---         ---
+  0f       G-5        ---         ---         ---
