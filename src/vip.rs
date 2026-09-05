@@ -58,6 +58,9 @@ fn decode_note(s: &str) -> Option<u8> {
 }
 
 fn encode_cell(c: Cell) -> String {
+    if c.hold {
+        return "===".to_string();
+    }
     match c.note {
         None => "---".to_string(),
         Some(n) => {
@@ -75,6 +78,9 @@ fn encode_cell(c: Cell) -> String {
 fn decode_cell(s: &str) -> Result<Cell> {
     if s == "---" || s.is_empty() {
         return Ok(Cell::default());
+    }
+    if s == "===" || s.starts_with("===:") {
+        return Ok(Cell::hold());
     }
     let mut parts = s.split(':');
     let note_s = parts.next().ok_or_else(|| anyhow!("empty cell token"))?;
@@ -97,7 +103,7 @@ fn decode_cell(s: &str) -> Result<Cell> {
         .map(decode_fx)
         .transpose()?
         .flatten();
-    Ok(Cell { note: Some(note), instr, vol, fx })
+    Ok(Cell { note: Some(note), instr, vol, fx, hold: false })
 }
 
 /// FORMAT.md effect column is `CPP`: a single-char command (letter or digit)
@@ -359,6 +365,26 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
         }
     }
 
+    // A hold with no note above it in the same phrase (rows > 0) sustains
+    // nothing; keep it (the synth idles, the compiler emits nothing) but say so.
+    let mut orphans = 0;
+    for p in &song.phrases {
+        for ch in 0..CHANNELS {
+            let mut sounding = false;
+            for s in 0..STEPS_PER_PHRASE {
+                let c = p.cells[s][ch];
+                if c.note.is_some() { sounding = true; }
+                else if c.hold {
+                    // a hold on row 0 continues the previous phrase: assume it sounds
+                    if s == 0 { sounding = true; } else if !sounding { orphans += 1; }
+                }
+                else { sounding = false; }
+            }
+        }
+    }
+    if orphans > 0 {
+        warnings.push(format!("{} hold cell(s) (===) have no note above them", orphans));
+    }
     if song.phrases.is_empty() {
         song.phrases.push(Phrase::default());
     }
@@ -698,13 +724,13 @@ mod tests {
 
     #[test]
     fn fx_round_trip() {
-        let cell = Cell { note: Some(60), instr: 1, vol: 0x0F, fx: Some((b'A', 0x42)) };
+        let cell = Cell { note: Some(60), instr: 1, vol: 0x0F, fx: Some((b'A', 0x42)), hold: false };
         let s = encode_cell(cell);
         assert_eq!(s, "C-4:01:0F:A42");
         let back = decode_cell(&s).unwrap();
         assert_eq!(back.fx, Some((b'A', 0x42)));
         // No fx field → round-trip without trailing :
-        let bare = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        let bare = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };
         assert_eq!(encode_cell(bare), "C-4:00:00");
     }
 
@@ -734,7 +760,7 @@ mod tests {
         song.artist = "viper".into();
         song.driver = Some(("driver/build/driver.bin".into(), "driver/build/driver.sym".into()));
         song.samples.push(crate::DpcmRef { name: "kick".into(), path: "samples/kick.dmc".into(), rate: 13 });
-        song.phrases[1].cells[3][4] = Cell { note: Some(61), instr: 0, vol: 0, fx: None };
+        song.phrases[1].cells[3][4] = Cell { note: Some(61), instr: 0, vol: 0, fx: None, hold: false };
         let text = to_vip(&song);
         let (back, warns) = from_vip(&text).unwrap();
         assert!(warns.is_empty(), "{:?}", warns);
@@ -748,6 +774,23 @@ mod tests {
         let (again, _) = from_vip("@dpcm 00 name=k path=k.dmc\n").unwrap();
         assert_eq!(again.samples[0].rate, 15);
         assert_eq!(back.phrases[1].cells[3][4].note, Some(61));
+    }
+
+    #[test]
+    fn hold_cells_round_trip_and_orphans_warn() {
+        let mut song = Song::default();
+        song.phrases[0].cells[0][0] = Cell { note: Some(60), instr: 1, vol: 0, fx: None, hold: false };
+        song.phrases[0].cells[1][0] = Cell::hold();
+        song.phrases[0].cells[2][0] = Cell::hold();
+        let text = to_vip(&song);
+        assert!(text.contains("===             ---"), "{}", text);
+        let (back, warns) = from_vip(&text).unwrap();
+        assert!(warns.is_empty(), "{:?}", warns);
+        assert!(back.phrases[0].cells[1][0].hold && back.phrases[0].cells[2][0].hold);
+        assert_eq!(back.phrases[0].cells[1][0].note, None);
+        let (_, warns) = from_vip("@phrase 00\n  00 --- --- --- --- ---\n  01 === --- --- --- ---\n").unwrap();
+        assert_eq!(warns.len(), 1, "{:?}", warns);
+        assert!(decode_cell("===:00").unwrap().hold);
     }
 
     #[test]

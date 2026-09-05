@@ -7,6 +7,7 @@ mod audio;
 mod compile;
 mod dpcm;
 mod gen;
+mod import;
 mod midi;
 mod modulation;
 mod sprite;
@@ -53,6 +54,16 @@ pub(crate) struct Cell {
     pub vol: u8,
     /// Effect column: (cmd, param). None = no effect.
     pub fx: Option<(u8, u8)>,
+    /// Hold cell (`===`): keep the previous note on this channel sounding,
+    /// no release, no retrigger. Implies `note == None` and no instr/vol/fx.
+    pub hold: bool,
+}
+
+impl Cell {
+    /// The `===` cell.
+    pub fn hold() -> Self {
+        Cell { hold: true, ..Default::default() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -945,7 +956,16 @@ impl App {
         let cell = &mut self.phrase_mut().cells[s][c];
         cell.note = Some(note);
         cell.instr = instr;
+        cell.hold = false;
         // Auto-advance by edit_step (1 = classic tracker, 4 = one note per beat).
+        let step = self.song.edit_step.max(1);
+        self.cursor_step = (self.cursor_step + step).min(STEPS_PER_PHRASE - 1);
+    }
+
+    /// `=` in insert mode: a hold cell, then advance like a note.
+    fn insert_hold(&mut self) {
+        let (s, c) = (self.cursor_step, self.cursor_ch);
+        self.phrase_mut().cells[s][c] = Cell::hold();
         let step = self.song.edit_step.max(1);
         self.cursor_step = (self.cursor_step + step).min(STEPS_PER_PHRASE - 1);
     }
@@ -1398,7 +1418,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         let mut spans = vec![Span::styled(format!(" {} {:02X} ", glyph, i), label_style)];
         for (c, cell) in row.iter().enumerate() {
             let has_note = cell.note.is_some();
-            let note_text = note_name(cell.note);
+            let note_text = if cell.hold { "===".to_string() } else { note_name(cell.note) };
             let instr_text = if has_note {
                 format!("{:02X}", cell.instr)
             } else { "--".into() };
@@ -1410,7 +1430,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 None => "---".into(),
             };
 
-            let note_color = if has_note { theme.note } else { theme.dim };
+            let note_color = if has_note { theme.note } else if cell.hold { theme.instr } else { theme.dim };
             let instr_color = if has_note { theme.instr } else { theme.dim };
             let vol_color = if has_note && cell.vol > 0 { theme.vol } else { theme.dim };
             let fx_color = if cell.fx.is_some() { theme.fx } else { theme.dim };
@@ -1515,6 +1535,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row("0 / $",           "first / last channel (PU1 ↔ NOI)"),
         row("g / G",            "top / bottom of phrase"),
         row("x",                "clear cell (count: Nx clears N cells down column)"),
+        row("r=",               "turn the cell into a hold (===): the note above keeps sounding"),
         row("dd / yy / cc",     "delete / yank / change current step row"),
         row("dab / yab / cab",  "delete / yank / change current bar (4 steps)"),
         row("dip / yip / cip",  "delete / yank / change whole phrase"),
@@ -2070,6 +2091,12 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.pending = Pending::None;
             match key.code {
                 KeyCode::Esc => { app.status = "cancelled".into(); }
+                KeyCode::Char('=') => {
+                    app.snapshot();
+                    let (s, ch) = (app.cursor_step, app.cursor_ch);
+                    app.phrase_mut().cells[s][ch] = Cell::hold();
+                    app.status = format!("[{:02X},ch{}] is now a hold (===)", s, ch + 1);
+                }
                 KeyCode::Char(c) => {
                     if let Some(note) = App::piano_row_note(c, app.insert_octave) {
                         app.snapshot();
@@ -2078,6 +2105,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                         let cell = &mut app.phrase_mut().cells[s][ch];
                         cell.note = Some(note);
                         cell.instr = instr;
+                        cell.hold = false;
                         app.status = format!(
                             "replaced [{:02X},ch{}] with {}",
                             s, ch + 1, note_name(Some(note)),
@@ -2279,6 +2307,9 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
         KeyCode::Char('>') => {
             app.insert_octave = (app.insert_octave + 1).min(8);
             app.status = format!("octave {}", app.insert_octave);
+        }
+        KeyCode::Char('=') => {
+            app.insert_hold();
         }
         KeyCode::Char(c) => {
             if let Some(note) = App::piano_row_note(c, app.insert_octave) {
@@ -3973,7 +4004,7 @@ fn set_cursor_vol(app: &mut App, tok: &str) {
     let (s, c) = (app.cursor_step, app.cursor_ch);
     let cell = app.phrase().cells[s][c];
     if cell.note.is_none() {
-        app.status = "cursor cell has no note — vol only applies to notes".into();
+        app.status = "cursor cell has no note (=== holds the note above) — vol only applies to notes".into();
         return;
     }
     let v = match u8::from_str_radix(tok, 16) {
@@ -3995,7 +4026,7 @@ fn set_cursor_vol(app: &mut App, tok: &str) {
 fn set_cursor_fx(app: &mut App, tok: &str) {
     let (s, c) = (app.cursor_step, app.cursor_ch);
     if app.phrase().cells[s][c].note.is_none() {
-        app.status = "cursor cell has no note — fx only applies to notes".into();
+        app.status = "cursor cell has no note (=== holds the note above) — fx only applies to notes".into();
         return;
     }
     let tok = tok.to_ascii_uppercase();
@@ -4247,7 +4278,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}

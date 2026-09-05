@@ -40,6 +40,7 @@ usage:
   viper dpcm decode in.dmc -o out.wav [--rate 15] [--level 64]   # through the DMC model
   viper dpcm info a.dmc [b.dmc ...] [--rate 15]                  # sizes, levels, drift, budget
   viper dpcm synth kick|snare|hat|tom -o out.wav [--rate 15]     # built-in recipes as WAV
+  viper import song.mid --map map.vmap [-o song.vip]              # MIDI → .vip (see docs/FORMAT.md)
   viper verify song.nsf|writes.log --against other.log [--vip song.vip]
                 [--loops N | --frames N] [--song N] [-o normalized.log]
       diff viper's register-write log against another emulator's dump
@@ -98,6 +99,7 @@ pub fn run(args: &[String]) -> Result<()> {
     match cmd {
         "check" => check(&a),
         "dpcm" => dpcm_cmd(&a),
+        "import" => import_cmd(&a),
         "gen" => gen(&a),
         "fmt" => fmt(&a),
         "compile" => compile_cmd(&a),
@@ -193,6 +195,23 @@ fn gen(a: &Args) -> Result<()> {
             path.display(), song.title, seed, crate::vip::key_name(info.key), info.scale, song.bpm, r.bars, r.unique_phrases, r.lead_density, r.lead_range, r.drum_hits
         );
     }
+    Ok(())
+}
+
+/// `viper import song.mid --map map.vmap -o song.vip`
+fn import_cmd(a: &Args) -> Result<()> {
+    let midi_path = a.positional.first().map(PathBuf::from).context("import: need a .mid path")?;
+    let map_path = a.get("map").map(PathBuf::from).context("import: need --map map.vmap")?;
+    let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| midi_path.with_extension("vip"));
+    let midi = crate::import::parse_midi(&std::fs::read(&midi_path).with_context(|| format!("read {}", midi_path.display()))?)
+        .with_context(|| format!("{}", midi_path.display()))?;
+    let map = crate::import::parse_map(&std::fs::read_to_string(&map_path).with_context(|| format!("read {}", map_path.display()))?)
+        .with_context(|| format!("parsing {}", map_path.display()))?;
+    let (song, report) = crate::import::import(&midi, &map)?;
+    let header = format!("# imported by viper import from {} with {}\n# {}\n", midi_path.display(), map_path.display(), report.summary().replace('\n', "\n# "));
+    std::fs::write(&out, format!("{}{}", header, vip::to_vip(&song))).with_context(|| format!("write {}", out.display()))?;
+    println!("{}", report.summary());
+    println!("→ {}", out.display());
     Ok(())
 }
 

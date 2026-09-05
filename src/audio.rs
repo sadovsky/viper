@@ -405,6 +405,9 @@ fn gate_step(
         }
         let len = (channel_length[ch].max(1) as usize).min(STEPS_PER_PHRASE);
         let cell = phrase.cells[step % len][ch];
+        if cell.hold {
+            continue; // === keeps whatever is sounding, untouched
+        }
         if let Some(n) = cell.note {
             let idx = (cell.instr as usize).min(INSTRUMENTS - 1);
             // vol=0 is treated as "default/full" so notes entered in insert
@@ -841,15 +844,16 @@ mod tests {
                 instr: 0,
                 vol: 0,
                 fx: None,
+                hold: false,
             };
         }
         // NOI hit every step (kick).
         for s in 0..STEPS_PER_PHRASE {
-            p.cells[s][3] = Cell { note: Some(40), instr: 0, vol: 0, fx: None };
+            p.cells[s][3] = Cell { note: Some(40), instr: 0, vol: 0, fx: None, hold: false };
         }
         // DPCM kick on the downbeats.
         for s in (0..STEPS_PER_PHRASE).step_by(8) {
-            p.cells[s][4] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+            p.cells[s][4] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };
         }
         p
     }
@@ -907,7 +911,7 @@ mod tests {
     #[test]
     fn polymeter_wraps_a_short_channel_inside_the_phrase() {
         let mut p = Phrase::default();
-        p.cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        p.cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };
         let instr = [Instrument::default(); INSTRUMENTS];
         let mut len = [STEPS_PER_PHRASE as u8; CHANNELS];
         len[0] = 4;

@@ -108,7 +108,14 @@ fn collect_channel_events(sequence: &[Phrase], ch: usize, loops: u32) -> Vec<Tra
                 ((cell.vol as u32) * 127 / 15).min(127) as u8
             };
             let on_tick = base_tick + gstep as u32 * TICKS_PER_STEP;
-            let off_tick = on_tick + TICKS_PER_STEP;
+            // extend through following hold cells (===)
+            let mut run = 1u32;
+            let mut g = gstep + 1;
+            while g < steps_per_loop as usize && sequence[g / STEPS_PER_PHRASE].cells[g % STEPS_PER_PHRASE][ch].hold {
+                run += 1;
+                g += 1;
+            }
+            let off_tick = on_tick + run * TICKS_PER_STEP;
             events.push(TrackEvent {
                 tick: on_tick,
                 order: 1,
@@ -209,11 +216,11 @@ mod tests {
 
     fn test_phrase() -> Phrase {
         let mut p = Phrase::default();
-        p.cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };  // PU1 C4
-        p.cells[4][0] = Cell { note: Some(64), instr: 0, vol: 0, fx: None };  // PU1 E4
-        p.cells[0][3] = Cell { note: Some(36), instr: 0, vol: 0, fx: None };  // NOI kick
-        p.cells[4][3] = Cell { note: Some(50), instr: 0, vol: 0, fx: None };  // NOI snare
-        p.cells[8][3] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };  // NOI hat
+        p.cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };  // PU1 C4
+        p.cells[4][0] = Cell { note: Some(64), instr: 0, vol: 0, fx: None, hold: false };  // PU1 E4
+        p.cells[0][3] = Cell { note: Some(36), instr: 0, vol: 0, fx: None, hold: false };  // NOI kick
+        p.cells[4][3] = Cell { note: Some(50), instr: 0, vol: 0, fx: None, hold: false };  // NOI snare
+        p.cells[8][3] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };  // NOI hat
         p
     }
 
