@@ -63,11 +63,15 @@ has a subtle tinted background column — "you are here" without shouting.
 ### Side panels (right, ~40% width, stacked)
 
 **Instrument editor** (top third). Live ADSR curve drawn in half-blocks.
-Waveform preview updating on every parameter change. When a note plays,
-the envelope lights up in sequence — attack glows, decay fades, sustain
-holds, release dims. The pulse width displays as a literal square wave
-morphing in real time. Noise instruments show a fluttering dithered
-pattern that actually scans through noise seeds.
+Waveform preview updating on every parameter change. The pulse width
+displays as a literal square wave morphing in real time.
+
+Shipped in Stage 28, with two amendments. The envelope segment belonging
+to the *selected parameter* is highlighted, rather than lighting up in
+sequence as a note plays: an instrument is not bound to a channel anywhere
+in the model, so there is no honest way to know which voice is sounding
+it. And noise instruments get no dithered scan, for the same reason —
+nothing types an instrument as a noise instrument.
 
 **Song / chain view** (middle third). Tiny matrix; columns are
 channels, rows are chain positions. Current position marked with a `►`

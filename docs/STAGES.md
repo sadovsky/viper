@@ -59,7 +59,7 @@ Command mode:
 - `:set theme=nes` / `:set theme=phosphor` — switch color theme
 - `:set still=on|off|toggle` — freeze the tempo-locked breathing animations
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
-- `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`); `:viz off` hides it
+- `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`, `register`); `:viz off` hides it
 - `:sprite load <path> [WxH]` — load a PNG sprite sheet (≤4 opaque colors; cell size defaults to the whole image)
 - `:sprite place <sheet> <idx> <x> <y>` — paint a tile into the viz pane (pane coords are half-block pixels)
 - `:sprite palette <name> <c0> <c1> <c2> <c3>` — define a 4-color palette (hex `#rrggbb` or `transparent`)
@@ -301,6 +301,31 @@ lives in viper.
   through one `mix` primitive that blends RGB numerically but switches
   named ANSI colors at the halfway point, so a user's terminal palette
   still decides what "yellow" is.
+
+- **Stage 28** ✅ — **The panels come alive.** The instrument editor was a
+  flat parameter list; it now draws its ADSR envelope and the waveform that
+  envelope shapes, in half-blocks, beside the list. The segment belonging to
+  the selected parameter is drawn in the accent colour, so `h`/`l` on
+  `attack` visibly moves that ramp — DESIGN.md's "the envelope lights up in
+  sequence" as a note plays was *not* built, because an instrument is not
+  bound to a channel anywhere in the model and there is no honest way to
+  know which voice is sounding it. Below ~54 columns the graphs step aside
+  and the list takes the pane.
+
+  `viz::HalfBlock` is the pixel canvas behind it: five viz renderers had
+  each hand-rolled the same "build a bitmap, collapse row pairs into
+  `▀`/`▄`/`█`" loop, so the sixth copy became a shared type instead. The
+  existing five can migrate onto it as they are touched.
+
+  The queued-scene badge grew DESIGN.md's **queue-drain**: an eight-cell bar
+  that empties toward the launch, counting the sub-step phase as well as
+  whole steps so it drains smoothly rather than in four jerks.
+
+  `:viz register` is the **register panel**: one glyph per cell, note letter
+  or a faint dot, so you read the *shape* of what you are about to paste.
+  DESIGN.md describes "a grid of yanked phrases", which presumes named
+  registers; viper has exactly one unnamed register, so that is what it
+  shows.
 
 ### Generators
 
