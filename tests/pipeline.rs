@@ -90,3 +90,36 @@ fn neutral_style_generates_a_song_that_compiles() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Regression for the driver's order-list lookup: a song with more than
+/// 25 order entries must keep advancing. The RAM-state loop the renderer
+/// detects has to match the loop length computed from the source; when
+/// the driver stalls, the detected loop collapses to a handful of frames.
+#[test]
+fn long_order_lists_keep_playing() {
+    let tmp = std::env::temp_dir().join(format!("viper_longorder_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = tmp.join("song.vip");
+    let out = viper()
+        .args(["gen", "--style"])
+        .arg(root().join("styles/neutral"))
+        .args(["--seed", "3", "-o"])
+        .arg(&vip)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(&vip).unwrap();
+    let order_len = text.lines().find(|l| l.starts_with("@song")).and_then(|l| l.split("order=[").nth(1)).map(|o| o.split(']').next().unwrap().split(',').count()).unwrap();
+    assert!(order_len > 26, "test needs a long order list, got {}", order_len);
+    let nsf = tmp.join("song.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let expected = viper().args(["render"]).arg(&nsf).arg("--vip").arg(&vip).arg("--log").arg(tmp.join("a.log")).output().unwrap();
+    let expected = String::from_utf8_lossy(&expected.stdout);
+    let loop_from_source: u32 = expected.lines().find(|l| l.contains("loop ")).and_then(|l| l.split("loop ").nth(1)).and_then(|s| s.split(' ').next()).and_then(|n| n.parse().ok()).expect("intro/loop line");
+    let detected = viper().args(["render"]).arg(&nsf).arg("--log").arg(tmp.join("b.log")).output().unwrap();
+    let detected = String::from_utf8_lossy(&detected.stdout);
+    let loop_detected: u32 = detected.lines().find(|l| l.starts_with("loop: ")).and_then(|l| l.split(' ').nth(1)).and_then(|n| n.parse().ok()).expect("loop line");
+    assert_eq!(loop_detected, loop_from_source, "driver stalled: detected loop {} vs {} frames from source\n{}", loop_detected, loop_from_source, detected);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
