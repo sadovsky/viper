@@ -33,6 +33,7 @@ viper check song.vip                             # parse + lowering report
 viper compile song.vip --driver driver.bin -o song.nsf
 viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
+viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
 ```
 
 ## Install & run
