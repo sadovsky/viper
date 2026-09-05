@@ -109,6 +109,7 @@ cells is arbitrary; alignment is writer's choice.
 | `@sprite` | sprite sheet reference + palette           | 11    |
 | `@groove` | per-step timing offset table               | 16    |
 | `@meta`   | free-form key=value metadata (author, etc) | any   |
+| `@driver` | NSF driver binary/symbol map + expansion flag | 18    |
 
 ## Parser error handling
 

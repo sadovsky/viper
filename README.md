@@ -188,9 +188,10 @@ mouse-driven DAWs never quite do.
   flip, and frame index to any audio source via a small expression
   language with note-on-triggered animations.
 
-Upcoming: color-domain modulation (rotate, hue, palette swap), WAV/MIDI
-export, song mode, plugin voices. See [`docs/STAGES.md`](docs/STAGES.md)
-for the full roadmap.
+Upcoming: song mode, plugin voices, and the NSF pipeline — compile
+`.vip` to a real NSF, play it back through an emulated 2A03, render
+per-channel stems (see [`docs/NSF.md`](docs/NSF.md)). See
+[`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
 
 ## Contributing
 

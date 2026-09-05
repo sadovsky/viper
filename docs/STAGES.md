@@ -186,3 +186,42 @@ Parameters: attack (ms), decay (ms), sustain (0–1), release (ms), duty (0.05�
 - Possible later: `:render out.mp4` recording the viz synced to the bounce.
 - **Stage 16 — Song mode.** Phrases → chains → song, groove/swing, per-channel track length (polymeter).
 - **Stage 17 — Plugin voices.** Load external SID/VRC6/FDS emulator cores as additional voice types for that extended-chip flavor.
+
+### NSF pipeline
+
+Design doc: [`NSF.md`](NSF.md). These stages turn viper into the front
+end and compiler for real 2A03 output: songs compile to NSF, play back
+through an emulated APU, and render to per-channel stems. The first
+consumer is [nintendo-metal](https://github.com/sadovsky/nintendo-metal),
+which owns the 6502 driver and the genre style; nothing album-specific
+lives in viper.
+
+- **Stage 18 — IR + NSF emitter (`viper-nsf`).** Lower `Song` to a
+  channel-indexed, frame-timestamped event IR (`note off vol duty retrig
+  slide vibrato arp env_reset dpcm loop jump`), serialize it to a
+  driver's bytecode, lay out period tables and `$C000`-aligned DPCM
+  samples, write the 128-byte NSF header and PRG banks. viper links
+  against an external `driver.bin` + `driver.sym` and pins a driver ABI
+  version. `@driver` directive and retrig/duty/env_reset effect columns
+  in `FORMAT.md`. Channel table carries an `expansion` flag so VRC6 rows
+  are just more channels. Exit: `projects/stress_melodeath.vip` compiles
+  to an NSF that plays in Mesen.
+- **Stage 19 — APU-backed playback (`viper-apu`).** FFI to Nes_Snd_Emu.
+  `space` compiles on play, runs the driver in a minimal 6502 host, and
+  feeds register writes to the APU core; the audio thread pulls PCM from
+  it. The atomic beat counter stays the clock and `VizFrame` reads from
+  APU-side state so the visualizer is untouched. Exit: the Stage 18 NSF
+  plays in the TUI with the playhead locked to it.
+- **Stage 20 — Register-write log.** Every render dumps `(frame, addr,
+  value)` in NSFPlay's log format. Golden-log test for the stress song.
+  Exit: log diffs clean against NSFPlay headless.
+- **Stage 21 — Stems + triggers.** `viper render song.nsf --stems out/
+  --triggers out/drums.mid`: one deterministic WAV per channel (DPCM
+  split per sample ID), plus a MIDI file with one note per drum hit for
+  DAW sampler layering. Bit-identical output for the same NSF.
+- **Stage 22 — Style interface + `viper gen`.** Plug-in boundary in the
+  generation layer: a style directory supplies scales, riff templates,
+  harmonization rules, drum vocabulary, form grammar, and album-level
+  constraints. viper ships the interface and a neutral style; genre
+  styles live downstream. `viper gen --style <dir> --seed N` is
+  deterministic and records seed + style version in `@meta`.
