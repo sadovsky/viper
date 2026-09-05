@@ -40,6 +40,10 @@ pub struct Riff {
     pub fx: Option<(u8, u8)>,
     /// Octave for the lead line.
     pub octave: i32,
+    /// Volume accents: (on-beat volume, off-beat volume), from `accent=FA`.
+    pub accent: Option<(u8, u8)>,
+    /// Probability that a lead hit (not the first of a bar) slides in.
+    pub slide: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +63,8 @@ pub struct Section {
     /// Probability that this section carries the style's motif.
     pub motif: f32,
     pub crash_end: bool,
+    /// Volume swell from quiet to full across the section's bars.
+    pub swell: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -275,7 +281,7 @@ impl Style {
                         Some(i) => (args[..i].to_string(), args[i..].trim()),
                         None => bail!("{}: missing name", ctx()),
                     };
-                    let mut r = Riff { name, rhythm: vec![true; 16], contour: "walk".into(), harmony: "third".into(), bass: "roots".into(), lead_instr: 0, harm_instr: 1, bass_instr: 2, pair: 1, fx: None, octave: 5 };
+                    let mut r = Riff { name, rhythm: vec![true; 16], contour: "walk".into(), harmony: "third".into(), bass: "roots".into(), lead_instr: 0, harm_instr: 1, bass_instr: 2, pair: 1, fx: None, octave: 5, accent: None, slide: 0.0 };
                     let instr_of = |v: &str, st: &Style| -> Result<u8> {
                         if let Some(&i) = st.instr_names.get(v) { return Ok(i); }
                         u8::from_str_radix(v, 16).map_err(|_| anyhow!("unknown instrument {:?}", v))
@@ -297,6 +303,13 @@ impl Style {
                             "pair" => r.pair = v.parse::<usize>().with_context(ctx)?.max(1),
                             "fx" => r.fx = parse_fx(&v),
                             "octave" => r.octave = v.parse().with_context(ctx)?,
+                            "accent" => {
+                                let b = v.as_bytes();
+                                if b.len() != 2 { bail!("{}: accent wants two hex digits (on-beat, off-beat)", ctx()); }
+                                let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+                                r.accent = Some((hex(b[0]).ok_or_else(|| anyhow!("{}: bad accent", ctx()))?, hex(b[1]).ok_or_else(|| anyhow!("{}: bad accent", ctx()))?));
+                            }
+                            "slide" => r.slide = v.parse().with_context(ctx)?,
                             _ => {}
                         }
                     }
@@ -326,7 +339,7 @@ impl Style {
                         Some(i) => (args[..i].to_string(), args[i..].trim()),
                         None => bail!("{}: missing name", ctx()),
                     };
-                    let mut s = Section { name, bars: vec![2], riffs: Vec::new(), drums: Vec::new(), repeat: 1, motif: 0.0, crash_end: false };
+                    let mut s = Section { name, bars: vec![2], riffs: Vec::new(), drums: Vec::new(), repeat: 1, motif: 0.0, crash_end: false, swell: false };
                     for (k, v) in kv(rest) {
                         match k.as_str() {
                             "bars" => s.bars = list(&v).iter().map(|t| t.parse::<usize>()).collect::<Result<_, _>>().with_context(ctx)?,
@@ -335,6 +348,7 @@ impl Style {
                             "repeat" => s.repeat = v.parse::<usize>().with_context(ctx)?.max(1),
                             "motif" => s.motif = v.parse().with_context(ctx)?,
                             "end" => s.crash_end = v == "crash",
+                            "swell" => s.swell = v == "1" || v == "on",
                             _ => {}
                         }
                     }
@@ -387,7 +401,8 @@ impl Style {
         if self.tempo_min == 0 || self.tempo_max < self.tempo_min { bail!("bad @tempo range"); }
         for f in &self.forms {
             for s in f {
-                if !self.sections.iter().any(|x| &x.name == s) {
+                let (name, _) = split_transpose(s);
+                if !self.sections.iter().any(|x| x.name == name) {
                     bail!("@form references unknown section {:?}", s);
                 }
             }
@@ -411,6 +426,16 @@ impl Style {
         let file = if dir.is_dir() { dir.join("style.vps") } else { dir.to_path_buf() };
         let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
         Self::parse(&text).with_context(|| format!("parsing {}", file.display()))
+    }
+}
+
+/// `chorus+3` → ("chorus", 3); `verse` → ("verse", 0).
+pub fn split_transpose(tok: &str) -> (&str, i32) {
+    if let Some(i) = tok.find(['+', '-']) {
+        let (name, n) = tok.split_at(i);
+        (name, n.parse().unwrap_or(0))
+    } else {
+        (tok, 0)
     }
 }
 
@@ -596,7 +621,11 @@ fn lead_bar(ctx: &mut Ctx, riff: &Riff, chord: Chord, bar_in_section: usize, use
     }
     for (i, &s) in hits.iter().enumerate() {
         let n = ctx.degree_note(pitches[i], oct);
-        out[s] = Some((n, riff.fx));
+        let mut fx = riff.fx;
+        if i > 0 && riff.slide > 0.0 && fx.is_none() && ctx.rng.chance(riff.slide) {
+            fx = Some((b'S', 0x04));
+        }
+        out[s] = Some((n, fx));
     }
     out
 }
@@ -756,9 +785,11 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
         None
     };
 
-    for (si, sname) in form.iter().enumerate() {
+    for (si, stok) in form.iter().enumerate() {
+        let (sname_str, transpose) = split_transpose(stok);
+        let sname = &sname_str.to_string();
         let section = style.sections.iter().find(|s| &s.name == sname).unwrap().clone();
-        let phrases: Vec<Phrase> = if let Some(p) = realized.get(sname) {
+        let mut phrases: Vec<Phrase> = if let Some(p) = realized.get(sname) {
             p.clone()
         } else {
             let bars = *ctx.pick(&section.bars);
@@ -777,9 +808,19 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
                 let last = b == bars - 1;
                 let (noi, dpcm) = drum_cells(style, &drums, last && bars > 1, b == 0 && si > 0, &mut ctx.rng);
                 let mut ph = Phrase::default();
+                let vol_at = |s: usize| -> u8 {
+                    let base = match riff.accent { Some((on, off)) => if s % 4 == 0 { on } else { off }, None => 0 };
+                    if section.swell && bars > 1 {
+                        // 6..15 across the bars; accents scale within it
+                        let top = 6 + (9 * b / (bars - 1).max(1)) as u8;
+                        if base == 0 { top } else { (base as u32 * top as u32 / 15).max(1) as u8 }
+                    } else {
+                        base
+                    }
+                };
                 for s in 0..STEPS_PER_PHRASE {
-                    if let Some((n, fx)) = lead[s] { ph.cells[s][0] = cell(n, riff.lead_instr, fx); }
-                    if let Some((n, fx)) = harm[s] { ph.cells[s][1] = cell(n, riff.harm_instr, fx); }
+                    if let Some((n, fx)) = lead[s] { let mut c = cell(n, riff.lead_instr, fx); c.vol = vol_at(s); ph.cells[s][0] = c; }
+                    if let Some((n, fx)) = harm[s] { let mut c = cell(n, riff.harm_instr, fx); c.vol = vol_at(s); ph.cells[s][1] = c; }
                     if let Some(n) = bass[s] { ph.cells[s][2] = cell(n, riff.bass_instr, None); }
                     if let Some((n, i)) = noi[s] { ph.cells[s][3] = cell(n, i, None); }
                     if let Some(n) = dpcm[s] { ph.cells[s][4] = cell(n, 0, None); }
@@ -798,6 +839,17 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
             realized.insert(sname.clone(), out.clone());
             out
         };
+        if transpose != 0 {
+            for ph in phrases.iter_mut() {
+                for row in ph.cells.iter_mut() {
+                    for c in row.iter_mut().take(3) {
+                        if let Some(n) = c.note {
+                            c.note = Some((n as i32 + transpose).clamp(24, 119) as u8);
+                        }
+                    }
+                }
+            }
+        }
         if si == 1 && loop_pos.is_none() {
             loop_pos = Some(order.len());
         }
@@ -885,6 +937,29 @@ mod tests {
         assert!(r.drum_hits > 0);
         let c = generate(&st, &GenParams { seed: 8, ..Default::default() }).unwrap();
         assert_ne!(crate::vip::to_vip(&a), crate::vip::to_vip(&c));
+    }
+
+    #[test]
+    fn transposed_form_sections_shift_pitched_channels_only() {
+        let text = NEUTRAL.replace("@form intro verse chorus verse chorus bridge chorus outro", "@form intro verse chorus+3 outro");
+        let st = Style::parse(&text).unwrap();
+        let a = generate(&st, &GenParams { seed: 5, form: Some(0), ..Default::default() }).unwrap();
+        let base = generate(&Style::parse(&NEUTRAL.replace("@form intro verse chorus verse chorus bridge chorus outro", "@form intro verse chorus outro")).unwrap(), &GenParams { seed: 5, form: Some(0), ..Default::default() }).unwrap();
+        // same bar count; chorus bars differ by +3 on PU1/PU2/TRI, drums identical
+        assert_eq!(a.order.len(), base.order.len());
+        let mut shifted = 0;
+        for (x, y) in a.order.iter().zip(base.order.iter()) {
+            let (pa, pb) = (&a.phrases[*x], &base.phrases[*y]);
+            for s in 0..STEPS_PER_PHRASE {
+                assert_eq!(pa.cells[s][3].note, pb.cells[s][3].note);
+                assert_eq!(pa.cells[s][4].note, pb.cells[s][4].note);
+                if let (Some(n1), Some(n2)) = (pa.cells[s][0].note, pb.cells[s][0].note) {
+                    if n1 != n2 { assert_eq!(n1, n2 + 3); shifted += 1; }
+                }
+            }
+        }
+        assert!(shifted > 0);
+        assert_eq!(split_transpose("chorus-2"), ("chorus", -2));
     }
 
     #[test]

@@ -61,10 +61,10 @@ Generation is deterministic per (style, seed, key, bpm). A style supplies:
 | `@progression [name=..] i VI VII` | roman numerals; `b`/`#` prefixes for chromatic roots (`bII`, `bV`) |
 | `@instr NN name=.. a= d= s= r= duty= vol=` | instruments, same syntax as `.vip` |
 | `@noise hat=C-6/03 open=G-5/03 crash=C-5/04` | NOI notes and instruments for the drum tokens |
-| `@riff name rhythm=x.xx.. contour= harmony= bass= lead= harm= bassi= pair= fx= octave=` | a riff template |
+| `@riff name rhythm=x.xx.. contour= harmony= bass= lead= harm= bassi= pair= fx= octave= accent=FA slide=0.1` | a riff template; `accent` = on-beat/off-beat volumes, `slide` = chance a lead hit portamentos in |
 | `@drums name noi=".." dpcm=".."` | 16 tokens each: `h o c` on NOI, `k s t` on DPCM |
-| `@section name bars=2,4 riffs=a,b drums=x,y repeat=2 motif=0.6 end=crash` | a section recipe |
-| `@form intro riffA verse ...` | a song form; several = weighted variation |
+| `@section name bars=2,4 riffs=a,b drums=x,y repeat=2 motif=0.6 end=crash swell=1` | a section recipe; `swell` ramps volume across its bars |
+| `@form intro riffA verse chorus+3 outro+3` | a song form; several = weighted variation; `+N`/`-N` transposes that occurrence by semitones (drums untouched) |
 | `@motif 0 2 3 2 0 -1 0 4` | scale-degree offsets of the shared motif |
 | `@title adj=.. noun=..` | title word lists |
 
