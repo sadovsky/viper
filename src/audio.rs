@@ -79,6 +79,11 @@ pub struct Transport {
     pub frames_per_row: f64,
     /// Set by the audio thread when the APU engine could not start.
     pub engine_error: Option<String>,
+    /// The DPCM preview bank (built-in, or the song's `@dpcm` files
+    /// decoded) and a generation counter so the callback can swap it
+    /// without allocating.
+    pub bank: Arc<Vec<dpcm::Sample>>,
+    pub bank_generation: u64,
 }
 
 /// One voice's state at the end of an audio callback. `env_level` is the
@@ -137,6 +142,8 @@ impl Default for Transport {
             nsf_generation: 0,
             frames_per_row: 4.0,
             engine_error: None,
+            bank: Arc::new(dpcm::default_bank()),
+            bank_generation: 0,
         }
     }
 }
@@ -302,7 +309,7 @@ impl Voice {
                 return 0.0;
             }
             self.env = EnvPhase::Sustain;
-            self.sample_pos += dpcm::RATE_HZ / sr;
+            self.sample_pos += s.rate_hz / sr;
             return s.wave[idx] * self.vel * 0.9;
         }
         self.advance_env(sr);
@@ -430,6 +437,7 @@ pub fn bounce_to_wav(
     bpm: u16,
     loops: u32,
     sample_rate: u32,
+    bank: &[dpcm::Sample],
     groove: &[i16; 16],
     channel_length: &[u8; CHANNELS],
 ) -> Result<u32> {
@@ -443,7 +451,6 @@ pub fn bounce_to_wav(
     let base_spb = (sr_f * 60.0 / bpm.max(1) as f32 / 4.0).max(1.0) as u32;
     let total_steps = (loops as usize).saturating_mul(STEPS_PER_PHRASE * sequence.len());
     let tail_cap = sample_rate * 2;
-    let bank = dpcm::default_bank();
 
     let mut voices = new_voices();
     let mut samples: Vec<f32> = Vec::with_capacity(
@@ -608,7 +615,8 @@ where
     let out_channels = config.channels as usize;
 
     let mut voices = new_voices();
-    let bank = dpcm::default_bank();
+    let mut bank: Arc<Vec<dpcm::Sample>> = Arc::new(dpcm::default_bank());
+    let mut bank_generation: u64 = 0;
     let mut sample_in_step: u32 = 0;
     let mut last_step: usize = usize::MAX;
     let mut was_playing = false;
@@ -662,6 +670,10 @@ where
                 }
             }
 
+            if tr.bank_generation != bank_generation {
+                bank = tr.bank.clone();
+                bank_generation = tr.bank_generation;
+            }
             // Engine selection: APU only when a compiled NSF is available.
             let use_apu = tr.engine == Engine::Apu && tr.nsf.is_some();
 
@@ -848,7 +860,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let instr = [Instrument::default(); INSTRUMENTS];
         let phrase = demo_phrase();
-        let frames = bounce_to_wav(&path, &[phrase], &instr, 140, 1, 44_100, &[0; 16], &[16; CHANNELS])
+        let frames = bounce_to_wav(&path, &[phrase], &instr, 140, 1, 44_100, &dpcm::default_bank(), &[0; 16], &[16; CHANNELS])
             .expect("bounce should succeed");
 
         // At 140 BPM, 16 steps = 60/140 * 4 = ~1.714 sec, plus release tail.
@@ -876,7 +888,7 @@ mod tests {
     fn bounce_rejects_zero_loops() {
         let path = std::env::temp_dir().join("viper_bounce_zero.wav");
         let instr = [Instrument::default(); INSTRUMENTS];
-        let err = bounce_to_wav(&path, &[Phrase::default()], &instr, 140, 0, 44_100, &[0; 16], &[16; CHANNELS])
+        let err = bounce_to_wav(&path, &[Phrase::default()], &instr, 140, 0, 44_100, &dpcm::default_bank(), &[0; 16], &[16; CHANNELS])
             .expect_err("zero loops should fail");
         assert!(err.to_string().contains("loops"));
     }

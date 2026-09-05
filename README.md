@@ -35,6 +35,7 @@ viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
 viper verify song.nsf --against fceux.log --vip song.vip  # diff vs another emulator
 viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
+viper dpcm encode kick.wav -o kick.dmc                  # hand-crafted drum samples
 ```
 
 ## Install & run

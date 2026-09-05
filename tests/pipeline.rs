@@ -209,3 +209,41 @@ fn long_order_lists_keep_playing() {
     assert_eq!(loop_detected, loop_from_source, "driver stalled: detected loop {} vs {} frames from source\n{}", loop_detected, loop_from_source, detected);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Hand-crafted DPCM end to end: synth a source, encode it, reference it
+/// from a .vip through @dpcm, compile against the fixture driver, and see
+/// the sample trigger in the render. Renders must be byte-identical.
+#[test]
+fn custom_dpcm_bank_round_trip() {
+    let tmp = std::env::temp_dir().join(format!("viper_dpcm_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for name in ["kick", "snare"] {
+        let out = viper().args(["dpcm", "synth", name, "-o"]).arg(tmp.join(format!("{}.wav", name))).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = viper().args(["dpcm", "encode"]).arg(tmp.join(format!("{}.wav", name))).arg("-o").arg(tmp.join(format!("{}.dmc", name))).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let dmc = std::fs::read(tmp.join(format!("{}.dmc", name))).unwrap();
+        assert_eq!(dmc.len() % 16, 1);
+    }
+    let info = viper().args(["dpcm", "info"]).arg(tmp.join("kick.dmc")).arg(tmp.join("snare.dmc")).output().unwrap();
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains("drift +0"), "{}", info);
+    let vip = "@song bpm=150 order=[00] loop=00\n@dpcm 00 name=kick path=kick.dmc\n@dpcm 01 name=snare path=snare.dmc\n@phrase 00\n  00 --- --- --- --- C-4\n  04 --- --- --- --- C#4\n  08 --- --- --- --- C-4\n  0C --- --- --- --- C#4\n";
+    std::fs::write(tmp.join("song.vip"), vip).unwrap();
+    let out = viper().args(["compile"]).arg(tmp.join("song.vip")).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(tmp.join("song.nsf")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("0 samples)"), "samples should be in the NSF: {}", stdout);
+    let mut logs = Vec::new();
+    for i in 0..2 {
+        let out = viper().args(["render"]).arg(tmp.join("song.nsf")).arg("--vip").arg(tmp.join("song.vip")).arg("--triggers").arg(tmp.join(format!("d{}.mid", i))).arg("--log").arg(tmp.join(format!("l{}.log", i))).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(s.contains("hits"), "{}", s);
+        logs.push(std::fs::read(tmp.join(format!("l{}.log", i))).unwrap());
+    }
+    assert_eq!(logs[0], logs[1]);
+    let log = String::from_utf8_lossy(&logs[0]);
+    assert!(log.lines().any(|l| l.contains(" 4015 1F")), "DPCM start expected in the log");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
