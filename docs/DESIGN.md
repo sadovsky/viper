@@ -90,6 +90,13 @@ log ("▸ scene B queued · step 0c · ch2 muted").
 
 ## The stuff that makes it feel alive
 
+> **Status.** The playhead character and the breath system below shipped in
+> Stage 26 (see [`STAGES.md`](STAGES.md)), along with `:set still` for
+> anyone who wants the motion off. The stacked three-phrase layout, ghost
+> command preview, diff mode, the context-aware help overlay, the live
+> instrument panel, the queue-drain bar, and phosphor scanlines are still
+> only described here.
+
 ### The playhead is a character, not a cursor
 
 A glyph (`◆`) travels down the step column when playing. It leaves a

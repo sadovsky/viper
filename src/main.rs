@@ -1332,7 +1332,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     // renders its header as a lit chip — DESIGN.md's "channel header letter
     // lights up on trigger." At typical tempos a step is ~100ms, so presence-
     // based highlighting reads as a ~one-step LED blink per hit.
-    let mut header = vec![Span::raw("     ")];
+    let mut header = vec![Span::raw("      ")];
     for ch in 0..CHANNELS {
         let base = CH_NAMES[ch];
         let muted = app.muted[ch];
@@ -1392,9 +1392,10 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
             2 => ('·', Style::default().fg(mix(theme.playhead_label, theme.viz_bg, 0.70))),
             _ => (' ', Style::default().fg(theme.dim)),
         };
-        // Gutter stays 5 columns wide (glyph, space, 2 hex, space) so the
-        // grid lines up with the header's 5-space lead.
-        let mut spans = vec![Span::styled(format!("{} {:02X} ", glyph, i), label_style)];
+        // Gutter is a fixed 6 columns (pad, glyph, pad, 2 hex, pad) so the
+        // grid lines up with the header's 6-space lead whether or not the
+        // playhead is in it.
+        let mut spans = vec![Span::styled(format!(" {} {:02X} ", glyph, i), label_style)];
         for (c, cell) in row.iter().enumerate() {
             let has_note = cell.note.is_some();
             let note_text = note_name(cell.note);
@@ -1569,6 +1570,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set step=4",     "auto-advance N steps per inserted note"),
         row(":set octave=4",   "base octave for insert-mode piano row (0–8)"),
         row(":set theme=nes",  "color theme (nes / phosphor)"),
+        row(":set still=on",   "freeze the tempo-locked breathing animations (off / toggle)"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
         row(":mute [N]",        "toggle mute on cursor channel (or N: 1-5 / pu1..dpcm)"),
@@ -4290,6 +4292,9 @@ mod tests {
         app
     }
 
+    /// Column the playhead glyph lives in: inside the border, one pad.
+    const GLYPH_X: usize = 2;
+
     /// Render the phrase pane and return one row's symbols.
     fn row_symbols(app: &App, y: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
@@ -4376,12 +4381,16 @@ mod tests {
         // Step rows: border, header, blank, then step 00 — so step N is at
         // y = N + 3.
         let head = row_symbols(&app, 4 + 3);
-        assert_eq!(head[1], "◆");
-        assert_eq!((head[3].as_str(), head[4].as_str()), ("0", "4"), "gutter reads the step index");
-        assert_eq!(row_symbols(&app, 3 + 3)[1], "◇", "one step behind");
-        assert_eq!(row_symbols(&app, 2 + 3)[1], "·", "two steps behind");
-        assert_eq!(row_symbols(&app, 1 + 3)[1], " ", "the trail is only two steps long");
-        assert_eq!(row_symbols(&app, 5 + 3)[1], " ", "nothing ahead of the playhead");
+        assert_eq!(head[GLYPH_X], "◆");
+        assert_eq!(
+            (head[GLYPH_X + 2].as_str(), head[GLYPH_X + 3].as_str()),
+            ("0", "4"),
+            "gutter reads the step index",
+        );
+        assert_eq!(row_symbols(&app, 3 + 3)[GLYPH_X], "◇", "one step behind");
+        assert_eq!(row_symbols(&app, 2 + 3)[GLYPH_X], "·", "two steps behind");
+        assert_eq!(row_symbols(&app, 1 + 3)[GLYPH_X], " ", "the trail is only two steps long");
+        assert_eq!(row_symbols(&app, 5 + 3)[GLYPH_X], " ", "nothing ahead of the playhead");
     }
 
     #[test]
@@ -4394,7 +4403,21 @@ mod tests {
         stopped.playing = false;
         let with = row_symbols(&playing, 4 + 3);
         let without = row_symbols(&stopped, 4 + 3);
-        assert_eq!(with[2..], without[2..]);
-        assert_ne!(with[1], without[1]);
+        assert_eq!(with[GLYPH_X + 1..], without[GLYPH_X + 1..]);
+        assert_ne!(with[GLYPH_X], without[GLYPH_X]);
+        // The header's lead matches the gutter, so PU1's column header sits
+        // over PU1's cells.
+        let first_letter = |row: &[String]| {
+            row.iter()
+                .skip(GLYPH_X + 1)
+                .position(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+                .expect("a letter after the gutter")
+        };
+        let header = row_symbols(&playing, 1);
+        assert_eq!(
+            first_letter(&with),
+            first_letter(&header),
+            "PU1's column header sits over PU1's cells",
+        );
     }
 }
