@@ -57,6 +57,7 @@ Command mode:
 - `:set step=4` — auto-advance N steps per inserted note (edit step)
 - `:set octave=4` — base octave for insert-mode piano row (0–8)
 - `:set theme=nes` / `:set theme=phosphor` — switch color theme
+- `:set still=on|off|toggle` — freeze the tempo-locked breathing animations
 - `:transpose ±N` / `:tr ±N` — shift all pitched notes by N semitones (skips NOI)
 - `:viz` / `:viz <kind>` — toggle visualizer pane (kinds: `bars`, `scope`, `grid`, `orbit`, `sprites`); `:viz off` hides it
 - `:sprite load <path> [WxH]` — load a PNG sprite sheet (≤4 opaque colors; cell size defaults to the whole image)
@@ -274,6 +275,32 @@ lives in viper.
   (including FCEUX's merged INIT + PLAY 1 frame), compares INIT writes as
   a set and PLAY frames exactly, and exits 1 at the first divergence. See
   `NSF.md` § Verification.
+
+### Interface
+
+- **Stage 26** ✅ — **Breath + the playhead as a character.** The first
+  two items from [`DESIGN.md`](DESIGN.md). `Breath` is one tempo-locked
+  oscillator that every animated element reads, so the interface breathes
+  together rather than each widget keeping its own timer: phase comes from
+  the audio thread's step counter plus its sub-step phase (free-running at
+  the song's tempo off the UI tick while stopped), `wave` swells and
+  `pulse` strikes-and-decays, and the named accessors are `pane` (bar
+  downbeat), `mode` (half bar), `cursor` (half beat) and `rec` (beat).
+  Consumers: the pane border brightens on the downbeat, the mode chip
+  pulses on beats 1 and 3, `● REC` breathes instead of blinking, and the
+  cursor breathes at half-beat rate. `:set still=on` collapses every
+  accessor to zero for anyone who wants the screen to hold still; signal-
+  driven feedback (channel LEDs, the playhead) stays live.
+
+  The playhead is now a character: a `◆` travels down a six-column gutter
+  leaving a `◇` `·` trail that fades into the theme's ground, its row
+  strikes bright at the top of each step and settles across it (off the
+  same sub-step phase, so the strike lands with the note), and a row that
+  actually gates something flashes brighter still. Channel-header LEDs ride
+  the envelope instead of switching, so release tails decay. Colors move
+  through one `mix` primitive that blends RGB numerically but switches
+  named ANSI colors at the halfway point, so a user's terminal palette
+  still decides what "yellow" is.
 
 ### Generators
 
