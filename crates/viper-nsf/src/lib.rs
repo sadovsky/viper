@@ -9,6 +9,20 @@
 //! binary plus its ld65 symbol map (ABI v1-v3, see nintendo-metal/driver/ABI.md)
 //! and the emitter appends song data at `song_table`.
 
+// Three lints turned off deliberately, with reasons, rather than worked
+// around. `type_complexity` fires on the channel-state tuples this codebase
+// passes around — `Vec<(usize, usize, NoteEnv)>` and friends — and naming a
+// dozen aliases for them would put a layer of indirection between a call
+// site and what it actually carries. `too_many_arguments` fires on the
+// renderers, which take a frame, an area and the several pieces of state
+// they draw; bundling those into a struct purely to get under a threshold
+// makes them harder to read, not easier. And `needless_range_loop` is
+// almost always wrong here: a loop index in this codebase is a channel, a
+// step or a row — a value with a meaning that gets compared, stored and
+// printed — so `for c in 0..CHANNELS` says what it means and
+// `for (c, x) in xs.iter().enumerate()` says less.
+#![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::needless_range_loop)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;

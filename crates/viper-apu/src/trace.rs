@@ -113,6 +113,21 @@ impl Envelope {
     }
 }
 
+/// The mirror of `apu::envelope_outputs`, driving this module's copy.
+#[cfg(test)]
+fn envelope_outputs(volume: u8, loop_: bool, constant: bool, restart_at: Option<usize>, clocks: usize) -> Vec<u8> {
+    let mut e = Envelope { start: true, loop_, constant, volume, divider: 0, decay: 0 };
+    (0..clocks)
+        .map(|i| {
+            if restart_at == Some(i) {
+                e.start = true;
+            }
+            e.clock();
+            e.output()
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Default)]
 struct Chan {
     timer: u16,
@@ -494,6 +509,54 @@ mod tests {
         assert_eq!(t[0].ch[PU1].level, 3, "the chip's answer wins");
         assert_eq!(t[0].ch[PU1].period, 0x111);
         assert!(t[0].ch[PU1].keyed, "and the register-derived flags survive");
+    }
+
+    #[test]
+    fn both_copies_of_the_envelope_generator_agree() {
+        // There are two implementations of the 2A03's envelope: the one in
+        // `apu.rs` that drives the emulator, and the one above, which exists
+        // because this module runs on log timing rather than CPU cycles.
+        // They are currently character-for-character identical, and nothing
+        // but this test stops them drifting apart.
+        //
+        // A divergence would be quiet and nasty: `viper rip` would read
+        // volumes the emulator never produced, so viper would stop
+        // round-tripping its own output and the golden log would not notice,
+        // because it records register writes rather than levels.
+        //
+        // The input space is small enough to exhaust rather than sample.
+        for volume in 0..=15u8 {
+            for loop_ in [false, true] {
+                for constant in [false, true] {
+                    for restart in [None, Some(5), Some(20)] {
+                        let mine = envelope_outputs(volume, loop_, constant, restart, 64);
+                        let theirs = crate::apu::envelope_outputs(volume, loop_, constant, restart, 64);
+                        assert_eq!(
+                            mine, theirs,
+                            "volume {} loop {} constant {} restart {:?}",
+                            volume, loop_, constant, restart
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_decaying_envelope_takes_the_time_the_hardware_says() {
+        // Pins both copies to the chip rather than merely to each other. The
+        // divider reloads to `volume`, so a decay step costs `volume + 1`
+        // quarter-frames and the fall from 15 to 0 takes fifteen of them.
+        for volume in [0u8, 1, 3, 7] {
+            let out = envelope_outputs(volume, false, false, None, 512);
+            let zero = out.iter().position(|&v| v == 0).expect("it decays to silence");
+            assert_eq!(zero, 15 * (volume as usize + 1), "volume {}", volume);
+            assert!(out[zero..].iter().all(|&v| v == 0), "and stays there without loop set");
+        }
+        // With loop set it wraps back to full instead of staying down.
+        let looped = envelope_outputs(0, true, false, None, 64);
+        assert_eq!(looped[15], 0, "reaches silence on the same clock");
+        assert_eq!(looped[16], 15, "then loop reloads the decay counter");
     }
 
     #[test]

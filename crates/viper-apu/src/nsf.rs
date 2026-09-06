@@ -219,3 +219,128 @@ impl Memory {
         self.load
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An NSFe chunk: little-endian length, four-byte id, body.
+    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = (body.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(id);
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn nsfe(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = b"NSFE".to_vec();
+        for c in chunks {
+            v.extend_from_slice(c);
+        }
+        v
+    }
+
+    fn info(songs: u8) -> Vec<u8> {
+        // load, init, play, region, expansion, songs, start
+        chunk(b"INFO", &[0x00, 0x80, 0x00, 0x80, 0x23, 0x80, 0x00, 0x00, songs, 0])
+    }
+
+    #[test]
+    fn a_header_survives_being_built_and_parsed_again() {
+        let h = Nsf::build_header(0x8000, 0x8123, 0x8456, 3, "Title", "Artist", "(c) 2026", 0x01);
+        let mut bytes = h.to_vec();
+        bytes.extend_from_slice(&[0x60; 16]);
+        let n = Nsf::parse(&bytes).unwrap();
+        assert_eq!((n.load, n.init, n.play), (0x8000, 0x8123, 0x8456));
+        assert_eq!(n.songs, 3);
+        assert_eq!((n.name.as_str(), n.artist.as_str()), ("Title", "Artist"));
+        assert_eq!(n.copyright, "(c) 2026");
+        assert_eq!(n.expansion, 0x01);
+        assert!(!n.pal, "viper emits NTSC");
+        assert_eq!(n.data.len(), 16, "everything past the 128-byte header is data");
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_nsf_is_refused_rather_than_read() {
+        // These are the shapes a user actually hands the tool by accident: a
+        // truncated download, the wrong file, an empty one.
+        for bad in [&b""[..], b"NESM\x1A", b"not an nsf at all", &[0u8; 127]] {
+            assert!(Nsf::parse(bad).is_err(), "{:?} should not parse", &bad[..bad.len().min(8)]);
+        }
+    }
+
+    #[test]
+    fn an_nsfe_chunk_that_overruns_the_file_names_itself() {
+        // A length field is attacker-controlled, so the parser has to treat
+        // it as a claim rather than a fact.
+        let mut bytes = b"NSFE".to_vec();
+        bytes.extend_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        bytes.extend_from_slice(b"INFO");
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = Nsf::parse(&bytes).unwrap_err().to_string();
+        assert!(err.contains("INFO") && err.contains("truncated"), "{}", err);
+    }
+
+    #[test]
+    fn an_nsfe_without_its_required_chunks_is_refused() {
+        assert!(Nsf::parse(&nsfe(&[])).is_err(), "no INFO");
+        assert!(Nsf::parse(&nsfe(&[info(1)])).is_err(), "INFO but no DATA");
+        assert!(Nsf::parse(&nsfe(&[chunk(b"DATA", &[0x60])])).is_err(), "DATA but no INFO");
+        // Both, and it parses.
+        assert!(Nsf::parse(&nsfe(&[info(1), chunk(b"DATA", &[0x60])])).is_ok());
+    }
+
+    #[test]
+    fn nsfe_metadata_is_read_the_way_the_format_stores_it() {
+        let n = Nsf::parse(&nsfe(&[
+            info(2),
+            chunk(b"auth", b"Album\0Artist\0(c)\0Ripper\0"),
+            chunk(b"tlbl", b"One\0Two\0Three\0"),
+            chunk(b"time", &[0xE8, 0x03, 0, 0, 0xD0, 0x07, 0, 0]),
+            chunk(b"DATA", &[0x60]),
+        ]))
+        .unwrap();
+        assert_eq!((n.name.as_str(), n.artist.as_str(), n.copyright.as_str()), ("Album", "Artist", "(c)"));
+        // Track names are NUL-separated and trimmed to the song count, so a
+        // file claiming more titles than tracks cannot desynchronise them.
+        assert_eq!(n.track_names, vec!["One", "Two"]);
+        assert_eq!(n.track_times, vec![1000, 2000], "milliseconds, four bytes each");
+        assert_eq!(n.start_song, 1, "stored zero-based, reported one-based");
+    }
+
+    #[test]
+    fn an_unknown_nsfe_chunk_is_skipped_and_nend_stops_the_walk() {
+        // Forward compatibility in one direction, and a terminator in the
+        // other: anything after NEND is not read at all.
+        let n = Nsf::parse(&nsfe(&[
+            info(1),
+            chunk(b"xxxx", b"whatever this is"),
+            chunk(b"DATA", &[0x60]),
+            chunk(b"NEND", b""),
+            chunk(b"tlbl", b"never read\0"),
+        ]))
+        .unwrap();
+        assert_eq!(n.data, vec![0x60]);
+        assert!(n.track_names.is_empty(), "the chunk past NEND was not read");
+    }
+
+    #[test]
+    fn a_bankswitched_file_says_so_and_maps_its_windows() {
+        let mut h = Nsf::build_header(0x8000, 0x8000, 0x8000, 1, "b", "", "", 0);
+        h[0x70..0x78].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 0]);
+        let mut bytes = h.to_vec();
+        bytes.extend_from_slice(&vec![0xAA; 0x9000]);
+        let n = Nsf::parse(&bytes).unwrap();
+        assert!(n.bankswitched(), "any non-zero bank entry means banked");
+        assert_eq!(n.banks[0], 1);
+        // And a file with all-zero bank entries is flat, which is what every
+        // song viper emits today looks like.
+        let flat = Nsf::parse(&{
+            let mut b = Nsf::build_header(0x8000, 0x8000, 0x8000, 1, "f", "", "", 0).to_vec();
+            b.extend_from_slice(&[0x60; 8]);
+            b
+        })
+        .unwrap();
+        assert!(!flat.bankswitched());
+    }
+}

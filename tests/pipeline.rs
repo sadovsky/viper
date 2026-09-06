@@ -110,6 +110,55 @@ fn stress_song_compiles_renders_and_loops_exactly() {
 }
 
 #[test]
+fn a_seed_generates_the_same_song_every_time() {
+    // Two things, and the second is the one with teeth.
+    //
+    // Determinism — the same seed twice gives byte-identical songs — costs
+    // nothing to maintain and catches real nondeterminism, the kind that
+    // creeps in through hash iteration order and only shows up as an
+    // unreproducible song months later.
+    //
+    // Seed *stability* is the harder promise: that seed 1 keeps meaning the
+    // same music across versions. docs/GENERATION.md lists that as an open
+    // question ("if we tweak the algorithm, do we break seed=42?"), and the
+    // fingerprint below is what turns the question into an answer. It is
+    // also the safety net that let a clippy fix inside the generator be
+    // proven behaviour-preserving rather than merely believed to be.
+    //
+    // If you changed the generator on purpose, this test is supposed to
+    // fail. Update the constant, and say in the commit message what the
+    // seeds now sound like instead.
+    let tmp = std::env::temp_dir().join(format!("viper_seed_{}", std::process::id()));
+    let corpus = |dir: &std::path::Path| -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = viper()
+            .args(["gen", "--style"])
+            .arg(root().join("styles/neutral"))
+            .args(["--seed", "1", "--count", "12", "-o"])
+            .arg(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        assert_eq!(names.len(), 12, "twelve seeds, twelve songs");
+        names.iter().map(|p| std::fs::read_to_string(p).unwrap()).collect()
+    };
+    let a = corpus(&tmp.join("a"));
+    let b = corpus(&tmp.join("b"));
+    assert_eq!(a, b, "the same seed must give the same song");
+
+    // A digest rather than a stored corpus: twelve songs is 100 KB of
+    // fixture to review on every change, and nobody would.
+    let digest = a.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    assert_eq!(
+        digest, 0x9efe_e423_8d3d_0182,
+        "seed 1 no longer generates the same twelve songs; if that was deliberate, update this"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn neutral_style_generates_a_song_that_compiles() {
     let tmp = std::env::temp_dir().join(format!("viper_gen_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -529,5 +578,40 @@ fn ripping_recovers_vibrato_portamento_and_arpeggio() {
     // that audibly climbs to E-4.
     let report = String::from_utf8_lossy(&out.stdout);
     assert!(report.contains("notes    PU1 4"), "four notes, two of them found without a key-on: {}", report);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The subcommand dispatcher, and two ways it used to go wrong quietly.
+#[test]
+fn the_command_line_refuses_what_it_cannot_do() {
+    // Anything the dispatcher does not recognise is treated as a filename to
+    // open in the tracker, so `viper --version` used to launch the editor on
+    // a file called `--version` rather than print anything.
+    for flag in ["--version", "-V", "version"] {
+        let out = viper().arg(flag).output().unwrap();
+        assert!(out.status.success(), "{} failed", flag);
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.starts_with("viper "), "{} printed {:?}", flag, s);
+        assert!(s.trim().len() > "viper ".len(), "and an actual version");
+    }
+
+    let tmp = std::env::temp_dir().join(format!("viper_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let nsf = tmp.join("s.nsf");
+    let out = viper().args(["compile"]).arg(root().join("projects/stress_melodeath.vip")).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // A tempo outside the driver's row clock used to be accepted, reported
+    // as a success, and written to a .vip that then refused to compile —
+    // the failure landing one command later than the mistake.
+    for bad in ["0", "1", "5000"] {
+        let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", bad]).arg("-o").arg(tmp.join("bad.vip")).output().unwrap();
+        assert!(!out.status.success(), "--bpm {} should be refused", bad);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("out of range"), "--bpm {}", bad);
+    }
+    // The tempo the report itself suggests is of course still accepted.
+    let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", "220"]).arg("-o").arg(tmp.join("ok.vip")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("TOLD"), "a supplied tempo is not an inference");
     let _ = std::fs::remove_dir_all(&tmp);
 }

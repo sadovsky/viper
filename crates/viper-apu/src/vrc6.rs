@@ -113,7 +113,7 @@ impl Saw {
             // is observed as step 0 (the reset) rather than skipping past it.
             if self.step == 0 {
                 self.accum = 0;
-            } else if self.step % 2 == 0 {
+            } else if self.step.is_multiple_of(2) {
                 // Wrapping is deliberate: six adds of a rate above 42 overflow
                 // the 8-bit accumulator on real hardware, and that buzz is a
                 // technique people use, not a bug to clamp away.

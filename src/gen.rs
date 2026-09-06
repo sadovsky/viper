@@ -229,7 +229,7 @@ pub fn parse_key(s: &str) -> Option<u8> {
         None => 0,
         _ => return None,
     };
-    let mut pc = pc as i32 + acc;
+    let mut pc = pc + acc;
     while pc < 0 {
         pc += 12;
     }
@@ -434,7 +434,7 @@ fn hit(note: u8, instr: u8, vol: u8) -> Cell {
 pub fn chord_prog(song: &mut Song, chords: &[Chord], steps_per_chord: usize) -> usize {
     let spc = steps_per_chord.clamp(1, STEPS_PER_PHRASE);
     let per_phrase = (STEPS_PER_PHRASE / spc).max(1);
-    let n_phrases = (chords.len() + per_phrase - 1) / per_phrase;
+    let n_phrases = chords.len().div_ceil(per_phrase);
     let first = song.current_phrase;
     ensure_phrases(song, first + n_phrases);
     for pi in 0..n_phrases {
@@ -473,7 +473,7 @@ pub fn chord_prog(song: &mut Song, chords: &[Chord], steps_per_chord: usize) -> 
 pub fn bassline(song: &mut Song, chords: &[Chord], style: &str, steps_per_chord: usize) -> Result<usize> {
     let spc = steps_per_chord.clamp(1, STEPS_PER_PHRASE);
     let per_phrase = (STEPS_PER_PHRASE / spc).max(1);
-    let n_phrases = (chords.len() + per_phrase - 1) / per_phrase;
+    let n_phrases = chords.len().div_ceil(per_phrase);
     let first = song.current_phrase;
     ensure_phrases(song, first + n_phrases);
     for pi in 0..n_phrases {
@@ -591,7 +591,7 @@ pub fn drums(song: &mut Song, preset: &DrumPreset, fills: usize, dpcm: bool) {
     if dpcm {
         clear_channel(phrase, 4);
     }
-    let on = |mask: &str, s: usize| mask.as_bytes().get(s).map_or(false, |&b| b == b'x' || b == b'X');
+    let on = |mask: &str, s: usize| mask.as_bytes().get(s).is_some_and(|&b| b == b'x' || b == b'X');
     let mut snare_mask: Vec<bool> = (0..STEPS_PER_PHRASE).map(|s| on(preset.snare, s)).collect();
     if fills > 0 {
         for (i, f) in euclid_mask(fills.min(4), 4, 0).iter().enumerate() {

@@ -712,3 +712,105 @@ fn scale_color(c: Color, t: f32) -> Color {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("expected an RGB colour, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_hsv_round_trip_is_exactly_the_identity() {
+        // Sprite palettes are transformed through HSV and back, and the
+        // renderer short-circuits that round trip when the transform is an
+        // identity — which is only sound if the round trip *is* an identity.
+        // It is: an exhaustive sweep of all 16.7 million RGB triples returns
+        // every one unchanged, recovered by the `.round()` on the way out.
+        //
+        // A stride of 8 stands guard here; the exhaustive check was done
+        // once. The margin is thin — an `as u8` truncation instead of a
+        // round, an f64 intermediate, or `%` in place of `rem_euclid` would
+        // each break it — and if it ever stops holding, the short-circuit
+        // silently becomes a behaviour switch and identical sprites render
+        // in two different colours depending on a float comparison.
+        for r in (0..=255u8).step_by(8) {
+            for g in (0..=255u8).step_by(8) {
+                for b in (0..=255u8).step_by(8) {
+                    let (h, s, v) = rgb_to_hsv(r, g, b);
+                    assert_eq!(hsv_to_rgb(h, s, v), (r, g, b), "{:?}", (r, g, b));
+                }
+            }
+        }
+        // The corners of the hue wheel, where the sextant branches meet.
+        for c in [(255, 0, 0), (255, 255, 0), (0, 255, 0), (0, 255, 255), (0, 0, 255), (255, 0, 255), (0, 0, 0), (255, 255, 255)] {
+            let (h, s, v) = rgb_to_hsv(c.0, c.1, c.2);
+            assert_eq!(hsv_to_rgb(h, s, v), c, "hue corner {:?}", c);
+        }
+    }
+
+    #[test]
+    fn an_identity_transform_changes_nothing_even_the_long_way_round() {
+        // The short-circuit at the call site skips this path; this is the
+        // path it skips, and it has to agree.
+        for c in [(200, 30, 90), (1, 2, 3), (255, 255, 254)] {
+            let got = apply_color_transform(Color::Rgb(c.0, c.1, c.2), 0.0, 1.0, 1.0);
+            assert_eq!(rgb(got), c);
+        }
+    }
+
+    #[test]
+    fn hue_rotation_behaves_like_an_angle() {
+        // Where `rem_euclid(360)` and the sextant boundaries live.
+        let c = Color::Rgb(200, 30, 90);
+        assert_eq!(rgb(apply_color_transform(c, 360.0, 1.0, 1.0)), rgb(c), "a full turn is nothing");
+        let twice = apply_color_transform(apply_color_transform(c, 180.0, 1.0, 1.0), 180.0, 1.0, 1.0);
+        assert_eq!(rgb(twice), rgb(c), "half a turn twice is nothing");
+        assert_eq!(
+            rgb(apply_color_transform(c, -90.0, 1.0, 1.0)),
+            rgb(apply_color_transform(c, 270.0, 1.0, 1.0)),
+            "negative rotation wraps rather than clamping"
+        );
+    }
+
+    #[test]
+    fn saturation_and_value_clamp_instead_of_wrapping() {
+        let c = Color::Rgb(200, 30, 90);
+        assert_eq!(rgb(apply_color_transform(c, 0.0, 0.0, 1.0)), (200, 200, 200), "no saturation is grey at the same value");
+        assert_eq!(rgb(apply_color_transform(c, 0.0, 1.0, 0.0)), (0, 0, 0), "no value is black");
+        // Driving either past 1 must saturate, not overflow into nonsense —
+        // and the hue has to survive it. (200, 30, 90) sits at 338.8 degrees,
+        // which at full saturation and value is (255, 0, 90).
+        let hot = rgb(apply_color_transform(c, 0.0, 10.0, 10.0));
+        assert_eq!(hot, (255, 0, 90), "clamped, with the hue kept");
+    }
+
+    #[test]
+    fn a_named_colour_is_left_for_the_terminal_to_decide() {
+        // The project's rule, and the reason the palette looks right in
+        // whatever theme the user runs: viper never resolves a named colour
+        // to RGB behind the user's back. A refactor that did so "for
+        // consistency" would quietly override every terminal theme.
+        for c in [Color::Yellow, Color::Reset, Color::Indexed(42)] {
+            assert_eq!(apply_color_transform(c, 90.0, 2.0, 0.5), c);
+            assert_eq!(scale_color(c, 0.25), c);
+        }
+    }
+
+    #[test]
+    fn scaling_toward_black_truncates_where_mixing_rounds() {
+        // `scale_color` truncates and `main.rs`'s `mix` rounds, so the two
+        // disagree by a step at the midpoint. Pinned so that nobody "fixes"
+        // one of them alone and shifts every dimmed sprite by one level.
+        assert_eq!(rgb(scale_color(Color::Rgb(255, 255, 255), 0.5)), (127, 127, 127));
+        assert_eq!(rgb(scale_color(Color::Rgb(100, 200, 40), 1.0)), (100, 200, 40), "t=1 is the original");
+        assert_eq!(rgb(scale_color(Color::Rgb(100, 200, 40), 0.0)), (0, 0, 0));
+        // Out-of-range factors clamp rather than overflowing.
+        assert_eq!(rgb(scale_color(Color::Rgb(100, 200, 40), 5.0)), (100, 200, 40));
+        assert_eq!(rgb(scale_color(Color::Rgb(100, 200, 40), -1.0)), (0, 0, 0));
+    }
+}

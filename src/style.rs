@@ -426,7 +426,7 @@ impl Style {
                 "motif" => {
                     // `@motif 0 2 3` or `@motif name 0 2 3`
                     let mut toks: Vec<&str> = args.split_whitespace().collect();
-                    let name = if toks.first().map_or(false, |t| t.parse::<i32>().is_err()) {
+                    let name = if toks.first().is_some_and(|t| t.parse::<i32>().is_err()) {
                         toks.remove(0).to_string()
                     } else {
                         format!("motif{}", st.motifs.len() + 1)
@@ -644,7 +644,7 @@ fn lead_bar(ctx: &mut Ctx, riff: &Riff, chord: Chord, bar_in_section: usize, use
             for (i, _) in hits.iter().enumerate() {
                 let p = if i >= jab_from && jab {
                     // walk up or down toward the b2 / tritone
-                    if tritone && i == n - 1 { cur = root_deg; root_deg * 0 + ctx.nearest_degree(chord.root + 6) } else { cur += if ctx.rng.chance(0.5) { 1 } else { 2 }; cur }
+                    if tritone && i == n - 1 { cur = root_deg; ctx.nearest_degree(chord.root + 6) } else { cur += if ctx.rng.chance(0.5) { 1 } else { 2 }; cur }
                 } else if contour == "pedal_jumps" && i % 4 == 3 && ctx.rng.chance(0.5) {
                     *ctx.pick(&chord_degs) + ctx.scale.len() as i32 * if ctx.rng.chance(0.5) { 1 } else { 0 }
                 } else if contour == "pedal" && i == n - 1 && ctx.rng.chance(0.35) {
@@ -862,8 +862,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
     let timbre_pick = if style.timbres.is_empty() { None } else { Some(rng.range(0, style.timbres.len() as u32) as usize) };
     let mut ctx = Ctx { style, motif: motif_pick, rng, key, scale, prog, motif_on };
 
-    let mut song = Song::default();
-    song.bpm = bpm;
+    let mut song = Song { bpm, ..Default::default() };
     for (idx, inst) in &style.instruments {
         song.instruments[*idx] = *inst;
     }
@@ -926,7 +925,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
                 let (noi, dpcm) = drum_cells(style, &drums, last && bars > 1, b == 0 && si > 0, &mut ctx.rng);
                 let mut ph = Phrase::default();
                 let vol_at = |s: usize| -> u8 {
-                    let base = match riff.accent { Some((on, off)) => if s % 4 == 0 { on } else { off }, None => 0 };
+                    let base = match riff.accent { Some((on, off)) => if s.is_multiple_of(4) { on } else { off }, None => 0 };
                     if section.swell && bars > 1 {
                         // 6..15 across the bars; accents scale within it
                         let top = 6 + (9 * b / (bars - 1).max(1)) as u8;

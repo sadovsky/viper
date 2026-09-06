@@ -148,7 +148,7 @@ fn onsets(t: &[FrameTrace]) -> Vec<u32> {
 /// Zero is never produced. It means "channel default" everywhere else in
 /// viper, so an audible note must not map to it.
 fn cell_volume(level: u8) -> u8 {
-    ((16 * level as u16 + 14) / 15).clamp(1, 15) as u8
+    (16 * level as u16).div_ceil(15).clamp(1, 15) as u8
 }
 
 /// Whether a note on this channel is still sounding when the *next* row
@@ -584,9 +584,8 @@ fn classify(periods: &[u16], ch: usize) -> Motion {
                 last = Some(i);
             }
         }
-        if cycle > 0 {
-            let rate = (32 / cycle).clamp(1, 15) as u8;
-            return Motion::Vibrato { depth: (span + 1).min(15), rate };
+        if let Some(rate) = 32usize.checked_div(cycle) {
+            return Motion::Vibrato { depth: (span + 1).min(15), rate: rate.clamp(1, 15) as u8 };
         }
     }
     Motion::Steady

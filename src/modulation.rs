@@ -383,7 +383,7 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
     while i < bytes.len() {
         let c = bytes[i];
         if c.is_whitespace() { i += 1; continue; }
-        if c.is_ascii_digit() || (c == '.' && bytes.get(i + 1).map_or(false, |d| d.is_ascii_digit())) {
+        if c.is_ascii_digit() || (c == '.' && bytes.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let mut buf = String::new();
             let mut saw_dot = false;
             while i < bytes.len() {
