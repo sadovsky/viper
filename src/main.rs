@@ -534,6 +534,23 @@ enum Pending {
 }
 
 impl Pending {
+    /// The keys that are valid right now, as vim's which-key plugin shows
+    /// them. This is the honest half of DESIGN.md's "inline help": rather
+    /// than dimming a full-screen overlay, the modeline says what the
+    /// half-finished command will accept next, where you are already
+    /// looking for the pending-key indicator.
+    fn valid_next(&self) -> &'static str {
+        match self {
+            Pending::None => "",
+            Pending::Z => "Z save+quit · Q quit!",
+            Pending::Op(_) => "hjkl/wb/gG motion · a/i object · dd/yy line · Esc",
+            Pending::OpScope(_, _) => "b bar · p phrase · v channel · Esc",
+            Pending::Replace => "piano row: z s x d c v g b h n j m , l . ; /",
+            Pending::MacroRecord => "a-z register to record into · Esc",
+            Pending::MacroPlay => "a-z register · @ replay last · Esc",
+        }
+    }
+
     fn display(&self) -> String {
         match self {
             Pending::None => String::new(),
@@ -707,6 +724,17 @@ struct App {
     ghost: Option<Overlay>,
     /// Stage 27: `:diff`. Sticky until dismissed or invalidated by an edit.
     diff: Option<Overlay>,
+    /// Stage 30: first visible line of the help screen. The reference is
+    /// longer than any terminal, so it scrolls rather than clipping.
+    help_scroll: usize,
+    /// Rows the help pane can show, refreshed from the terminal each frame.
+    /// The key handler needs it to clamp scrolling: clamping only at render
+    /// time would let `G` then `k` sit on an out-of-range value and appear
+    /// stuck.
+    help_viewport: usize,
+    /// Stage 30: whether the grid stays anchored to the active phrase or
+    /// flows past a pinned playhead. See [`ScrollStyle`].
+    scroll_style: ScrollStyle,
     /// Stage 29: the last few things the app announced, newest first, for
     /// row 2 of the modeline. Derived by watching `status` rather than
     /// instrumenting every action — everything notable already announces
@@ -792,6 +820,9 @@ impl App {
             viz_tick: 0,
             ghost: None,
             diff: None,
+            help_scroll: 0,
+            help_viewport: 20,
+            scroll_style: ScrollStyle::default(),
             event_log: VecDeque::new(),
             last_logged: String::new(),
             still: false,
@@ -1224,6 +1255,13 @@ struct Theme {
     instr_value: Color,
     instr_label: Color,
 
+    /// Ink for neighbour ("ghost") phrase rows in the stacked layout.
+    /// DESIGN.md asks for "roughly 30% brightness", which is not computable
+    /// here: under `nes` most foregrounds are named ANSI colours and `mix`
+    /// deliberately refuses to resolve those to fixed RGB, so there is no
+    /// 30% of `Color::Green` to take. Each theme declares its own dim tier
+    /// instead, like every other semantic role in this struct.
+    ghost: Color,
     /// Phosphor's CRT scanline: a faint background on alternate grid rows.
     /// `None` in themes that do not want one — DESIGN.md is explicit that
     /// the effect should be *of* the terminal, an alternating-line colour
@@ -1294,6 +1332,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Green,
         instr_label: Color::Gray,
+        ghost: Color::DarkGray,
         scanline_bg: None,
         viz_bg: Color::Rgb(12, 12, 24),
         // Colour does the talking here, matching git's vocabulary.
@@ -1340,6 +1379,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Rgb(255, 220, 120),
         instr_label: Color::Rgb(200, 130, 0),
+        ghost: Color::Rgb(120, 66, 0),
         scanline_bg: Some(Color::Rgb(18, 10, 0)),
         viz_bg: Color::Rgb(10, 5, 0),
         // Near-monochrome by design, so brightness and the margin sigil
@@ -1559,6 +1599,185 @@ fn render_song_pane(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+// ---------- Stage 30: the stacked phrase view ----------
+
+/// How the grid reacts when the transport crosses a phrase boundary.
+///
+/// A terminal cell is the smallest unit of vertical position — there is no
+/// sub-row scrolling, so "smooth" cannot mean what it means in a GUI
+/// tracker. What it can mean, and does here, is *what is pinned*.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScrollStyle {
+    /// LSDJ. The active phrase's rows own fixed screen rows; the playhead
+    /// travels down them and the grid re-labels in one frame at the
+    /// boundary. A hard cut is a good sync cue, and "step 07 is always
+    /// there" is muscle memory worth keeping, so this is the default.
+    #[default]
+    Jumpy,
+    /// Renoise. The playing row is pinned near the centre and the tape
+    /// flows past it, one row per sixteenth, so a phrase boundary is a
+    /// non-event. Only differs while the transport is rolling.
+    Smooth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Active,
+    Ghost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridRow {
+    phrase: usize,
+    step: usize,
+    role: Role,
+}
+
+/// What the phrase pane shows, top to bottom. Pure data — no `Frame`, no
+/// `Theme` — so every layout claim is a unit test rather than a screenshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PhraseView {
+    spacer: bool,
+    rows: Vec<Option<GridRow>>,
+}
+
+/// The tape index of the row at the top of the viewport.
+///
+/// Priorities, highest first — this ladder is the whole degradation story:
+/// the cursor is on screen, always; the playing row is on screen too
+/// whenever both fit; then the requested anchor; and never scroll past the
+/// neighbour phrases into blank space.
+fn viewport_top(viewport: usize, above: usize, cursor_step: usize, play: Option<usize>, smooth: bool) -> isize {
+    let v = viewport as isize;
+    let steps = STEPS_PER_PHRASE as isize;
+    let mut top = match (smooth, play) {
+        (true, Some(p)) => p as isize - v / 2,
+        _ => -(above as isize),
+    };
+    let c = cursor_step as isize;
+    // Clamp so the cursor stays visible, and the playhead too when both fit
+    // in the viewport at once. They live in the same 16-row phrase, so for
+    // any viewport of 16 or more this interval is never empty.
+    let (lo, hi) = match play {
+        Some(p) if (c - p as isize).abs() <= v - 1 => (c.max(p as isize) - v + 1, c.min(p as isize)),
+        _ => (c - v + 1, c),
+    };
+    top = top.clamp(lo, hi);
+    // Never scroll past the neighbours into blank space. The exception is a
+    // pane taller than the whole 48-row tape, where blank space is
+    // unavoidable — there centre the tape so the active phrase stays in the
+    // middle rather than riding the top edge.
+    let tape_lo = -steps;
+    let tape_hi = (2 * steps) - v;
+    if tape_hi < tape_lo {
+        return tape_lo - (v - 3 * steps) / 2;
+    }
+    top.clamp(tape_lo, tape_hi)
+}
+
+/// The phrase that plays before or after this one. In song mode that is the
+/// neighbouring entry in the *flattened* order — what actually plays next,
+/// including the wrap back to the loop point — not `current_phrase ± 1`.
+fn neighbour_phrase(app: &App, delta: isize) -> Option<usize> {
+    let n = app.song.phrases.len();
+    if n <= 1 {
+        return None;
+    }
+    let cur = app.song.current_phrase;
+    let (order, loop_pos) = app.song.flat_order();
+    if app.song_mode && !order.is_empty() {
+        let pos = if app.playing {
+            app.viz_frame.order_pos.min(order.len() - 1)
+        } else {
+            // A phrase appearing twice in the order resolves to its first
+            // occurrence; there is nothing better to go on while stopped.
+            order.iter().position(|&p| p == cur)?
+        };
+        let len = order.len() as isize;
+        let mut i = pos as isize + delta;
+        if i >= len {
+            // Past the last entry, playback returns to the loop point.
+            i = loop_pos as isize + (i - len);
+        } else if i < 0 {
+            // Nothing precedes entry 0 unless the loop point is the start;
+            // an intro before the loop only ever plays once. That blank
+            // space above the grid is information.
+            if loop_pos == 0 {
+                i += len;
+            } else {
+                return None;
+            }
+        }
+        return order.get(i.rem_euclid(len.max(1)) as usize).copied();
+    }
+    Some((cur as isize + delta).rem_euclid(n as isize) as usize)
+}
+
+/// Lay out the phrase pane for a given inner height.
+///
+/// The model is one virtual tape of 48 rows indexed from the active
+/// phrase's step 0: −16..−1 is the previous phrase, 0..15 the active one,
+/// 16..31 the next. The pane renders a window into that tape, so graceful
+/// degradation, centring, scroll style and song mode are all just a choice
+/// of where the window starts.
+fn phrase_view(app: &App, inner_h: u16) -> PhraseView {
+    let steps = STEPS_PER_PHRASE;
+    // The header is pinned; the blank spacer under it is a luxury that only
+    // earns its row once there is enough height that losing it would buy at
+    // most one row of context.
+    let v0 = (inner_h as usize).saturating_sub(1);
+    let spacer = v0 >= steps + 2;
+    let viewport = v0.saturating_sub(spacer as usize);
+    if viewport == 0 {
+        return PhraseView { spacer, rows: Vec::new() };
+    }
+    let extra = viewport.saturating_sub(steps);
+    // The odd row goes below: music reads forward, and it matches the
+    // playhead's downward sweep. `above` may exceed a phrase on a very tall
+    // pane; the surplus falls off the end of the tape and renders blank.
+    let above = extra / 2;
+
+    let smooth = app.scroll_style == ScrollStyle::Smooth && !app.still && above >= 1;
+    let play = app.playing.then_some(app.play_step);
+    let top = viewport_top(viewport, above, app.cursor_step, play, smooth);
+
+    let cur = app.song.current_phrase;
+    let prev = neighbour_phrase(app, -1);
+    let next = neighbour_phrase(app, 1);
+    let s = steps as isize;
+    let rows = (0..viewport as isize)
+        .map(|r| {
+            let i = top + r;
+            match i {
+                _ if (0..s).contains(&i) => Some(GridRow { phrase: cur, step: i as usize, role: Role::Active }),
+                _ if (-s..0).contains(&i) => prev.map(|p| GridRow { phrase: p, step: (i + s) as usize, role: Role::Ghost }),
+                _ if (s..2 * s).contains(&i) => next.map(|p| GridRow { phrase: p, step: (i - s) as usize, role: Role::Ghost }),
+                _ => None,
+            }
+        })
+        .collect();
+    PhraseView { spacer, rows }
+}
+
+/// One neighbour row: a single ink, blanks where the active grid would show
+/// `--- -- -- ---`, and the *phrase* index in the gutter instead of the step
+/// index. Collapsing five field colours to one and dropping the empty-cell
+/// dashes is what makes these read as context rather than content — and it
+/// works on a monochrome terminal, where a brightness ramp would not.
+fn ghost_row_line(theme: &Theme, phrase: &Phrase, phrase_idx: usize, step: usize) -> Line<'static> {
+    let style = Style::default().fg(theme.ghost);
+    let mut spans = vec![Span::styled(format!("   {:02X} ", phrase_idx), Style::default().fg(theme.ghost))];
+    for c in 0..CHANNELS {
+        let cell = phrase.cells[step][c];
+        let note = match cell.note {
+            Some(n) => note_name(Some(n)),
+            None => "   ".to_string(),
+        };
+        spans.push(Span::styled(format!(" {}           ", note), style));
+    }
+    Line::from(spans)
+}
+
 fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     let p = app.phrase();
     let theme = &app.theme;
@@ -1621,7 +1840,13 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         header.push(Span::styled(format!(" {:<14}", label), style));
     }
     lines.push(Line::from(header));
-    lines.push(Line::from(""));
+    // The grid is a window onto a tape of the previous, active and next
+    // phrases; see `phrase_view`. On a short pane the window narrows to the
+    // active phrase alone and scrolls to follow the cursor.
+    let view = phrase_view(app, area.height.saturating_sub(2));
+    if view.spacer {
+        lines.push(Line::from(""));
+    }
 
     // DESIGN.md: "the playhead is a character, not a cursor." A diamond
     // travels down the gutter leaving a two-step trail that fades into the
@@ -1630,7 +1855,20 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     // lands with the note), and a row that actually gates something flashes
     // brighter still.
     let strike = 1.0 - app.viz_frame.step_phase.clamp(0.0, 1.0);
-    for (i, row) in p.cells.iter().enumerate() {
+    for slot in &view.rows {
+        let Some(gr) = slot else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        if gr.role == Role::Ghost {
+            match app.song.phrases.get(gr.phrase) {
+                Some(ph) => lines.push(ghost_row_line(theme, ph, gr.phrase, gr.step)),
+                None => lines.push(Line::from("")),
+            }
+            continue;
+        }
+        let i = gr.step;
+        let row = &p.cells[i];
         let behind = if app.playing {
             (app.play_step + STEPS_PER_PHRASE - i) % STEPS_PER_PHRASE
         } else {
@@ -1818,7 +2056,9 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
+/// The keybinding reference, built once so both the renderer and the key
+/// handler agree on how many lines there are to scroll through.
+fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     let section = |title: &str| Line::from(Span::styled(
         title.to_string(),
         Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -1892,6 +2132,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":set theme=nes",  "color theme (nes / phosphor)"),
         row(":set still=on",   "freeze the tempo-locked breathing animations (off / toggle)"),
         row(":diff [A] B",     "compare phrase A (or the current one) against B; :diff off dismisses"),
+        row(":set scroll=jumpy", "phrase scroll style: jumpy (grid fixed) / smooth (playhead pinned) / toggle"),
         row(":play / :stop",   "transport"),
         row(":rec / :rec off",  "toggle record-arm / disarm all channels"),
         row(":mute [N]",        "toggle mute on cursor channel (or N: 1-5 / pu1..dpcm)"),
@@ -1945,15 +2186,35 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":gen style DIR [seed]", "compose a whole song from a style directory"),
         Line::from(""),
         Line::from(Span::styled(
-            "  press q, Esc, or ? to close help",
+            "  j/k scroll · g/G top/bottom · press q, Esc, or ? to close help",
             Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC),
         )),
     ];
 
-    let block = Block::default()
-        .title(" HELP ")
-        .borders(Borders::ALL);
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    lines
+}
+
+/// How far the help screen can scroll before it runs out of content.
+fn help_max_scroll(viewport: usize) -> usize {
+    help_lines(&Theme::NES).len().saturating_sub(viewport.max(1))
+}
+
+fn render_help(f: &mut Frame, area: Rect, app: &App) {
+    let lines = help_lines(&app.theme);
+    // The reference is far longer than any terminal, and until now it was
+    // simply clipped: on a 24-row window most of it was unreachable with no
+    // sign that anything had been cut. Scroll it, and say where you are.
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let scroll = app.help_scroll.min(max_scroll);
+    let title = if max_scroll == 0 {
+        " HELP ".to_string()
+    } else {
+        format!(" HELP  {}–{} of {}  ·  j/k or PgUp/PgDn to scroll ",
+            scroll + 1, (scroll + visible).min(lines.len()), lines.len())
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)).block(block), area);
 }
 
 #[derive(Clone, Copy)]
@@ -2346,9 +2607,19 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(after.to_string()),
         ])
     } else if app.count > 0 || app.pending != Pending::None {
-        Line::from(format!("{}{}",
+        // The pending keystrokes, then what they will accept next.
+        let typed = format!("{}{}",
             if app.count > 0 { app.count.to_string() } else { String::new() },
-            app.pending.display()))
+            app.pending.display());
+        let hint = app.pending.valid_next();
+        if hint.is_empty() {
+            Line::from(typed)
+        } else {
+            Line::from(vec![
+                Span::styled(format!("{}  ", typed), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(hint.to_string(), Style::default().fg(theme.hint)),
+            ])
+        }
     } else if app.event_log.len() > 1 {
         // Idle: a rolling log of what just happened, oldest to newest so it
         // reads left to right. The newest entry is already the status line
@@ -2390,7 +2661,7 @@ fn ui(f: &mut Frame, app: &App) {
         (chunks[0], None)
     };
     match app.mode {
-        Mode::Help => render_help(f, chunks[0], &app.theme),
+        Mode::Help => render_help(f, chunks[0], app),
         Mode::Instrument => render_instrument(f, chunks[0], app),
         _ => {
             // Stage 23: the song pane sits above the grid when toggled on.
@@ -2516,10 +2787,21 @@ fn handle_help(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1) => {
             app.mode = Mode::Normal;
+            app.help_scroll = 0;
             app.status = "".into();
         }
-        _ => {}
+        // Same motions as the grid, so the keys you already know work here.
+        KeyCode::Char('j') | KeyCode::Down => app.help_scroll += 1,
+        KeyCode::Char('k') | KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
+        KeyCode::PageDown | KeyCode::Char('d') => app.help_scroll += 10,
+        KeyCode::PageUp | KeyCode::Char('u') => app.help_scroll = app.help_scroll.saturating_sub(10),
+        KeyCode::Char('g') | KeyCode::Home => app.help_scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => app.help_scroll = usize::MAX,
+        _ => return,
     }
+    // Clamp here, not only at render: leaving an out-of-range value parked
+    // would make the next `k` look like it did nothing.
+    app.help_scroll = app.help_scroll.min(help_max_scroll(app.help_viewport));
 }
 
 fn handle_normal(app: &mut App, key: KeyEvent) {
@@ -3339,6 +3621,18 @@ fn execute_command(app: &mut App, cmd: &str) {
                         app.status = format!("theme = {}", t.name);
                     }
                     None => app.status = format!("unknown theme: {:?} (try nes or phosphor)", v),
+                },
+                "scroll" => match v {
+                    "smooth" => { app.scroll_style = ScrollStyle::Smooth; app.status = "scroll = smooth (playing row pinned, grid flows)".into(); }
+                    "jumpy" => { app.scroll_style = ScrollStyle::Jumpy; app.status = "scroll = jumpy (grid fixed, snaps at the boundary)".into(); }
+                    "toggle" => {
+                        app.scroll_style = match app.scroll_style {
+                            ScrollStyle::Jumpy => ScrollStyle::Smooth,
+                            ScrollStyle::Smooth => ScrollStyle::Jumpy,
+                        };
+                        app.status = format!("scroll = {}", if app.scroll_style == ScrollStyle::Smooth { "smooth" } else { "jumpy" });
+                    }
+                    _ => app.status = format!("scroll: expected smooth / jumpy / toggle, got {:?}", v),
                 },
                 "still" => match v {
                     "on" | "1" | "yes" => { app.still = true; app.status = "still = on (animations frozen)".into(); }
@@ -4901,6 +5195,11 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, audio: Option<&audio::AudioEngine
         } else if !app.splash_particles.is_empty() {
             app.splash_particles.clear();
         }
+        // The help pane needs its own height for scroll clamping, and only
+        // the draw loop knows the terminal size.
+        if let Ok(sz) = terminal.size() {
+            app.help_viewport = sz.height.saturating_sub(4) as usize;
+        }
         terminal.draw(|f| ui(f, &app))?;
         // 16ms poll ≈ 60Hz UI refresh — needed for the viz pane to animate
         // smoothly and for the DESIGN.md "breath / pulse" aesthetic.
@@ -4965,8 +5264,26 @@ mod tests {
         app
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::from(code));
+    }
+
     /// Column the playhead glyph lives in: inside the border, one pad.
     const GLYPH_X: usize = 2;
+
+    /// Screen row of a step in the active phrase, derived from the layout
+    /// rather than a magic offset — so these tests document the stacked
+    /// view instead of duplicating its arithmetic.
+    fn active_y(app: &App, height: u16, step: usize) -> u16 {
+        let view = phrase_view(app, height - 2);
+        let idx = view
+            .rows
+            .iter()
+            .position(|r| matches!(r, Some(g) if g.role == Role::Active && g.step == step))
+            .expect("that step is on screen");
+        // border + header + optional spacer + position in the window
+        2 + view.spacer as u16 + idx as u16
+    }
 
     /// Render the phrase pane and return one row's symbols.
     fn row_symbols(app: &App, y: u16) -> Vec<String> {
@@ -5053,17 +5370,18 @@ mod tests {
         let app = playing_app(4, 0.0);
         // Step rows: border, header, blank, then step 00 — so step N is at
         // y = N + 3.
-        let head = row_symbols(&app, 4 + 3);
+        let y = |step| active_y(&app, 24, step);
+        let head = row_symbols(&app, y(4));
         assert_eq!(head[GLYPH_X], "◆");
         assert_eq!(
             (head[GLYPH_X + 2].as_str(), head[GLYPH_X + 3].as_str()),
             ("0", "4"),
             "gutter reads the step index",
         );
-        assert_eq!(row_symbols(&app, 3 + 3)[GLYPH_X], "◇", "one step behind");
-        assert_eq!(row_symbols(&app, 2 + 3)[GLYPH_X], "·", "two steps behind");
-        assert_eq!(row_symbols(&app, 1 + 3)[GLYPH_X], " ", "the trail is only two steps long");
-        assert_eq!(row_symbols(&app, 5 + 3)[GLYPH_X], " ", "nothing ahead of the playhead");
+        assert_eq!(row_symbols(&app, y(3))[GLYPH_X], "◇", "one step behind");
+        assert_eq!(row_symbols(&app, y(2))[GLYPH_X], "·", "two steps behind");
+        assert_eq!(row_symbols(&app, y(1))[GLYPH_X], " ", "the trail is only two steps long");
+        assert_eq!(row_symbols(&app, y(5))[GLYPH_X], " ", "nothing ahead of the playhead");
     }
 
     #[test]
@@ -5074,8 +5392,8 @@ mod tests {
         let playing = playing_app(4, 0.0);
         let mut stopped = playing_app(4, 0.0);
         stopped.playing = false;
-        let with = row_symbols(&playing, 4 + 3);
-        let without = row_symbols(&stopped, 4 + 3);
+        let with = row_symbols(&playing, active_y(&playing, 24, 4));
+        let without = row_symbols(&stopped, active_y(&stopped, 24, 4));
         assert_eq!(with[GLYPH_X + 1..], without[GLYPH_X + 1..]);
         assert_ne!(with[GLYPH_X], without[GLYPH_X]);
         // The header's lead matches the gutter, so PU1's column header sits
@@ -5103,7 +5421,7 @@ mod tests {
     fn every_channel_header_aligns_with_its_column() {
         let app = playing_app(0, 0.0);
         let header = row_symbols(&app, 1);
-        let row = row_symbols(&app, 3);
+        let row = row_symbols(&app, active_y(&app, 24, 0));
         let starts = |line: &[String]| -> Vec<usize> {
             let mut out = Vec::new();
             let mut prev_blank = true;
@@ -5126,10 +5444,6 @@ mod tests {
     }
 
     // ---------- Stage 27: ghost preview and diff ----------
-
-    fn press(app: &mut App, code: KeyCode) {
-        handle_key(app, KeyEvent::from(code));
-    }
 
     /// Open the command line and type `cmd`, exactly as a user would.
     fn type_command(app: &mut App, cmd: &str) {
@@ -5313,7 +5627,7 @@ mod tests {
         assert_eq!(o.grid[s][c].unwrap().mark, Mark::Proposed);
         assert!(app.song.phrases[0].cells[s][c].note.is_none(), "the song itself is still empty there");
         // The proposed note reaches the screen, with its margin sigil.
-        let row = row_symbols(&app, s as u16 + 3);
+        let row = row_symbols(&app, active_y(&app, 24, s));
         let text: String = row.concat();
         assert!(text.contains('·'), "a proposed cell carries the ghost sigil: {:?}", text);
     }
@@ -5422,7 +5736,7 @@ mod tests {
         terminal.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         // Find the cursor's note glyph and check it kept the cursor colour.
-        let y = s as u16 + 3;
+        let y = active_y(&app, 24, s);
         let x = 2 + 5 + (c as u16) * 15 + 1;
         let bg = buf.cell((x, y)).unwrap().bg;
         assert_eq!(bg, app.theme.cursor_bg, "the mark tint must not cover the cursor");
@@ -5516,7 +5830,7 @@ mod tests {
         app.cursor_step = 0;
         // A column well clear of the cursor column and the playhead rows.
         // Step 5 is an odd row (scanlined), step 6 an even one.
-        let (x, even_y, odd_y) = (60, 6 + 3, 5 + 3);
+        let (x, even_y, odd_y) = (60, active_y(&app, 24, 6), active_y(&app, 24, 5));
         app.theme = Theme::by_name("nes").unwrap();
         assert_eq!(cell_at(&app, x, odd_y).bg, Color::Reset, "nes asks for no scanline");
         app.theme = Theme::by_name("phosphor").unwrap();
@@ -5534,8 +5848,8 @@ mod tests {
         app.theme = Theme::by_name("phosphor").unwrap();
         app.cursor_step = 5;
         app.cursor_ch = 0;
-        assert_eq!(cell_at(&app, 8, 5 + 3).bg, app.theme.cursor_bg, "cursor wins");
-        assert_ne!(cell_at(&app, 60, 3 + 3).bg, app.theme.scanline_bg.unwrap(), "playhead row wins");
+        assert_eq!(cell_at(&app, 8, active_y(&app, 24, 5)).bg, app.theme.cursor_bg, "cursor wins");
+        assert_ne!(cell_at(&app, 60, active_y(&app, 24, 3)).bg, app.theme.scanline_bg.unwrap(), "playhead row wins");
     }
 
     #[test]
@@ -5544,13 +5858,14 @@ mod tests {
         app.still = true;
         app.cursor_ch = 0;
         let other_x = 8 + 15; // PU2's note field
-        let normal = cell_at(&app, other_x, 3);
+        let y0 = active_y(&app, 24, 0);
+        let normal = cell_at(&app, other_x, y0);
         app.mode = Mode::Insert;
-        let insert = cell_at(&app, other_x, 3);
+        let insert = cell_at(&app, other_x, y0);
         assert!(!normal.modifier.contains(Modifier::DIM));
         assert!(insert.modifier.contains(Modifier::DIM), "other channels recede in INSERT");
         // The column being typed into does not.
-        assert!(!cell_at(&app, 8, 3).modifier.contains(Modifier::DIM));
+        assert!(!cell_at(&app, 8, y0).modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -5609,5 +5924,320 @@ mod tests {
         // A pending count owns row 2 while it is live.
         app.count = 4;
         assert!(row2(&app).contains('4') && !row2(&app).contains("alpha"));
+    }
+
+    // ---------- Stage 30: the stacked phrase view ----------
+
+    /// (spacer, ghost rows above, active rows, ghost rows below)
+    fn view_shape(app: &App, inner_h: u16) -> (bool, usize, usize, usize) {
+        let v = phrase_view(app, inner_h);
+        let first = v.rows.iter().position(|r| matches!(r, Some(g) if g.role == Role::Active));
+        let active = v.rows.iter().filter(|r| matches!(r, Some(g) if g.role == Role::Active)).count();
+        let ghost = |range: &[Option<GridRow>]| range.iter().filter(|r| matches!(r, Some(g) if g.role == Role::Ghost)).count();
+        match first {
+            Some(i) => (v.spacer, ghost(&v.rows[..i]), active, ghost(&v.rows[i + active..])),
+            None => (v.spacer, 0, 0, 0),
+        }
+    }
+
+    /// A song with three distinct phrases, so neighbours actually exist.
+    fn three_phrase_app() -> App {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.song.phrases = vec![Phrase::default(), Phrase::default(), Phrase::default()];
+        app.song.current_phrase = 1;
+        app
+    }
+
+    #[test]
+    fn spare_rows_become_context_and_the_active_phrase_is_never_truncated() {
+        let app = three_phrase_app();
+        // (inner height) -> (spacer, above, active, below)
+        for (h, want) in [
+            (17u16, (false, 0usize, 16usize, 0usize)),
+            (19, (true, 0, 16, 1)),
+            (20, (true, 1, 16, 1)),
+            (26, (true, 4, 16, 4)),
+            (36, (true, 9, 16, 9)),
+            (50, (true, 16, 16, 16)),
+        ] {
+            assert_eq!(view_shape(&app, h), want, "inner height {}", h);
+        }
+        // Past the full three-phrase view the context clamps and the extra
+        // rows go blank rather than reaching for phrases two away.
+        assert_eq!(view_shape(&app, 56), (true, 16, 16, 16));
+        let v = phrase_view(&app, 56);
+        assert_eq!(v.rows.iter().filter(|r| r.is_none()).count(), 6, "padded with blanks");
+        // Those blanks are split evenly, so the active phrase stays centred
+        // rather than riding the top edge.
+        let lead = v.rows.iter().take_while(|r| r.is_none()).count();
+        assert_eq!(lead, 3, "blank padding is centred");
+    }
+
+    #[test]
+    fn the_layout_never_panics_and_never_lies_about_its_size() {
+        // The `- 2` and `16 - viewport` arithmetic is the one place this
+        // change can crash, so walk every height including the degenerate
+        // ones.
+        let app = three_phrase_app();
+        for h in 0..200u16 {
+            let v = phrase_view(&app, h);
+            let viewport = (h as usize).saturating_sub(1).saturating_sub(v.spacer as usize);
+            assert_eq!(v.rows.len(), viewport, "height {}", h);
+            for r in v.rows.iter().flatten() {
+                assert!(r.step < STEPS_PER_PHRASE);
+                assert!(r.phrase < app.song.phrases.len());
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_is_always_on_screen() {
+        let mut app = three_phrase_app();
+        for viewport in 1..=48usize {
+            for cursor in 0..STEPS_PER_PHRASE {
+                app.cursor_step = cursor;
+                // inner height that yields this viewport, spacer included
+                let inner = viewport as u16 + 1 + (viewport >= STEPS_PER_PHRASE + 2) as u16;
+                let v = phrase_view(&app, inner);
+                assert!(
+                    v.rows.iter().any(|r| matches!(r, Some(g) if g.role == Role::Active && g.step == cursor)),
+                    "viewport {} cursor {}", viewport, cursor,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_playhead_joins_the_cursor_whenever_both_fit() {
+        let mut app = three_phrase_app();
+        app.playing = true;
+        for cursor in 0..STEPS_PER_PHRASE {
+            for play in 0..STEPS_PER_PHRASE {
+                app.cursor_step = cursor;
+                app.play_step = play;
+                for style in [ScrollStyle::Jumpy, ScrollStyle::Smooth] {
+                    app.scroll_style = style;
+                    let v = phrase_view(&app, 20);
+                    let on = |s: usize| v.rows.iter().any(|r| matches!(r, Some(g) if g.role == Role::Active && g.step == s));
+                    assert!(on(cursor) && on(play), "{:?} cursor {} play {}", style, cursor, play);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jumpy_keeps_the_active_phrase_still() {
+        // The LSDJ contract: step 07 is always on the same screen row, so
+        // the view is rock-steady and the playhead does the moving.
+        let mut app = three_phrase_app();
+        app.playing = true;
+        app.scroll_style = ScrollStyle::Jumpy;
+        let first = phrase_view(&app, 20);
+        for play in 0..STEPS_PER_PHRASE {
+            app.play_step = play;
+            assert_eq!(phrase_view(&app, 20), first, "play_step {} moved the grid", play);
+        }
+    }
+
+    #[test]
+    fn smooth_pins_the_playing_row_and_flows_the_tape_past_it() {
+        let mut app = three_phrase_app();
+        app.playing = true;
+        app.scroll_style = ScrollStyle::Smooth;
+        app.cursor_step = 8;
+        let screen_of_play = |app: &App| {
+            phrase_view(app, 40)
+                .rows
+                .iter()
+                .position(|r| matches!(r, Some(g) if g.role == Role::Active && g.step == app.play_step))
+                .unwrap()
+        };
+        app.play_step = 6;
+        let at_six = screen_of_play(&app);
+        let top_at_six = phrase_view(&app, 40).rows[0];
+        app.play_step = 9;
+        assert_eq!(screen_of_play(&app), at_six, "the playing row stays pinned");
+        assert_ne!(phrase_view(&app, 40).rows[0], top_at_six, "and the tape under it moved");
+    }
+
+    #[test]
+    fn still_and_a_contextless_pane_both_collapse_smooth_to_jumpy() {
+        let mut app = three_phrase_app();
+        app.playing = true;
+        app.play_step = 9;
+        app.cursor_step = 2;
+
+        app.scroll_style = ScrollStyle::Jumpy;
+        let jumpy_tall = phrase_view(&app, 40);
+        let jumpy_short = phrase_view(&app, 18);
+
+        app.scroll_style = ScrollStyle::Smooth;
+        assert_ne!(phrase_view(&app, 40), jumpy_tall, "smooth differs while playing with room to flow");
+
+        // `:set still=on` promises the screen holds still, and that has to
+        // include the grid.
+        app.still = true;
+        assert_eq!(phrase_view(&app, 40), jumpy_tall, "still freezes the flow");
+        app.still = false;
+
+        // With no room for context there is nothing to flow into, so the
+        // two styles are indistinguishable — which is correct.
+        assert_eq!(phrase_view(&app, 18), jumpy_short);
+    }
+
+    #[test]
+    fn neighbours_follow_the_song_order_not_the_phrase_index() {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.song.phrases = vec![Phrase::default(), Phrase::default(), Phrase::default()];
+        app.song.order = vec![0, 2, 2, 1];
+        app.song.loop_pos = 1;
+        app.song_mode = true;
+        app.playing = true;
+        // At order position 3 (phrase 01), the next entry is the loop point.
+        app.viz_frame.order_pos = 3;
+        app.song.current_phrase = 1;
+        assert_eq!(neighbour_phrase(&app, 1), Some(2), "wraps to the loop point, not off the end");
+        assert_eq!(neighbour_phrase(&app, -1), Some(2));
+        // Entry 0 is an intro before the loop point: nothing precedes it.
+        app.viz_frame.order_pos = 0;
+        app.song.current_phrase = 0;
+        assert_eq!(neighbour_phrase(&app, -1), None, "an intro has no predecessor");
+        assert_eq!(neighbour_phrase(&app, 1), Some(2));
+        // Outside song mode it is simply the adjacent index, wrapping.
+        app.song_mode = false;
+        app.song.current_phrase = 0;
+        assert_eq!(neighbour_phrase(&app, -1), Some(2));
+        assert_eq!(neighbour_phrase(&app, 1), Some(1));
+        // A one-phrase song has no neighbours; showing itself would lie.
+        let solo = App::new();
+        assert_eq!(neighbour_phrase(&solo, 1), None);
+        assert_eq!(neighbour_phrase(&solo, -1), None);
+    }
+
+    #[test]
+    fn neighbour_rows_read_as_context_not_content() {
+        let mut app = three_phrase_app();
+        app.still = true;
+        app.song.phrases[0].cells[15][0] = Cell { note: Some(60), instr: 3, vol: 9, fx: Some((b'V', 1)) };
+        let mut t = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        t.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let view = phrase_view(&app, 28);
+        let ghost_idx = view.rows.iter().position(|r| matches!(r, Some(g) if g.role == Role::Ghost)).expect("a ghost row");
+        let y = 2 + view.spacer as u16 + ghost_idx as u16;
+        let line: String = (0..buf.area().width).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect();
+        // The gutter carries the *phrase* index, so the boundary is
+        // self-evident without spending a separator row.
+        assert!(line.starts_with("│   00 "), "ghost gutter shows the phrase: {:?}", line);
+        // Empty cells are blank, not `---`: you read a silhouette.
+        assert!(!line.contains("---"), "ghost rows do not draw empty-cell dashes: {:?}", line);
+        // One ink, and never a cursor, selection or playhead background.
+        for x in 6..80 {
+            let c = buf.cell((x, y)).unwrap();
+            assert!(c.fg == app.theme.ghost || c.symbol() == " ", "ghost ink only at {}: {:?}", x, c.fg);
+            assert_eq!(c.bg, Color::Reset, "no highlight backgrounds on a ghost row");
+        }
+    }
+
+    #[test]
+    fn the_playhead_never_leaves_the_active_phrase() {
+        let mut app = three_phrase_app();
+        app.playing = true;
+        app.play_step = 0;
+        let mut t = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        t.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let view = phrase_view(&app, 28);
+        for (i, r) in view.rows.iter().enumerate() {
+            let y = 2 + view.spacer as u16 + i as u16;
+            let g = buf.cell((GLYPH_X as u16, y)).unwrap().symbol().to_string();
+            if !matches!(r, Some(row) if row.role == Role::Active) {
+                assert!(!matches!(g.as_str(), "◆" | "◇" | "·"), "playhead glyph escaped onto row {}", i);
+            }
+        }
+    }
+
+    #[test]
+    fn the_grid_survives_every_height() {
+        let app = three_phrase_app();
+        for h in 2..=60u16 {
+            let mut t = Terminal::new(TestBackend::new(90, h)).unwrap();
+            t.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
+        }
+        // Degenerate rects must not panic either.
+        for (w, h) in [(0u16, 0u16), (2, 2), (1, 40), (90, 1)] {
+            let mut t = Terminal::new(TestBackend::new(w.max(1), h.max(1))).unwrap();
+            t.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn set_scroll_takes_smooth_jumpy_and_toggle() {
+        let mut app = App::new();
+        execute_command(&mut app, "set scroll=smooth");
+        assert_eq!(app.scroll_style, ScrollStyle::Smooth);
+        execute_command(&mut app, "set scroll=jumpy");
+        assert_eq!(app.scroll_style, ScrollStyle::Jumpy);
+        execute_command(&mut app, "set scroll=toggle");
+        assert_eq!(app.scroll_style, ScrollStyle::Smooth);
+        execute_command(&mut app, "set scroll=sideways");
+        assert!(app.status.contains("expected smooth"), "{}", app.status);
+        assert_eq!(app.scroll_style, ScrollStyle::Smooth, "a bad value changes nothing");
+    }
+
+
+    #[test]
+    fn a_pending_command_says_what_it_will_accept_next() {
+        let mut app = App::new();
+        app.show_splash = false;
+        let row2 = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(90, 2)).unwrap();
+            t.draw(|f| render_status(f, f.area(), app)).unwrap();
+            let b = t.backend().buffer().clone();
+            (0..b.area().width).map(|x| b.cell((x, 1)).unwrap().symbol().to_string()).collect::<String>()
+        };
+        press(&mut app, KeyCode::Char('d'));
+        let line = row2(&app);
+        assert!(line.starts_with('d'), "the keystroke so far: {:?}", line);
+        assert!(line.contains("object"), "and what it accepts next: {:?}", line);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(row2(&app).contains("bar"), "the scope narrows the hints: {:?}", row2(&app));
+        // Esc drops back to no hint at all.
+        press(&mut app, KeyCode::Esc);
+        assert!(!row2(&app).contains("bar"));
+    }
+
+    #[test]
+    fn the_help_screen_scrolls_instead_of_clipping_silently() {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.mode = Mode::Help;
+        app.help_viewport = 18; // matches the 20-row test backend
+        let render = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
+            t.draw(|f| render_help(f, f.area(), app)).unwrap();
+            let b = t.backend().buffer().clone();
+            (0..b.area().height)
+                .map(|y| (0..b.area().width).map(|x| b.cell((x, y)).unwrap().symbol().to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let top = render(&app);
+        assert!(top[0].contains("of "), "the title says how much there is: {:?}", top[0]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let scrolled = render(&app);
+        assert_ne!(top[1], scrolled[1], "j scrolls");
+        // G goes to the bottom and stays in range rather than blanking.
+        press(&mut app, KeyCode::Char('G'));
+        let bottom = render(&app);
+        assert!(bottom[1].trim() != "", "the last page still has content");
+        press(&mut app, KeyCode::Char('k'));
+        assert_ne!(render(&app)[1], bottom[1], "k comes back up");
+        // Closing resets the position, so `?` always opens at the top.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.help_scroll, 0);
     }
 }

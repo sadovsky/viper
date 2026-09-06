@@ -74,6 +74,7 @@ splash, then <kbd>space</kbd> to play.
 | toggle visualizer                   | `:viz` (bars/scope/grid/orbit/sprites) |
 | preview a command before running it | type `:gen …` or `:transpose …`     |
 | compare two phrases                 | `:diff 03`, `:diff off`             |
+| phrase context above and below      | automatic; `:set scroll=smooth`     |
 | save / load `.vip`                  | `:w path`, `:e path`                |
 | edit instrument                     | `F2` or `:inst`                     |
 | help screen                         | `?` or `F1`                         |
