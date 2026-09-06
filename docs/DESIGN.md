@@ -94,12 +94,15 @@ log ("▸ scene B queued · step 0c · ch2 muted").
 
 ## The stuff that makes it feel alive
 
-> **Status.** The playhead character and the breath system below shipped in
-> Stage 26, and ghost command preview and diff mode in Stage 27 (see
-> [`STAGES.md`](STAGES.md)), along with `:set still` for anyone who wants
-> the motion off. Still only described here: the stacked three-phrase
-> layout, the context-aware help overlay, the live instrument panel, the
-> queue-drain bar, register thumbnails, and phosphor scanlines.
+> **Status.** Most of what follows now exists (see [`STAGES.md`](STAGES.md)):
+> the playhead character and the breath system in Stage 26, along with
+> `:set still` for anyone who wants the motion off; the instrument panel,
+> queue-drain bar and register thumbnail in Stage 28; the mode transitions,
+> border flash, phosphor scanlines and modeline event log in Stage 29. Ghost
+> command preview and diff mode land alongside in Stage 27. Still only
+> described here: the stacked three-phrase layout and the context-aware help
+> overlay. Where the terminal would not support what this document imagined,
+> the section says what shipped instead.
 
 ### The playhead is a character, not a cursor
 

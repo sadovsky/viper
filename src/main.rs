@@ -707,6 +707,13 @@ struct App {
     ghost: Option<Overlay>,
     /// Stage 27: `:diff`. Sticky until dismissed or invalidated by an edit.
     diff: Option<Overlay>,
+    /// Stage 29: the last few things the app announced, newest first, for
+    /// row 2 of the modeline. Derived by watching `status` rather than
+    /// instrumenting every action — everything notable already announces
+    /// itself there, so one watcher catches all of it.
+    event_log: VecDeque<String>,
+    /// The status text already folded into `event_log`.
+    last_logged: String,
     /// `:set still=on` — freeze the tempo-locked breathing animations.
     /// Signal-driven feedback (channel LEDs, the playhead) stays live;
     /// only the decorative pulses stop. See [`Breath`].
@@ -785,6 +792,8 @@ impl App {
             viz_tick: 0,
             ghost: None,
             diff: None,
+            event_log: VecDeque::new(),
+            last_logged: String::new(),
             still: false,
             sprite_sheets: HashMap::new(),
             sprite_placements: Vec::new(),
@@ -1215,6 +1224,12 @@ struct Theme {
     instr_value: Color,
     instr_label: Color,
 
+    /// Phosphor's CRT scanline: a faint background on alternate grid rows.
+    /// `None` in themes that do not want one — DESIGN.md is explicit that
+    /// the effect should be *of* the terminal, an alternating-line colour
+    /// tweak, not a texture painted on top.
+    scanline_bg: Option<Color>,
+
     // Visualizer
     viz_bg: Color,
 
@@ -1279,6 +1294,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Green,
         instr_label: Color::Gray,
+        scanline_bg: None,
         viz_bg: Color::Rgb(12, 12, 24),
         // Colour does the talking here, matching git's vocabulary.
         ghost_fg: Color::DarkGray,
@@ -1324,6 +1340,7 @@ impl Theme {
         instr_row_fg: Color::Black,
         instr_value: Color::Rgb(255, 220, 120),
         instr_label: Color::Rgb(200, 130, 0),
+        scanline_bg: Some(Color::Rgb(18, 10, 0)),
         viz_bg: Color::Rgb(10, 5, 0),
         // Near-monochrome by design, so brightness and the margin sigil
         // carry the distinction instead of hue.
@@ -1692,7 +1709,10 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
             } else if in_cursor_col {
                 Some(theme.column_bg)
             } else {
-                None
+                // Phosphor's scanline: alternate rows sit on a faintly
+                // lifted ground. Lowest precedence, so it never competes
+                // with anything that carries meaning.
+                theme.scanline_bg.filter(|_| i % 2 == 1)
             };
 
             // The overlay composites on top of whatever that produced, so
@@ -1708,6 +1728,9 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let ghosting = matches!(mark, Some(Mark::Proposed) | Some(Mark::Vanishing));
+            // Entering INSERT narrows attention to the column you are
+            // typing into; the others stay legible but recede.
+            let unfocused = app.mode == Mode::Insert && !in_cursor_col;
             let apply = |fg: Color| {
                 let mut s = Style::default().fg(fg);
                 if let Some(b) = bg { s = s.bg(b); }
@@ -1715,6 +1738,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 // Reinforcement only: DIM is unevenly supported, so the
                 // tint and the sigil have to stand on their own.
                 if ghosting { s = s.add_modifier(Modifier::DIM | Modifier::ITALIC); }
+                if unfocused { s = s.add_modifier(Modifier::DIM); }
                 s
             };
 
@@ -1776,11 +1800,21 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
         None => title,
     };
     // The frame brightens on the downbeat of every bar — the whole pane
-    // taking a breath with the music.
+    // taking a breath with the music — and Live mode outlines it in red,
+    // so the mode is visible from the edge of vision rather than only in
+    // the modeline.
+    let base = if app.mode == Mode::Live { theme.mode_live } else { theme.hint };
+    let lit = if app.mode == Mode::Live { theme.mode_live } else { theme.accent };
+    // DESIGN.md's "the viz bleeds into the UI": the border flashes on a
+    // snare. The other half of that idea — the row tinting toward red when
+    // a note is dissonant against the root — needs a notion of consonance
+    // the app does not have, so it is not built.
+    let snare = app.viz_frame.voices[3].env_level.clamp(0.0, 1.0);
+    let border = mix(mix(base, lit, breath.pane()), theme.playhead_label, 0.7 * snare);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(mix(theme.hint, theme.accent, breath.pane())));
+        .border_style(Style::default().fg(border));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -2315,6 +2349,15 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("{}{}",
             if app.count > 0 { app.count.to_string() } else { String::new() },
             app.pending.display()))
+    } else if app.event_log.len() > 1 {
+        // Idle: a rolling log of what just happened, oldest to newest so it
+        // reads left to right. The newest entry is already the status line
+        // above, so it is skipped rather than shown twice.
+        let recent: Vec<String> = app.event_log.iter().skip(1).take(4).rev().cloned().collect();
+        Line::from(Span::styled(
+            format!("  {} ·", recent.join("  ·  ")),
+            Style::default().fg(theme.hint),
+        ))
     } else {
         Line::from(String::new())
     };
@@ -4057,6 +4100,22 @@ fn queue_or_launch_scene(app: &mut App, slot: usize) {
     );
 }
 
+/// Most rows in the log are worth one line of scrollback; beyond a handful
+/// they stop being a log and start being noise.
+const EVENT_LOG_MAX: usize = 6;
+
+/// Fold a changed status line into the rolling event log.
+fn record_event(app: &mut App) {
+    if app.status == app.last_logged {
+        return;
+    }
+    if !app.status.is_empty() {
+        app.event_log.push_front(app.status.clone());
+        app.event_log.truncate(EVENT_LOG_MAX);
+    }
+    app.last_logged = app.status.clone();
+}
+
 /// How much of the wait before a queued scene commits is still ahead, 1.0
 /// down to 0.0. Counts the sub-step phase as well as whole steps so the
 /// drain bar empties smoothly rather than in four jerks.
@@ -4762,6 +4821,7 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
         // Stage 9: snapshot the viz state while we're inside the lock.
         app.viz_frame = tr.frame;
     }
+    record_event(app);
     app.viz_tick = app.viz_tick.wrapping_add(1);
     let time_s = app.viz_tick as f32 / 60.0;
     // Stage 13: detect note-on edges and stamp the per-voice "last on" time.
@@ -5438,5 +5498,116 @@ mod tests {
         assert!(out.contains("2 row(s)"), "{}", out);
         assert!(out.contains('·'), "empty cells render faint: {}", out);
         assert!(out.contains('A'), "a note shows its letter: {}", out);
+    }
+
+    // ---------- Stage 29: atmosphere ----------
+
+    fn cell_at(app: &App, x: u16, y: u16) -> ratatui::buffer::Cell {
+        let mut t = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        t.draw(|f| render_phrase(f, f.area(), app)).unwrap();
+        t.backend().buffer().cell((x, y)).unwrap().clone()
+    }
+
+    #[test]
+    fn phosphor_scanlines_tint_alternate_rows_and_nes_has_none() {
+        let mut app = playing_app(0, 0.0);
+        app.still = true;
+        app.cursor_ch = 0;
+        app.cursor_step = 0;
+        // A column well clear of the cursor column and the playhead rows.
+        // Step 5 is an odd row (scanlined), step 6 an even one.
+        let (x, even_y, odd_y) = (60, 6 + 3, 5 + 3);
+        app.theme = Theme::by_name("nes").unwrap();
+        assert_eq!(cell_at(&app, x, odd_y).bg, Color::Reset, "nes asks for no scanline");
+        app.theme = Theme::by_name("phosphor").unwrap();
+        let scan = app.theme.scanline_bg.expect("phosphor declares a scanline");
+        assert_eq!(cell_at(&app, x, odd_y).bg, scan, "odd rows sit on the scanline ground");
+        assert_eq!(cell_at(&app, x, even_y).bg, Color::Reset, "even rows do not");
+    }
+
+    #[test]
+    fn the_scanline_never_outranks_something_meaningful() {
+        // Lowest precedence: the cursor, the playhead and the column tint
+        // all still win on a scanline row.
+        let mut app = playing_app(3, 0.0);
+        app.still = true;
+        app.theme = Theme::by_name("phosphor").unwrap();
+        app.cursor_step = 5;
+        app.cursor_ch = 0;
+        assert_eq!(cell_at(&app, 8, 5 + 3).bg, app.theme.cursor_bg, "cursor wins");
+        assert_ne!(cell_at(&app, 60, 3 + 3).bg, app.theme.scanline_bg.unwrap(), "playhead row wins");
+    }
+
+    #[test]
+    fn insert_mode_dims_the_channels_you_are_not_typing_into() {
+        let mut app = playing_app(0, 0.0);
+        app.still = true;
+        app.cursor_ch = 0;
+        let other_x = 8 + 15; // PU2's note field
+        let normal = cell_at(&app, other_x, 3);
+        app.mode = Mode::Insert;
+        let insert = cell_at(&app, other_x, 3);
+        assert!(!normal.modifier.contains(Modifier::DIM));
+        assert!(insert.modifier.contains(Modifier::DIM), "other channels recede in INSERT");
+        // The column being typed into does not.
+        assert!(!cell_at(&app, 8, 3).modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn live_mode_outlines_the_pane_and_a_snare_flashes_it() {
+        let mut app = playing_app(0, 0.5);
+        app.still = true;
+        let quiet = cell_at(&app, 40, 0).fg;
+        app.mode = Mode::Live;
+        let live = cell_at(&app, 40, 0).fg;
+        assert_ne!(quiet, live, "LIVE recolours the frame");
+        // A NOI hit pushes the border toward the playhead colour, so the
+        // viz visibly bleeds into the editor chrome.
+        app.mode = Mode::Normal;
+        app.viz_frame.voices[3].env_level = 1.0;
+        assert_ne!(cell_at(&app, 40, 0).fg, quiet, "a snare flashes the border");
+    }
+
+    #[test]
+    fn the_event_log_follows_the_status_line_without_repeating_it() {
+        let mut app = App::new();
+        app.status = "first".into();
+        record_event(&mut app);
+        record_event(&mut app); // unchanged status must not double-log
+        app.status = "second".into();
+        record_event(&mut app);
+        assert_eq!(app.event_log.iter().cloned().collect::<Vec<_>>(), vec!["second", "first"]);
+        // It stays a log, not a transcript.
+        for i in 0..20 {
+            app.status = format!("event {}", i);
+            record_event(&mut app);
+        }
+        assert_eq!(app.event_log.len(), EVENT_LOG_MAX);
+        assert_eq!(app.event_log[0], "event 19");
+        // An empty status clears nothing and adds nothing.
+        app.status = String::new();
+        record_event(&mut app);
+        assert_eq!(app.event_log[0], "event 19");
+    }
+
+    #[test]
+    fn the_modeline_shows_the_log_only_when_it_is_otherwise_idle() {
+        let mut app = App::new();
+        app.show_splash = false;
+        for s in ["alpha", "bravo"] {
+            app.status = s.into();
+            record_event(&mut app);
+        }
+        let row2 = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(90, 2)).unwrap();
+            t.draw(|f| render_status(f, f.area(), app)).unwrap();
+            let b = t.backend().buffer().clone();
+            (0..b.area().width).map(|x| b.cell((x, 1)).unwrap().symbol().to_string()).collect::<String>()
+        };
+        assert!(row2(&app).contains("alpha"), "idle row 2 shows the log");
+        assert!(!row2(&app).contains("bravo"), "the newest entry is already the status line");
+        // A pending count owns row 2 while it is live.
+        app.count = 4;
+        assert!(row2(&app).contains('4') && !row2(&app).contains("alpha"));
     }
 }

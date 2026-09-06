@@ -365,6 +365,25 @@ lives in viper.
   registers; viper has exactly one unnamed register, so that is what it
   shows.
 
+- **Stage 29** ✅ — **Atmosphere.** Four small pieces, all reading state
+  that already existed. Entering INSERT dims the channels you are not
+  typing into, so attention narrows to the column under the cursor. LIVE
+  outlines the phrase pane in red, putting the mode at the edge of vision
+  rather than only in the modeline. The border also flashes on a NOI hit —
+  DESIGN.md's "the viz bleeds into the UI"; its other half, the row tinting
+  toward red when a note is dissonant against the root, needs a notion of
+  consonance the app does not have and is not built. `phosphor` gains CRT
+  scanlines as a faint background on alternate rows, at the very bottom of
+  the background precedence chain so it never competes with the cursor,
+  the playhead or the column tint; `nes` declares none.
+
+  Row 2 of the modeline, previously blank unless you were typing a command
+  or holding a count, now carries a rolling event log. It is derived by
+  watching `status` once per UI tick rather than instrumenting every
+  action: everything notable already announces itself there, so one watcher
+  catches all of it, and the newest entry is skipped because it is already
+  the status line above.
+
 ### Generators
 
 - **Stage 25** ✅ — **Pattern generators from `GENERATION.md`.** `:gen
