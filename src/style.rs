@@ -644,7 +644,7 @@ fn lead_bar(ctx: &mut Ctx, riff: &Riff, chord: Chord, bar_in_section: usize, use
             for (i, _) in hits.iter().enumerate() {
                 let p = if i >= jab_from && jab {
                     // walk up or down toward the b2 / tritone
-                    if tritone && i == n - 1 { cur = root_deg; root_deg * 0 + ctx.nearest_degree(chord.root + 6) } else { cur += if ctx.rng.chance(0.5) { 1 } else { 2 }; cur }
+                    if tritone && i == n - 1 { cur = root_deg; ctx.nearest_degree(chord.root + 6) } else { cur += if ctx.rng.chance(0.5) { 1 } else { 2 }; cur }
                 } else if contour == "pedal_jumps" && i % 4 == 3 && ctx.rng.chance(0.5) {
                     *ctx.pick(&chord_degs) + ctx.scale.len() as i32 * if ctx.rng.chance(0.5) { 1 } else { 0 }
                 } else if contour == "pedal" && i == n - 1 && ctx.rng.chance(0.35) {

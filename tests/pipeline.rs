@@ -110,6 +110,55 @@ fn stress_song_compiles_renders_and_loops_exactly() {
 }
 
 #[test]
+fn a_seed_generates_the_same_song_every_time() {
+    // Two things, and the second is the one with teeth.
+    //
+    // Determinism — the same seed twice gives byte-identical songs — costs
+    // nothing to maintain and catches real nondeterminism, the kind that
+    // creeps in through hash iteration order and only shows up as an
+    // unreproducible song months later.
+    //
+    // Seed *stability* is the harder promise: that seed 1 keeps meaning the
+    // same music across versions. docs/GENERATION.md lists that as an open
+    // question ("if we tweak the algorithm, do we break seed=42?"), and the
+    // fingerprint below is what turns the question into an answer. It is
+    // also the safety net that let a clippy fix inside the generator be
+    // proven behaviour-preserving rather than merely believed to be.
+    //
+    // If you changed the generator on purpose, this test is supposed to
+    // fail. Update the constant, and say in the commit message what the
+    // seeds now sound like instead.
+    let tmp = std::env::temp_dir().join(format!("viper_seed_{}", std::process::id()));
+    let corpus = |dir: &std::path::Path| -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = viper()
+            .args(["gen", "--style"])
+            .arg(root().join("styles/neutral"))
+            .args(["--seed", "1", "--count", "12", "-o"])
+            .arg(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        assert_eq!(names.len(), 12, "twelve seeds, twelve songs");
+        names.iter().map(|p| std::fs::read_to_string(p).unwrap()).collect()
+    };
+    let a = corpus(&tmp.join("a"));
+    let b = corpus(&tmp.join("b"));
+    assert_eq!(a, b, "the same seed must give the same song");
+
+    // A digest rather than a stored corpus: twelve songs is 100 KB of
+    // fixture to review on every change, and nobody would.
+    let digest = a.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    assert_eq!(
+        digest, 0x9efe_e423_8d3d_0182,
+        "seed 1 no longer generates the same twelve songs; if that was deliberate, update this"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn neutral_style_generates_a_song_that_compiles() {
     let tmp = std::env::temp_dir().join(format!("viper_gen_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
