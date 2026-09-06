@@ -7,6 +7,7 @@ mod audio;
 mod compile;
 mod dpcm;
 mod gen;
+mod import;
 mod midi;
 mod modulation;
 mod sprite;
@@ -53,6 +54,16 @@ pub(crate) struct Cell {
     pub vol: u8,
     /// Effect column: (cmd, param). None = no effect.
     pub fx: Option<(u8, u8)>,
+    /// Hold cell (`===`): keep the previous note on this channel sounding,
+    /// no release, no retrigger. Implies `note == None` and no instr/vol/fx.
+    pub hold: bool,
+}
+
+impl Cell {
+    /// The `===` cell.
+    pub fn hold() -> Self {
+        Cell { hold: true, ..Default::default() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1173,7 +1184,16 @@ impl App {
         let cell = &mut self.phrase_mut().cells[s][c];
         cell.note = Some(note);
         cell.instr = instr;
+        cell.hold = false;
         // Auto-advance by edit_step (1 = classic tracker, 4 = one note per beat).
+        let step = self.song.edit_step.max(1);
+        self.cursor_step = (self.cursor_step + step).min(STEPS_PER_PHRASE - 1);
+    }
+
+    /// `=` in insert mode: a hold cell, then advance like a note.
+    fn insert_hold(&mut self) {
+        let (s, c) = (self.cursor_step, self.cursor_ch);
+        self.phrase_mut().cells[s][c] = Cell::hold();
         let step = self.song.edit_step.max(1);
         self.cursor_step = (self.cursor_step + step).min(STEPS_PER_PHRASE - 1);
     }
@@ -1902,7 +1922,7 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
             let cell = &over.map_or(*authored, |m| m.cell);
             let mark = over.map(|m| m.mark);
             let has_note = cell.note.is_some();
-            let note_text = note_name(cell.note);
+            let note_text = if cell.hold { "===".to_string() } else { note_name(cell.note) };
             let instr_text = if has_note {
                 format!("{:02X}", cell.instr)
             } else { "--".into() };
@@ -1914,7 +1934,10 @@ fn render_phrase(f: &mut Frame, area: Rect, app: &App) {
                 None => "---".into(),
             };
 
-            let mut note_color = if has_note { theme.note } else { theme.dim };
+            // A hold cell (`===`) has no note of its own but sustains the
+            // one above it, so it takes the instrument colour rather than
+            // reading as empty.
+            let mut note_color = if has_note { theme.note } else if cell.hold { theme.instr } else { theme.dim };
             let mut instr_color = if has_note { theme.instr } else { theme.dim };
             let mut vol_color = if has_note && cell.vol > 0 { theme.vol } else { theme.dim };
             let mut fx_color = if cell.fx.is_some() { theme.fx } else { theme.dim };
@@ -2075,6 +2098,7 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         row("0 / $",           "first / last channel (PU1 ↔ NOI)"),
         row("g / G",            "top / bottom of phrase"),
         row("x",                "clear cell (count: Nx clears N cells down column)"),
+        row("r=",               "turn the cell into a hold (===): the note above keeps sounding"),
         row("dd / yy / cc",     "delete / yank / change current step row"),
         row("dab / yab / cab",  "delete / yank / change current bar (4 steps)"),
         row("dip / yip / cip",  "delete / yank / change whole phrase"),
@@ -2838,6 +2862,12 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.pending = Pending::None;
             match key.code {
                 KeyCode::Esc => { app.status = "cancelled".into(); }
+                KeyCode::Char('=') => {
+                    app.snapshot();
+                    let (s, ch) = (app.cursor_step, app.cursor_ch);
+                    app.phrase_mut().cells[s][ch] = Cell::hold();
+                    app.status = format!("[{:02X},ch{}] is now a hold (===)", s, ch + 1);
+                }
                 KeyCode::Char(c) => {
                     if let Some(note) = App::piano_row_note(c, app.insert_octave) {
                         app.snapshot();
@@ -2846,6 +2876,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                         let cell = &mut app.phrase_mut().cells[s][ch];
                         cell.note = Some(note);
                         cell.instr = instr;
+                        cell.hold = false;
                         app.status = format!(
                             "replaced [{:02X},ch{}] with {}",
                             s, ch + 1, note_name(Some(note)),
@@ -3051,6 +3082,9 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
         KeyCode::Char('>') => {
             app.insert_octave = (app.insert_octave + 1).min(8);
             app.status = format!("octave {}", app.insert_octave);
+        }
+        KeyCode::Char('=') => {
+            app.insert_hold();
         }
         KeyCode::Char(c) => {
             if let Some(note) = App::piano_row_note(c, app.insert_octave) {
@@ -4799,7 +4833,7 @@ fn set_cursor_vol(app: &mut App, tok: &str) {
     let (s, c) = (app.cursor_step, app.cursor_ch);
     let cell = app.phrase().cells[s][c];
     if cell.note.is_none() {
-        app.status = "cursor cell has no note — vol only applies to notes".into();
+        app.status = "cursor cell has no note (=== holds the note above) — vol only applies to notes".into();
         return;
     }
     let v = match u8::from_str_radix(tok, 16) {
@@ -4821,7 +4855,7 @@ fn set_cursor_vol(app: &mut App, tok: &str) {
 fn set_cursor_fx(app: &mut App, tok: &str) {
     let (s, c) = (app.cursor_step, app.cursor_ch);
     if app.phrase().cells[s][c].note.is_none() {
-        app.status = "cursor cell has no note — fx only applies to notes".into();
+        app.status = "cursor cell has no note (=== holds the note above) — fx only applies to notes".into();
         return;
     }
     let tok = tok.to_ascii_uppercase();
@@ -5219,7 +5253,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}
@@ -5505,7 +5539,7 @@ mod tests {
             // From an empty phrase, so even `gen four` has something to
             // propose — against the demo song it is a genuine no-op.
             app.song.phrases[0] = Phrase::default();
-            app.song.phrases[0].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+            app.song.phrases[0].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };
             type_command(&mut app, cmd);
             let expected = materialize(&app);
             press(&mut app, KeyCode::Enter);
@@ -5634,7 +5668,7 @@ mod tests {
 
     #[test]
     fn diff_classifies_added_removed_and_changed() {
-        let note = |n: u8| Cell { note: Some(n), instr: 0, vol: 0, fx: None };
+        let note = |n: u8| Cell { note: Some(n), instr: 0, vol: 0, fx: None, hold: false };
         let mut a = Phrase::default();
         let mut b = Phrase::default();
         b.cells[0][0] = note(60);                       // added
@@ -5667,11 +5701,11 @@ mod tests {
         // that look identical.
         let a = Phrase::default();
         let mut b = Phrase::default();
-        b.cells[0][0] = Cell { note: None, instr: 7, vol: 9, fx: None };
+        b.cells[0][0] = Cell { note: None, instr: 7, vol: 9, fx: None, hold: false };
         assert!(Overlay::diff(&a, &b, String::new()).grid[0][0].is_none());
         // An fx-only difference does render, so it is marked.
         let mut c = Phrase::default();
-        c.cells[0][0] = Cell { note: None, instr: 0, vol: 0, fx: Some((b'V', 0x52)) };
+        c.cells[0][0] = Cell { note: None, instr: 0, vol: 0, fx: Some((b'V', 0x52)), hold: false };
         assert!(Overlay::diff(&a, &c, String::new()).grid[0][0].is_some());
     }
 
@@ -5710,7 +5744,7 @@ mod tests {
         let mut app = App::new();
         app.song.phrases[0] = Phrase::default();
         app.song.phrases.push(Phrase::default());
-        app.song.phrases[1].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None };
+        app.song.phrases[1].cells[0][0] = Cell { note: Some(60), instr: 0, vol: 0, fx: None, hold: false };
         execute_command(&mut app, "diff phrase 00 01");
         assert!(app.status.contains("+1"), "{}", app.status);
         execute_command(&mut app, "diff off");
@@ -6120,7 +6154,7 @@ mod tests {
     fn neighbour_rows_read_as_context_not_content() {
         let mut app = three_phrase_app();
         app.still = true;
-        app.song.phrases[0].cells[15][0] = Cell { note: Some(60), instr: 3, vol: 9, fx: Some((b'V', 1)) };
+        app.song.phrases[0].cells[15][0] = Cell { note: Some(60), instr: 3, vol: 9, fx: Some((b'V', 1)), hold: false };
         let mut t = Terminal::new(TestBackend::new(90, 30)).unwrap();
         t.draw(|f| render_phrase(f, f.area(), &app)).unwrap();
         let buf = t.backend().buffer().clone();

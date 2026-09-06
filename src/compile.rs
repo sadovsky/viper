@@ -3,7 +3,8 @@
 //! The mapping from the tracker grid to driver events:
 //!
 //! * A cell with a note gates the channel on for that step; the first empty
-//!   step afterwards releases it — exactly what the internal synth does.
+//!   step afterwards releases it — exactly what the internal synth does. A
+//!   hold cell (`===`) emits nothing, so the note keeps sounding.
 //! * Instrument and volume changes are emitted only when they differ from
 //!   the stream's last value (tracked per pattern so patterns stay
 //!   order-independent).
@@ -86,6 +87,12 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
             for step in 0..STEPS_PER_PHRASE {
                 let cell = phrase.cells[step % len][ch];
                 let ev = &mut pat.rows[step][ch];
+                if cell.hold {
+                    // === : nothing happens, the note keeps sounding. On row 0
+                    // this also skips the defensive Off, which is how a note
+                    // holds across a phrase boundary.
+                    continue;
+                }
                 match cell.note {
                     Some(n) => {
                         let instr = cell.instr.min((INSTRUMENTS - 1) as u8);
@@ -230,8 +237,8 @@ mod tests {
     #[test]
     fn lowering_emits_instr_vol_note_and_off() {
         let mut song = Song::default();
-        song.phrases[0].cells[0][0] = crate::Cell { note: Some(64), instr: 1, vol: 0, fx: None };
-        song.phrases[0].cells[2][0] = crate::Cell { note: Some(66), instr: 1, vol: 8, fx: Some((b'V', 0x63)) };
+        song.phrases[0].cells[0][0] = crate::Cell { note: Some(64), instr: 1, vol: 0, fx: None, hold: false };
+        song.phrases[0].cells[2][0] = crate::Cell { note: Some(66), instr: 1, vol: 8, fx: Some((b'V', 0x63)), hold: false };
         let l = lower(&song, None).unwrap();
         let rows = &l.module.songs[0].patterns[0].rows;
         assert_eq!(rows[0][0], vec![Event::Instr(1), Event::Vol(15), Event::Note(40)]);

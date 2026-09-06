@@ -34,8 +34,12 @@ accidental  := '-' | '#'
 key_value   := ident '=' value
 ```
 
-Notes are always 3 chars wide. `---` means empty. Sharps only (no flats,
-matches every tracker from ProTracker forward). Octaves 0–9.
+Notes are always 3 chars wide. `---` means empty (the channel releases).
+`===` is a **hold**: the note above keeps sounding, no release, no
+retrigger, across phrase boundaries too. Sharps only (no flats, matches
+every tracker from ProTracker forward). Octaves 0–9. In the tracker `=`
+writes a hold in insert mode and `r=` turns a cell into one; a hold with
+no note above it is harmless and gets a warning on load.
 
 Rows carry five cells: `PU1 PU2 TRI NOI DPCM`. Files with four cells
 per row still load; the DPCM column is empty. On the DPCM column the
@@ -185,6 +189,29 @@ effects; the NSF driver implements them (Stage 18):
 | `E00` | restart the volume envelope without retriggering |
 
 Effect state persists on the channel until changed.
+
+## `viper import` map files
+
+`viper import song.mid --map song.vmap -o song.vip` turns a Standard
+MIDI File into a `.vip` using a map in this same directive grammar:
+
+```
+@song     title="..." artist="..." arranger="..." bpm=auto transpose=0
+@track    midi="Lead"   ch=PU1 instr=00 flatten=top  octave=0 vibrato=V42 vibrato_min_rows=2
+@track    midi="Rhythm" ch=PU2 instr=01 flatten=root octave=-1
+@track    midi="Bass"   ch=TRI instr=02
+@track    midi="Drums"  drums=1
+@drum     36 dpcm=0                # GM key(s) → DPCM slot
+@drum     42,51 noi=C-6/03         # or a noise note/instrument
+@priority dpcm=38,36  noi=49,42    # who wins a row when two hits collide
+@fallback 36 noi=C-2/05            # a losing kick becomes a thump if NOI is free
+@instr / @dpcm / @driver           # as in .vip, copied into the output
+```
+
+Rows are 16ths; held notes become `===`; chords collapse per `flatten`
+(`top` keeps the highest, `root` the lowest), except that a chord shared
+by PU1 and PU2 is voiced root on PU2, fifth on PU1. `midi=` matches a
+track name case-insensitively by substring.
 
 ## Parser error handling
 

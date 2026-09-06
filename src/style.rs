@@ -120,7 +120,7 @@ pub struct Style {
 
 // ---------------------------------------------------------------- parsing
 
-fn kv(s: &str) -> Vec<(String, String)> {
+pub(crate) fn kv(s: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut rest = s.trim();
     while !rest.is_empty() {
@@ -777,7 +777,7 @@ fn drum_cells(style: &Style, d: &Drums, fill: bool, crash_start: bool, rng: &mut
 }
 
 fn cell(note: u8, instr: u8, fx: Option<(u8, u8)>) -> Cell {
-    Cell { note: Some(note), instr, vol: 0, fx }
+    Cell { note: Some(note), instr, vol: 0, fx, hold: false }
 }
 
 /// What `generate` chose, for headers and manifests.
@@ -914,7 +914,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
         }
         for _ in 0..section.repeat {
             for ph in &phrases {
-                let key: Vec<u8> = ph.cells.iter().flatten().flat_map(|c| [c.note.unwrap_or(0xFF), c.instr, c.fx.map(|f| f.0).unwrap_or(0), c.fx.map(|f| f.1).unwrap_or(0)]).collect();
+                let key: Vec<u8> = ph.cells.iter().flatten().flat_map(|c| [c.note.unwrap_or(if c.hold { 0xFE } else { 0xFF }), c.instr, c.fx.map(|f| f.0).unwrap_or(0), c.fx.map(|f| f.1).unwrap_or(0)]).collect();
                 let idx = *phrase_index.entry(key).or_insert_with(|| {
                     song.phrases.push(ph.clone());
                     song.phrases.len() - 1

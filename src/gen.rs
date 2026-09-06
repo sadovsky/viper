@@ -102,7 +102,8 @@ pub fn four_on_floor(song: &mut Song) {
             instr: 3,
             vol: 15,
             fx: None,
-        };
+                hold: false,
+            };
     }
 }
 
@@ -153,6 +154,7 @@ pub fn euclid(
                 instr,
                 vol: 15,
                 fx: None,
+                hold: false,
             };
         }
     }
@@ -268,6 +270,7 @@ pub fn random_in_scale(
                 instr,
                 vol: 15,
                 fx: None,
+                hold: false,
             };
         }
     }
@@ -420,7 +423,7 @@ fn ensure_phrases(song: &mut Song, count: usize) {
 }
 
 fn hit(note: u8, instr: u8, vol: u8) -> Cell {
-    Cell { note: Some(note), instr, vol, fx: None }
+    Cell { note: Some(note), instr, vol, fx: None, hold: false }
 }
 
 // ---------- chord_prog / bassline / arp ----------
