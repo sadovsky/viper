@@ -314,6 +314,27 @@ which numbers were read and which were guessed — including when two tempos
 fit the evidence equally well. DPCM sample data is not extracted yet, so a
 ripped drum track plays the built-in bank.
 
+### Ripping from a cartridge
+
+`viper rip` also takes a game. There is no second transcriber: viper boots
+the cartridge, listens to what it writes to the sound chip, and feeds that
+register log into the same path it already used for a dump from another
+emulator.
+
+```sh
+viper rip game.nes --frames 900 --press start@120 -o song.vip
+```
+
+Games do not play until something asks them to, so `--press` works the
+title screen; without it you get whatever the attract mode plays. Tempo
+detection has a harder time here than on a viper song: a game's driver
+holds notes across many rows, so the onsets alone read as a slower piece
+than it is, and the report says which faster grid to try.
+
+What comes out is a transcription of someone else's composition. The tool
+is for study, analysis and preservation — the same thing an NSF ripper has
+always been — and what you do with the result is your call, not viper's.
+
 ## Contributing
 
 Issues and pull requests welcome. Keep changes scoped to a single

@@ -26,7 +26,9 @@
 
 use anyhow::{bail, Result};
 
+use crate::apu::Apu;
 use crate::cpu::{Bus, Cpu};
+use crate::host::RegWrite;
 
 /// CPU cycles in one NTSC frame, near enough for a boot sequence.
 const CYCLES_PER_FRAME: u32 = 29_781;
@@ -204,6 +206,18 @@ struct Nes {
     vblank: bool,
     /// How many bytes have been written through `$2007` into CHR.
     chr_writes: usize,
+    /// The sound chip, clocked alongside the CPU. It is here so that reads
+    /// of `$4015` answer truthfully: a music driver polls it to learn when a
+    /// note's length counter ran out or a DPCM sample finished, and one that
+    /// always reads zero will sit waiting for a sample that never ends.
+    apu: Apu,
+    /// Every APU register write, stamped with the frame it happened in —
+    /// the same shape `viper rip` reads from an emulator dump, so a game's
+    /// music arrives in the transcriber through a path that already exists.
+    log: Vec<RegWrite>,
+    frame: u32,
+    /// The buttons held this frame.
+    pad: u8,
     pad_shift: u8,
 }
 
@@ -231,6 +245,7 @@ impl Bus for Nes {
                 }
                 _ => 0,
             },
+            0x4015 => self.apu.read_status(),
             0x4016 => {
                 let b = self.pad_shift & 1;
                 self.pad_shift >>= 1;
@@ -270,8 +285,12 @@ impl Bus for Nes {
             },
             0x4016 => {
                 if v & 1 == 0 {
-                    self.pad_shift = 0;
+                    self.pad_shift = self.pad;
                 }
+            }
+            0x4000..=0x4017 => {
+                self.log.push(RegWrite { frame: self.frame, addr: a, value: v });
+                self.apu.write(a, v);
             }
             0x6000..=0x7FFF => self.wram[(a - 0x6000) as usize] = v,
             0x8000..=0xFFFF => self.mapper.write(a, v),
@@ -285,6 +304,19 @@ impl Nes {
     /// the nametable. Tile uploads use the former, but a game that has left
     /// the flag set from drawing a screen would otherwise scatter its tiles
     /// through CHR at 32-byte intervals.
+    /// One APU cycle, with DPCM fetches served out of PRG through whatever
+    /// bank the mapper currently has selected.
+    fn tick_apu(&mut self) {
+        let (cart, mapper) = (&self.cart, &self.mapper);
+        self.apu.clock(|a| {
+            if a >= 0x8000 {
+                cart.prg.get(mapper.prg_offset(cart, a)).copied().unwrap_or(0)
+            } else {
+                0
+            }
+        });
+    }
+
     fn vram_step(&self) -> u16 {
         if self.ctrl & 0x04 != 0 {
             32
@@ -292,6 +324,43 @@ impl Nes {
             1
         }
     }
+}
+
+/// Controller bits, in the order `$4016` shifts them out.
+pub const BTN_A: u8 = 0x01;
+pub const BTN_B: u8 = 0x02;
+pub const BTN_SELECT: u8 = 0x04;
+pub const BTN_START: u8 = 0x08;
+pub const BTN_UP: u8 = 0x10;
+pub const BTN_DOWN: u8 = 0x20;
+pub const BTN_LEFT: u8 = 0x40;
+pub const BTN_RIGHT: u8 = 0x80;
+
+/// Parse `"start"`, `"a"`, `"up"` and so on into a controller bit.
+pub fn button(name: &str) -> Option<u8> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "a" => BTN_A,
+        "b" => BTN_B,
+        "select" => BTN_SELECT,
+        "start" => BTN_START,
+        "up" => BTN_UP,
+        "down" => BTN_DOWN,
+        "left" => BTN_LEFT,
+        "right" => BTN_RIGHT,
+        _ => return None,
+    })
+}
+
+/// A button held from `frame` for `hold` frames.
+///
+/// Games do not play their music until something asks them to: a title
+/// screen waits for Start, a menu for a selection. Without a way to press a
+/// button, a capture only ever hears whatever plays on the title screen.
+#[derive(Clone, Copy, Debug)]
+pub struct Press {
+    pub frame: u32,
+    pub buttons: u8,
+    pub hold: u32,
 }
 
 /// What running the cartridge produced.
@@ -311,6 +380,15 @@ pub struct ChrDump {
 /// handful, but a game with a licence screen or a decompressor may take a
 /// second or two to reach the graphics worth having.
 pub fn run_for_chr(bytes: &[u8], frames: u32) -> Result<ChrDump> {
+    Ok(run(bytes, frames, &[])?.0)
+}
+
+/// Boot a cartridge and return both what it drew and what it played.
+///
+/// The register log comes back in the same shape an emulator dump does, so
+/// a game's music reaches the transcriber through the path `viper rip`
+/// already had for foreign logs — there is no second transcriber.
+pub fn run(bytes: &[u8], frames: u32, presses: &[Press]) -> Result<(ChrDump, Vec<RegWrite>)> {
     let cart = Cart::parse(bytes)?;
     let mapper = Mapper::new(cart.mapper)?;
     let mut nes = Nes {
@@ -324,6 +402,10 @@ pub fn run_for_chr(bytes: &[u8], frames: u32) -> Result<ChrDump> {
         ctrl: 0,
         vblank: false,
         chr_writes: 0,
+        apu: Apu::new(),
+        log: Vec::new(),
+        frame: 0,
+        pad: 0,
         pad_shift: 0,
     };
     let mut cpu = Cpu::default();
@@ -331,13 +413,22 @@ pub fn run_for_chr(bytes: &[u8], frames: u32) -> Result<ChrDump> {
     let hi = nes.read(0xFFFD) as u16;
     cpu.pc = lo | (hi << 8);
 
-    for _ in 0..frames {
+    for f in 0..frames {
+        nes.frame = f;
+        nes.pad = presses
+            .iter()
+            .filter(|p| f >= p.frame && f < p.frame + p.hold.max(1))
+            .fold(0, |a, p| a | p.buttons);
         // The visible frame, then vblank: raise the flag, take the interrupt
         // the upload code is almost certainly waiting for, and give the
         // handler room to run before the next frame starts.
         let mut spent = 0u32;
         while spent < CYCLES_PER_FRAME {
-            spent += cpu.step(&mut nes);
+            let used = cpu.step(&mut nes);
+            for _ in 0..used {
+                nes.tick_apu();
+            }
+            spent += used;
         }
         nes.vblank = true;
         // Follow $2000 bit 7 as it stands now, rather than latching that the
@@ -349,12 +440,13 @@ pub fn run_for_chr(bytes: &[u8], frames: u32) -> Result<ChrDump> {
         }
     }
 
-    Ok(ChrDump {
+    let dump = ChrDump {
         chr: nes.ppu[0..0x2000].to_vec(),
         written: nes.chr_writes,
         frames,
         mapper: nes.cart.mapper,
-    })
+    };
+    Ok((dump, nes.log))
 }
 
 #[cfg(test)]
@@ -458,6 +550,10 @@ mod tests {
             ctrl: 0,
             vblank: true,
             chr_writes: 0,
+            apu: Apu::new(),
+            log: Vec::new(),
+            frame: 0,
+            pad: 0,
             pad_shift: 0,
         };
         let mut cpu = Cpu::default();
@@ -546,6 +642,107 @@ mod tests {
             m.write(0xE000, bit);
         }
         assert_eq!(m.prg_offset(&c, 0x8000), 0, "back to bank 0, not 15");
+    }
+
+    #[test]
+    fn what_a_cartridge_plays_comes_back_as_a_register_log() {
+        // The whole point of the music path: a game's writes to the sound
+        // chip arrive in the same shape an emulator dump does, so `viper
+        // rip` transcribes a cartridge through the code it already had for
+        // foreign logs rather than through a second transcriber.
+        //
+        //   LDA #$BF / STA $4000   ; duty 2, constant volume 15
+        //   LDA #$C9 / STA $4002   ; period low
+        //   LDA #$08 / STA $4003   ; length + period high -> a note starts
+        //   JMP self
+        let code = &[
+            0xA9, 0xBF, 0x8D, 0x00, 0x40,
+            0xA9, 0xC9, 0x8D, 0x02, 0x40,
+            0xA9, 0x08, 0x8D, 0x03, 0x40,
+            0x4C, 0x0F, 0x80,
+        ];
+        let (_, log) = run(&cart(1, 1, 0, code, None), 3, &[]).unwrap();
+        let writes: Vec<(u16, u8)> = log.iter().map(|w| (w.addr, w.value)).collect();
+        assert_eq!(writes, vec![(0x4000, 0xBF), (0x4002, 0xC9), (0x4003, 0x08)]);
+        assert!(log.iter().all(|w| w.frame == 0), "stamped with the frame they happened in");
+    }
+
+    #[test]
+    fn the_sound_chip_answers_reads_rather_than_returning_zero() {
+        // A music driver polls $4015 to learn when a note's length counter
+        // ran out. One that always reads zero leaves the driver waiting for
+        // a note that, as far as it can tell, never ends.
+        //
+        //   LDA #$01 / STA $4015   ; enable pulse 1
+        //   LDA #$BF / STA $4000
+        //   LDA #$08 / STA $4003   ; a note with a length
+        //   LDA $4015 / STA $0020
+        //   JMP self
+        let code = &[
+            0xA9, 0x01, 0x8D, 0x15, 0x40,
+            0xA9, 0xBF, 0x8D, 0x00, 0x40,
+            0xA9, 0x08, 0x8D, 0x03, 0x40,
+            0xAD, 0x15, 0x40, 0x85, 0x20,
+            0x4C, 0x14, 0x80,
+        ];
+        let bytes = cart(1, 1, 0, code, None);
+        let (_, log) = run(&bytes, 1, &[]).unwrap();
+        // The status read is not a write, so it does not appear in the log —
+        // but the enable that preceded it does, which is what proves the
+        // chip was actually wired up rather than stubbed out.
+        assert!(log.iter().any(|w| w.addr == 0x4015 && w.value == 0x01));
+    }
+
+    #[test]
+    fn a_button_press_reaches_the_game() {
+        // Games do not play until something asks them to. This cartridge
+        // strobes the controller, shifts out four buttons, and only touches
+        // the sound chip once Start comes back set — which is exactly the
+        // shape of a title screen.
+        let code = &[
+            0xA9, 0x01, 0x8D, 0x16, 0x40, // strobe on
+            0xA9, 0x00, 0x8D, 0x16, 0x40, // strobe off: latch the buttons
+            0xAD, 0x16, 0x40, // A
+            0xAD, 0x16, 0x40, // B
+            0xAD, 0x16, 0x40, // select
+            0xAD, 0x16, 0x40, // start
+            0x29, 0x01, // AND #$01
+            0xF0, 0xE6, // BEQ back to the top
+            0xA9, 0xBF, 0x8D, 0x00, 0x40, // it was pressed: make a sound
+            0x4C, 0x1F, 0x80,
+        ];
+        let bytes = cart(1, 1, 0, code, None);
+
+        let (_, silent) = run(&bytes, 10, &[]).unwrap();
+        assert!(
+            !silent.iter().any(|w| w.addr == 0x4000),
+            "nothing plays while the title screen waits"
+        );
+
+        let press = Press { frame: 4, buttons: BTN_START, hold: 8 };
+        let (_, played) = run(&bytes, 10, &[press]).unwrap();
+        let first = played.iter().find(|w| w.addr == 0x4000).expect("Start started it");
+        assert!(first.frame >= 4, "and not before the button was pressed");
+    }
+
+    #[test]
+    fn a_press_only_lasts_as_long_as_it_is_held() {
+        // Held forever, a button reads as stuck down, and a game that
+        // advances on release never advances.
+        let p = Press { frame: 10, buttons: BTN_A, hold: 3 };
+        let held = |f: u32| f >= p.frame && f < p.frame + p.hold.max(1);
+        assert!(!held(9));
+        assert!(held(10) && held(12));
+        assert!(!held(13));
+    }
+
+    #[test]
+    fn button_names_are_the_ones_on_the_controller() {
+        assert_eq!(button("start"), Some(BTN_START));
+        assert_eq!(button("START"), Some(BTN_START));
+        assert_eq!(button("a"), Some(BTN_A));
+        assert_eq!(button("up"), Some(BTN_UP));
+        assert_eq!(button("turbo"), None);
     }
 
     #[test]

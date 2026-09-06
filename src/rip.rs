@@ -905,7 +905,18 @@ impl Report {
                     "INFERRED, GUESSED: worst {:.2} rows, {} onsets collided on a row{}",
                     worst_rows,
                     collisions,
-                    if collisions > 0 { " — the grid may be too coarse, try --bpm" } else { "" }
+                    // Collisions mean two notes wanted one row, which only
+                    // happens when the grid is coarser than the music. The
+                    // "largest grid that fits" rule is right for a viper song,
+                    // where nearly every row carries a note; a game driver
+                    // holds notes across many rows, so the onsets alone look
+                    // like a slower piece than it is. Doubling is the fix
+                    // often enough to be worth naming.
+                    if collisions > 0 {
+                        format!(" — the grid is too coarse for this music; try --bpm {}", self.bpm * 2)
+                    } else {
+                        String::new()
+                    }
                 ),
             };
             s.push_str(&format!("tempo    {} BPM, {:.2} frames/row — {}\n", self.bpm, self.frames_per_row, how));
