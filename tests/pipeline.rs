@@ -80,7 +80,16 @@ fn stress_song_compiles_renders_and_loops_exactly() {
     // The external receipt: FCEUX 2.6.6 playing the same NSF, logged by
     // tools/fceux_apu_log.lua (INIT and PLAY 1 share a frame there, and
     // its frame counter starts at 3). Every PLAY frame must match.
-    let out = viper().args(["verify"]).arg(&nsf).arg("--vip").arg(&vip).arg("--against").arg(root().join("tests/golden/stress_melodeath.fceux.log")).output().unwrap();
+    //
+    // It is pinned to driver-fceux.bin, the exact build FCEUX played. The
+    // capture is evidence about that driver; re-linking it against a newer
+    // one would silently rewrite the evidence. When the driver changes in
+    // a way that alters its register writes, recapture with FCEUX and
+    // replace both the fixture and the log together.
+    let fceux_nsf = tmp.join("stress-fceux.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver-fceux.bin")).arg("--sym").arg(root().join("tests/fixtures/driver-fceux.sym")).arg("-o").arg(&fceux_nsf).output().unwrap();
+    assert!(out.status.success(), "compile against the FCEUX-era driver: {}", String::from_utf8_lossy(&out.stderr));
+    let out = viper().args(["verify"]).arg(&fceux_nsf).arg("--vip").arg(&vip).arg("--against").arg(root().join("tests/golden/stress_melodeath.fceux.log")).output().unwrap();
     let verify_out = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success() && verify_out.contains("frames compared: 196") && verify_out.contains("PLAY frames match"), "{}", verify_out);
     // A tampered log is caught, with the frame named.
