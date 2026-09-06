@@ -79,10 +79,46 @@ noise periods (C-2 and below = deepest rumble, C-7 and above = hiss).
 @instr 01  voice=triangle a=00  d=00  s=0F  r=04
 @instr 02  voice=noise    a=00  d=04  s=00  r=00
 
-# Optional modulation bindings (stage 12)
-@bind sprite mario.0 scale = tri.env * 0.5 + 1.0
-@bind sprite mario.0 hue   = pu1.pitch % 360
+# Scene slots and visualizer state (stages 7, 11-13)
+@scene 1  phrase=00
+@sprite palette dusk 102030 405060 708090 transparent
+@sprite load sprites/mario.png 16x16
+@sprite place mario 0 10 10
+@bind mario.0 scale = tri.env * 0.5 + 1.0
+@bind mario.0 hue   = pu1.pitch % 360
 ```
+
+## Scene slots and visualizer state
+
+`@scene`, `@sprite` and `@bind` carry the tracker's scene slots and its
+visualizer. They take exactly the arguments of the matching `:` commands, so
+anything you can type you can save, and the file is the only documentation
+either needs:
+
+```
+@scene 3  phrase=02
+@sprite palette dusk 102030 405060 708090 transparent
+@sprite load sprites/mario.png 16x16 q
+@sprite repalette mario dusk
+@sprite place mario 0 10 10
+@bind mario.0 scale = tri.env * 0.5 + 1.0
+```
+
+Three details worth knowing:
+
+- **Palette colours are written without a leading `#`.** A `#` at the start of
+  a token opens a comment, so `#102030` would be stripped and the palette would
+  load empty. The reader accepts either form; the writer never emits `#`.
+- **Order matters on load**: palettes, then the sheets that may name one, then
+  placements, then the bindings that address them. The writer emits them that
+  way; a hand-written file should too.
+- **A sheet whose PNG has moved is a warning, not an error.** The song still
+  loads, without that sheet, and the status line says how many lines could not
+  be restored. Losing a visualizer should not cost you the music.
+
+Before Stage 31 these three directives were parsed only to be discarded, so
+saving a song silently destroyed every sprite, palette, placement, binding and
+scene slot it had — an exception to principle 1 above that is now closed.
 
 ## Cell columns
 
@@ -167,9 +203,9 @@ they hold the defaults.
 | `@length` | `pu1=16 pu2=16 tri=16 noi=16 dpcm=16` per-channel wrap length (polymeter) | 23 |
 | `@groove` | `swing=N`, or a row of 16 signed sample offsets (synth engine only) | 23 |
 | `@instr`  | instrument definition                      | 3     |
-| `@scene`  | named snapshot of chain state              | 7     |
-| `@bind`   | modulation binding                         | 12    |
-| `@sprite` | sprite sheet reference + palette           | 11    |
+| `@scene`  | `N phrase=NN` — bind scene slot N to a phrase | 7   |
+| `@bind`   | `ADDR TARGET = EXPR` — modulation binding  | 12    |
+| `@sprite` | `load` / `palette` / `place` / `repalette` | 11    |
 | `@meta`   | free-form key=value metadata (author, etc) | any   |
 | `@driver` | NSF driver binary/symbol map + expansion flag | 18    |
 | `@dpcm`   | `NN name=.. path=.. [rate=15]` DPCM sample for note C-4+NN; `rate` is the $4010 index it was encoded at | 18    |

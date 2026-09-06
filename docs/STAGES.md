@@ -429,6 +429,34 @@ lives in viper.
   it had no scrolling and no wrapping, so on a 24-row terminal most of the
   reference was unreachable with no sign anything had been cut.
 
+### Format
+
+- **Stage 31** ✅ — **`.vip` round-trip losslessness.** `@scene`, `@sprite`
+  and `@bind` were parsed only to warn and discard, and were never written, so
+  saving a song silently destroyed every scene slot, sprite sheet, placement,
+  palette and modulation binding it had. The whole Stage 11–13 visualizer
+  could not be persisted at all, and FORMAT.md's own canonical example warned
+  twice on load — against a doc whose first principle calls round-tripping
+  "non-negotiable".
+
+  `Song` now carries those lines verbatim in `extras`, so `viper fmt` and
+  `viper check` are lossless without knowing their grammar and `Song` stays
+  cheap to deep-clone on every undo snapshot. The TUI regenerates them from
+  live state on save and replays them through `execute_command` on load, so
+  the file grammar and the `:` grammar are the same thing by construction.
+
+  Two fields were missing for a faithful round trip: `SpriteSheet` did not
+  record `quantize` (so a quantized sheet failed to reload, its source PNG
+  still having too many colours) or which named palette `:sprite repalette`
+  had applied. Both are stored now. Palette colours are written without a
+  leading `#`, which would otherwise be eaten as a comment.
+
+  Two bugs surfaced while testing. `:sprite load` drops a convenience
+  placement at (0,0), so placements bred on every save/load cycle until the
+  replay learned to discard them before applying the file's own. And
+  `edit_file` never cleared this state, so opening a second song inherited the
+  first one's visualizer and scene slots.
+
 ### Generators
 
 - **Stage 25** ✅ — **Pattern generators from `GENERATION.md`.** `:gen
