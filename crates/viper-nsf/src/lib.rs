@@ -20,7 +20,7 @@ pub use emit::{emit, EmitResult};
 pub use ir::*;
 
 /// Supported driver ABI.
-pub const DRIVER_ABI_VERSION: u32 = 1;
+pub const DRIVER_ABI_VERSION: u32 = 3;
 
 /// A sound driver binary + the symbols the emitter links against.
 #[derive(Clone, Debug)]

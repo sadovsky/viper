@@ -311,6 +311,16 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
                 }
                 "meta" => { parse_meta(&mut song, args); section = Section::None; }
                 "driver" => { parse_driver(&mut song, args); section = Section::None; }
+                "tempo" => {
+                    song.tempo_map = args
+                        .split_whitespace()
+                        .filter_map(|t| t.split_once('='))
+                        .map(|(r, b)| Ok::<_, std::num::ParseIntError>((r.parse::<usize>()?, b.parse::<u16>()?)))
+                        .collect::<Result<Vec<_>, _>>()
+                        .with_context(|| format!("line {}: @tempo", line_num))?;
+                    song.tempo_map.sort_by_key(|t| t.0);
+                    section = Section::None;
+                }
                 "dpcm" => {
                     parse_dpcm(&mut song, args)
                         .with_context(|| format!("line {}: @dpcm", line_num))?;

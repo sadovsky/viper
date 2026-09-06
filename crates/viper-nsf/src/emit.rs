@@ -24,6 +24,7 @@ const OP_SLIDE: u8 = 0x65;
 const OP_VIBRATO: u8 = 0x66;
 const OP_ARP: u8 = 0x67;
 const OP_ENV_RESET: u8 = 0x68;
+const OP_SPEED: u8 = 0x69;
 const OP_ROW_END: u8 = 0x80;
 
 const DPCM_BASE: usize = 0xC000;
@@ -100,6 +101,7 @@ fn encode_event(e: &Event, out: &mut Vec<u8>) {
         Event::Vibrato { depth, rate } => out.extend([OP_VIBRATO, (depth.min(15) << 4) | rate.min(15)]),
         Event::Arp { x, y } => out.extend([OP_ARP, (x.min(15) << 4) | y.min(15)]),
         Event::EnvReset => out.push(OP_ENV_RESET),
+        Event::Speed(v) => out.extend([OP_SPEED, (v & 0xFF) as u8, (v >> 8) as u8]),
     }
 }
 
@@ -244,8 +246,8 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         if song.order.is_empty() {
             bail!("song {} has an empty order list", si);
         }
-        if song.order.len() > 255 {
-            bail!("song {}: order list longer than 255", si);
+        if song.order.len() > 65535 {
+            bail!("song {}: order list longer than 65535", si);
         }
         if song.loop_pos >= song.order.len() {
             bail!("song {}: loop position {} is past the order list", si, song.loop_pos);
@@ -269,8 +271,13 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
 
         // header + order list as one object (the driver indexes into it)
         let (sp_lo, sp_hi) = fixed_8_8(song.frames_per_row)?;
-        let mut header = vec![sp_lo, sp_hi, song.rows_per_pattern, song.order.len() as u8, song.loop_pos as u8, 0, 0, 0, 0];
-        header.resize(9 + 10 * song.order.len(), 0);
+        let mut header = vec![
+            sp_lo, sp_hi, song.rows_per_pattern,
+            (song.order.len() & 0xFF) as u8, (song.order.len() >> 8) as u8,
+            (song.loop_pos & 0xFF) as u8, (song.loop_pos >> 8) as u8,
+            0, 0, 0, 0,
+        ];
+        header.resize(11 + 10 * song.order.len(), 0);
         let song_addr = lay.place(&header)?;
         lay.patch16(table_at + 2 * si, song_addr);
         data_bytes += header.len();
@@ -315,8 +322,8 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         }
         let dpcm_table = lay.place(&dtab)?;
         data_bytes += dtab.len();
-        lay.patch16(song_addr + 5, instr_table);
-        lay.patch16(song_addr + 7, dpcm_table);
+        lay.patch16(song_addr + 7, instr_table);
+        lay.patch16(song_addr + 9, dpcm_table);
 
         // streams, deduplicated by content
         let mut stream_addr: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -341,7 +348,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         }
         for (oi, &pi) in song.order.iter().enumerate() {
             for ci in 0..5 {
-                lay.patch16(song_addr + 9 + oi * 10 + ci * 2, pattern_streams[pi][ci]);
+                lay.patch16(song_addr + 11 + oi * 10 + ci * 2, pattern_streams[pi][ci]);
             }
         }
     }
