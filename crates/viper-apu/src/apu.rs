@@ -59,6 +59,26 @@ impl Envelope {
     }
 }
 
+/// The levels this envelope generator produces over `clocks` quarter-frames,
+/// restarting at `restart_at` if given.
+///
+/// Exists so `trace.rs`'s reimplementation can be checked against this one.
+/// Comparing observable output rather than internal state keeps both structs
+/// private and still catches any divergence that could reach a listener.
+#[cfg(test)]
+pub(crate) fn envelope_outputs(volume: u8, loop_: bool, constant: bool, restart_at: Option<usize>, clocks: usize) -> Vec<u8> {
+    let mut e = Envelope { start: true, loop_, constant, volume, divider: 0, decay: 0 };
+    (0..clocks)
+        .map(|i| {
+            if restart_at == Some(i) {
+                e.start = true;
+            }
+            e.clock();
+            e.output()
+        })
+        .collect()
+}
+
 #[derive(Clone, Default)]
 struct Pulse {
     enabled: bool,

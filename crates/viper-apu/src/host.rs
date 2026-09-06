@@ -280,7 +280,7 @@ impl Player {
 }
 
 #[cfg(test)]
-mod vrc6_host_tests {
+mod host_tests {
     use super::*;
     use crate::vrc6::is_vrc6_reg;
 
@@ -332,6 +332,103 @@ mod vrc6_host_tests {
             p.frame().unwrap();
         }
         p
+    }
+
+    /// A whole 2A03 NSF, hand-assembled the same way as `vrc6_nsf`: a pulse
+    /// at 50% duty, volume `vol`, period 253 — about 440 Hz, comfortably
+    /// between the output stage's 90 Hz high-pass and its 14 kHz low-pass.
+    fn pulse_nsf(vol: u8) -> Nsf {
+        //   A9 01  LDA #$01      ; enable pulse 1 only
+        //   8D 15 40  STA $4015
+        //   A9 Bx  LDA #$Bx      ; duty 2, halt set, constant volume, vol
+        //   8D 00 40  STA $4000
+        //   A9 08  LDA #$08      ; sweep off, shift 0 — the mute cannot fire
+        //   8D 01 40  STA $4001
+        //   A9 FD  LDA #$FD      ; period low = 253
+        //   8D 02 40  STA $4002
+        //   A9 08  LDA #$08      ; length index 1, period high = 0
+        //   8D 03 40  STA $4003
+        //   60     RTS
+        let mut code: Vec<u8> = vec![
+            0xA9, 0x01, 0x8D, 0x15, 0x40,
+            0xA9, 0xB0 | (vol & 0x0F), 0x8D, 0x00, 0x40,
+            0xA9, 0x08, 0x8D, 0x01, 0x40,
+            0xA9, 0xFD, 0x8D, 0x02, 0x40,
+            0xA9, 0x08, 0x8D, 0x03, 0x40,
+            0x60,
+        ];
+        let play = 0x8000 + code.len() as u16;
+        code.push(0x60); // PLAY: rts
+        let header = Nsf::build_header(0x8000, 0x8000, play, 1, "pulse", "", "", 0);
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&code);
+        Nsf::parse(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_2a03_pulse_comes_out_at_the_amplitude_the_mixer_predicts() {
+        // The one thing the golden log cannot check: that a register write
+        // reaching the CPU bus arrives at the resampler at the level the
+        // hardware says it should. The log records what the driver wrote;
+        // this records what came out.
+        //
+        // Derived here rather than recorded, so it still means something
+        // after the golden log is regenerated.
+        //
+        // A 50%-duty pulse alone at volume 15 alternates between
+        // pulse_table[0] = 0 and pulse_table[15], from the published mixer
+        // formula. The tempting prediction is half of that once the 90 Hz
+        // high-pass removes the DC — and it is wrong. A first-order
+        // high-pass does not merely centre a square wave, it droops within
+        // each half cycle, so the steady-state excursion is A / (1 + a^N)
+        // for a decay `a` over `N` samples of half period: about 0.61 A
+        // here, not 0.5 A. Getting that wrong is how a perfectly correct
+        // mixer looks broken.
+        let a = 95.52 / (8128.0 / 15.0 + 100.0); // pulse_table[15]
+        let hp_rc = 1.0 / (2.0 * std::f64::consts::PI * 90.0);
+        let hp_a = hp_rc / (hp_rc + 1.0 / 44_100.0);
+        let half = (16.0 * (253.0 + 1.0) / 2.0) * 44_100.0 / CPU_HZ; // samples
+        let predicted = (a / (1.0 + hp_a.powf(half))) as f32;
+        let got = tail_peak(&run(pulse_nsf(15), None));
+        assert!(
+            (got - predicted).abs() < predicted * 0.15,
+            "expected about {:.5} from the mixer and the filter, got {:.5}",
+            predicted,
+            got
+        );
+    }
+
+    #[test]
+    fn the_non_linear_mixer_is_live_all_the_way_to_the_output() {
+        // Volume 3 against volume 15. A linear mixer would give exactly
+        // 3/15 = 0.200; the real tables give pulse_table[3] / pulse_table[15]
+        // = 0.2285. The 14% gap is far outside measurement noise, so this
+        // proves the lookup tables are still in the path — through the bus,
+        // the resampler and both filters — and not quietly replaced by a
+        // multiply somewhere.
+        let loud = tail_peak(&run(pulse_nsf(15), None));
+        let soft = tail_peak(&run(pulse_nsf(3), None));
+        let ratio = soft / loud;
+        assert!((ratio - 0.2285).abs() < 0.05 * 0.2285, "ratio {:.4}, linear would be 0.2000", ratio);
+        assert!(ratio > 0.21, "and it is audibly not linear");
+    }
+
+    #[test]
+    fn masking_a_channel_does_not_change_its_timing() {
+        // apu.rs claims stems are "timing-identical to the full mix" because
+        // masking silences at the mixer without touching channel state. If
+        // that were ever untrue, every stem would drift against the mix it
+        // was split from, and nothing else would notice.
+        let full = run(pulse_nsf(15), Some(crate::apu::CH_ALL));
+        let solo = run(pulse_nsf(15), Some(crate::apu::CH_PU1));
+        let without = run(pulse_nsf(15), Some(crate::apu::CH_ALL & !crate::apu::CH_PU1));
+        assert_eq!(full.log, solo.log, "the same writes happen either way");
+        assert_eq!(full.samples.len(), solo.samples.len(), "and take the same time");
+        // Not sample-identical: the unmasked triangle sits at its ultrasonic
+        // mid-level and contributes a DC step the high-pass then removes. By
+        // the tail that difference is gone, which is the level that matters.
+        assert!((tail_peak(&full) - tail_peak(&solo)).abs() < 0.002, "same steady level");
+        assert!(tail_peak(&without) < 0.001, "muting pulse 1 leaves silence");
     }
 
     #[test]
