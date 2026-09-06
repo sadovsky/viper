@@ -197,7 +197,12 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     if module.songs.len() > 255 {
         bail!("NSF holds at most 255 songs");
     }
-    let mut warnings = Vec::new();
+    // Nothing warns here any more: the one warning this function had — the
+    // expansion header set anyway — became a hard error, because a warning
+    // could not stop a file that lied about itself from being written. The
+    // field stays on EmitResult so callers keep working and future emitter
+    // warnings have somewhere to go.
+    let warnings = Vec::new();
     let base = driver.load as usize;
 
     // --- DPCM samples: collect across songs, dedupe by content ---
