@@ -30,7 +30,7 @@ hear it through a cycle-stepped 2A03 (see [`docs/NSF.md`](docs/NSF.md)).
 ```sh
 viper song.vip                                   # open in the tracker
 viper check song.vip                             # parse + lowering report
-viper compile song.vip --driver driver.bin -o song.nsf
+viper compile song.vip --driver tests/fixtures/driver.bin -o song.nsf
 viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
 viper verify song.nsf --against fceux.log --vip song.vip  # diff vs another emulator
@@ -48,6 +48,24 @@ git clone https://github.com/sadovsky/viper.git
 cd viper
 cargo run --release
 ```
+
+### Compiling to NSF needs a driver
+
+viper is the front end and the compiler; it deliberately does not own a 6502
+sound driver. `viper compile` links your song's data against one you supply as
+a `driver.bin` plus a `driver.sym` symbol map.
+
+A working driver ships in this repo at `tests/fixtures/driver.bin`, so the
+`viper compile` line above runs as written. It is ABI v1: 1613 bytes, strict
+2A03 (no expansion audio), 16 rows per pattern, and it implements every effect
+the IR emits — note, off, volume, duty, instrument, retrigger, portamento,
+vibrato, arpeggio and envelope reset. That is enough for the whole toolchain,
+including `viper render` and `viper verify`.
+
+Its source, and the ABI it implements, live in
+[nintendo-metal](https://github.com/sadovsky/nintendo-metal) under `driver/`.
+Point `--driver` at your own build once you want to change the driver itself;
+a song's `@driver` directive can name one so you never have to pass the flag.
 
 Viper boots with a demo song loaded — an Am–F–G–Am (i–VI–VII–i)
 progression with a lead pulse, an arpeggiated pulse, a triangle bass,
@@ -193,34 +211,38 @@ mouse-driven DAWs never quite do.
 
 ## Status
 
-**Stages 1–23 are shipped.** You can:
+**Stages 1–31 are shipped.** The tracker, the NSF pipeline and the generation
+layer are all complete against the roadmap in
+[`docs/STAGES.md`](docs/STAGES.md).
 
-- edit a 16-step × 5-channel phrase with full vim motions, operators,
-  text objects, visual block selection, counts, undo/redo, and `.` repeat;
-- play it back with sample-accurate ADSR-driven pulse/triangle/noise
-  synthesis via `cpal`;
-- edit instruments with a dedicated modal editor;
-- save and load `.vip` files;
-- generate drum patterns, Euclidean rhythms, and random-in-scale melodies;
-- play live through the piano row, overdub-record to the grid, launch
-  scenes on bar boundaries, mute/unmute voices, record and replay
-  performance macros;
-- watch the song on a built-in visualizer (bars, scope, grid, orbit)
-  or load 4-color PNG sprite sheets and bind their position, scale,
-  flip, and frame index to any audio source via a small expression
-  language with note-on-triggered animations.
+**Editing.** A 16-step × 5-channel grid with vim motions, operators, text
+objects, visual block selection, counts, undo/redo and `.` repeat; hold cells
+(`===`) that sustain a note across rows; an instrument editor drawing its own
+ADSR envelope and waveform; plain-text `.vip` files that round-trip losslessly.
 
-Also: song mode — a flat `:order` list, or chains sequenced by an
-arrangement (`:chain`, `:arr`, `:song` pane) with per-channel polymeter
-(`:len`) and swing (`:groove`); the NSF pipeline — `:compile` a `.vip`
-against a 6502 driver, `:engine apu` to play the result through an
-emulated 2A03 in the tracker, `viper render` for deterministic
-per-channel stems and a register-write log (see
-[`docs/NSF.md`](docs/NSF.md)), with `viper verify` diffing that log
-against another emulator's (the bundled stress song matches FCEUX frame
-for frame); and `viper gen`, which composes whole songs from a style
-directory. Upcoming: more generators, plugin voices. See
-[`docs/STAGES.md`](docs/STAGES.md) for the full roadmap.
+**Playing.** Sample-accurate ADSR synthesis through `cpal`, or the real thing:
+`:engine apu` compiles the song and plays it through an emulated 2A03. Live
+keyboard mode, overdub recording, scene launching on bar boundaries, mutes and
+performance macros.
+
+**Arranging.** Phrases into chains into an arrangement, with per-channel
+polymeter (`:len`) and swing (`:groove`), or a flat `:order` list.
+
+**Seeing.** A visualizer pane with five renderers, 4-colour PNG sprite sheets,
+and a small expression language binding sprite position, scale, rotation,
+palette and frame to any audio source. Ghost previews of `:gen` and
+`:transpose` before they commit, and `:diff` between two phrases.
+
+**Shipping.** `viper compile` to NSF or NSFe, including multi-song album
+bundles; `viper render` for deterministic mixes, per-channel stems, trigger
+MIDI and a register-write log; `viper verify` to diff that log against another
+emulator (the bundled stress song matches FCEUX frame for frame); `viper dpcm`
+to encode DPCM samples with a trellis encoder that returns the DAC to its start
+level; `viper import` to turn a MIDI file into a `.vip`; and `viper gen` to
+compose whole songs from a style directory.
+
+Next up: real VRC6 expansion audio. Today `expansion=vrc6` sets a header bit
+and emits no VRC6 data, which is a file that lies about itself.
 
 ## Contributing
 
@@ -230,4 +252,4 @@ the audio engine or `.vip` parser.
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](LICENSE).

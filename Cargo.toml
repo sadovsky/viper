@@ -3,6 +3,7 @@ name = "viper"
 version = "0.1.0"
 edition = "2021"
 description = "A vim-keybound chiptune step sequencer for the terminal"
+license = "MIT"
 
 [workspace]
 members = ["crates/*"]
