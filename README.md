@@ -269,12 +269,15 @@ than guessed: the stress song's lead is written `s=0.90 r=60 duty=0.25
 vol=0.70` and rips as `s=0.909 r=67 duty=0.250 vol=0.733`, from the register
 log alone.
 
+Effect columns come back too. Vibrato, portamento and arpeggio all recover
+their parameters exactly, and a portamento target is found even though
+sliding never retriggers the channel — the case a ripper that followed
+key-ons alone would lose outright.
+
 An NSF records none of this, so all of it is inferred, and the report says
 which numbers were read and which were guessed — including when two tempos
-fit the evidence equally well. Effect columns and DPCM sample data are not
-recovered yet.
-
-Next up: recovering the effect columns — vibrato, slides and arpeggios.
+fit the evidence equally well. DPCM sample data is not extracted yet, so a
+ripped drum track plays the built-in bank.
 
 ## Contributing
 

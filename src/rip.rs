@@ -480,6 +480,189 @@ fn read_adsr(levels: &[u8], vol: u8) -> Option<Adsr> {
     Some(Adsr { attack, decay, release: r, peak, sustain })
 }
 
+/// What the pitch was doing inside one note.
+///
+/// A tracker cell holds one effect, and `compile` only emits it on a cell
+/// that carries a note, so a note's whole period series has to reduce to a
+/// single answer. That constraint does most of the work: the three motions
+/// below look nothing like each other over a few frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Motion {
+    Steady,
+    /// `Vdr`: the period wobbles around the note by less than a semitone.
+    Vibrato { depth: u8, rate: u8 },
+    /// `Axy`: the period cycles through the note and two offsets from it,
+    /// one frame each.
+    Arpeggio { x: u8, y: u8 },
+    /// `Sxx`: the period walks to a new pitch at a fixed number of units per
+    /// frame. Portamento does not retrigger, so this is the one motion that
+    /// arrives with no key-on to hang an effect on.
+    Slide { speed: u8 },
+}
+
+/// Read the pitch motion out of one note's periods.
+///
+/// The numbers come back exactly, because each effect writes its parameter
+/// into the register stream in a form that survives. Measured against the
+/// reference driver: vibrato spans `depth - 1` period units peak to peak and
+/// repeats every `32 / rate` frames; portamento moves `speed` units on its
+/// first frame; and an arpeggio's offsets are just the notes it visits.
+fn classify(periods: &[u16], ch: usize) -> Motion {
+    if periods.len() < 3 {
+        return Motion::Steady;
+    }
+    let (lo, hi) = (*periods.iter().min().unwrap(), *periods.iter().max().unwrap());
+    if lo == hi {
+        return Motion::Steady;
+    }
+    let note_of = |p: u16| if ch == TRI { tri_note(p) } else { pulse_note(p) };
+
+    // Arpeggio: two or three distinct pitches, revisited every few frames.
+    // The chip is stepping between them one frame at a time, which nothing
+    // else on this list does.
+    let all: Vec<u8> = periods.iter().filter_map(|&p| note_of(p)).collect();
+    // Pitches the cycle actually visits, not the ones it passes through. A
+    // period is written a byte at a time, so a frame can be sampled between
+    // two settings and name a note that was never played; those appear once
+    // and would otherwise make a three-note arpeggio look like a four-note
+    // one, which is not an arpeggio at all.
+    let visited: Vec<u8> = all.iter().copied().filter(|n| all.iter().filter(|m| *m == n).count() >= 2).collect();
+    let mut distinct: Vec<u8> = visited.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    // An arpeggio steps every frame. Two pitches that alternate every few
+    // frames are two notes, not one chord — the stress song's triangle
+    // rocks between E-2 and E-3 once a row, and calling that an arpeggio
+    // would rewrite its bassline as a single droning chord.
+    let longest_run = {
+        let mut best = 0usize;
+        let mut run = 0usize;
+        let mut prev: Option<u8> = None;
+        for n in &all {
+            run = if Some(*n) == prev { run + 1 } else { 1 };
+            prev = Some(*n);
+            best = best.max(run);
+        }
+        best
+    };
+    if (2..=3).contains(&distinct.len()) && visited.len() >= 4 && longest_run <= 2 {
+        // The root is the lowest pitch, which is the note the tracker wrote;
+        // the others are its offsets above it.
+        let root = *distinct.first().unwrap();
+        let off = |i: usize| distinct.get(i).map(|&n| n.saturating_sub(root).min(15)).unwrap_or(0);
+        return Motion::Arpeggio { x: off(1), y: off(2) };
+    }
+
+    // Slide: the pitch walks one way and stays there. The first step is the
+    // speed, since the driver moves a fixed number of units per frame until
+    // it arrives.
+    let first = (periods[1] as i32 - periods[0] as i32).unsigned_abs();
+    let ends_elsewhere = note_of(periods[0]) != note_of(*periods.last().unwrap());
+    if ends_elsewhere && first > 0 {
+        let monotone = periods.windows(2).take(4).all(|w| w[1] <= w[0]) || periods.windows(2).take(4).all(|w| w[1] >= w[0]);
+        if monotone {
+            return Motion::Slide { speed: first.min(255) as u8 };
+        }
+    }
+
+    // Vibrato: a wobble narrower than a semitone, repeating. Depth and rate
+    // both fall out of the shape.
+    if hi - lo < 32 {
+        let span = (hi - lo) as u8;
+        // A cycle is one return to the lowest period — the unmodulated pitch,
+        // since this driver bends only upward in period.
+        let mut cycle = 0usize;
+        let mut last: Option<usize> = None;
+        for (i, &p) in periods.iter().enumerate() {
+            if p == lo {
+                if let Some(prev) = last {
+                    if i - prev > 1 {
+                        cycle = i - prev;
+                        break;
+                    }
+                }
+                last = Some(i);
+            }
+        }
+        if cycle > 0 {
+            let rate = (32 / cycle).clamp(1, 15) as u8;
+            return Motion::Vibrato { depth: (span + 1).min(15), rate };
+        }
+    }
+    Motion::Steady
+}
+
+impl Motion {
+    /// The effect column this motion writes, if any.
+    fn fx(self) -> Option<(u8, u8)> {
+        match self {
+            Motion::Steady => None,
+            Motion::Vibrato { depth, rate } => Some((b'V', (depth << 4) | rate)),
+            Motion::Arpeggio { x, y } => Some((b'A', (x << 4) | y)),
+            Motion::Slide { speed } => Some((b'S', speed)),
+        }
+    }
+    /// The letter whose "off" form has to be written when this stops.
+    fn off(self) -> Option<(u8, u8)> {
+        match self {
+            Motion::Steady => None,
+            Motion::Vibrato { .. } => Some((b'V', 0)),
+            Motion::Arpeggio { .. } => Some((b'A', 0)),
+            Motion::Slide { .. } => Some((b'S', 0)),
+        }
+    }
+}
+
+/// The periods sounded inside one row. Empty for a row that does not exist,
+/// so callers can look at a neighbour without checking the edges first.
+fn row_periods(t: &[FrameTrace], c: usize, starts: &[u32], r: usize) -> Vec<u16> {
+    let Some(&from) = starts.get(r) else { return Vec::new() };
+    let to = starts.get(r + 1).copied().unwrap_or(u32::MAX);
+    t.iter()
+        .filter(|f| f.frame >= from && f.frame < to && f.ch[c].level > 0)
+        .map(|f| f.ch[c].period)
+        .collect()
+}
+
+/// The periods one note played while it was still *that* note.
+///
+/// Bounded twice, and both bounds matter. Thirty-two frames is one cycle of
+/// the slowest vibrato the format can express, so nothing is gained by
+/// looking further. And the window closes as soon as the pitch has moved
+/// somewhere else and stayed there for two frames: a note that is later slid
+/// or arpeggiated away from is still a plain note where it starts, and
+/// reading its whole life at once turns a vibrato into a slide.
+///
+/// Two frames rather than one, because an arpeggio visits other pitches for
+/// exactly one frame at a time and must not close the window.
+fn periods_played(t: &[FrameTrace], c: usize, from: u32) -> Vec<u16> {
+    let note_of = |p: u16| if c == TRI { tri_note(p) } else { pulse_note(p) };
+    let mut out: Vec<u16> = Vec::new();
+    let mut home: Option<u8> = None;
+    let mut away = 0;
+    for f in t.iter().skip_while(|f| f.frame < from).take(32) {
+        if f.frame > from && f.ch[c].keyed && f.ch[c].level > 0 {
+            break;
+        }
+        if f.ch[c].level == 0 {
+            break;
+        }
+        let n = note_of(f.ch[c].period);
+        home = home.or(n);
+        if n != home {
+            away += 1;
+            if away >= 2 {
+                out.truncate(out.len().saturating_sub(1));
+                break;
+            }
+        } else {
+            away = 0;
+        }
+        out.push(f.ch[c].period);
+    }
+    out
+}
+
 /// The levels one note played: from its key-on until the channel is keyed
 /// again or falls silent.
 ///
@@ -662,6 +845,10 @@ pub struct Report {
     pub phrases_unique: usize,
     /// Instruments synthesised from the envelopes the notes played.
     pub instruments: usize,
+    /// Notes carrying a recovered effect column.
+    pub effects: usize,
+    /// Notes found only because the pitch moved without a key-on.
+    pub slide_targets: usize,
     /// Audible notes written, per channel.
     pub notes: [usize; CHANNELS],
     /// Key-ons dropped because the channel had no volume at the time.
@@ -756,6 +943,13 @@ impl Report {
             "instr    {} synthesised from the envelopes the notes played\n",
             self.instruments
         ));
+        if self.effects > 0 || self.slide_targets > 0 {
+            s.push_str(&format!("fx       {} notes carry a recovered effect", self.effects));
+            if self.slide_targets > 0 {
+                s.push_str(&format!(", {} found only because the pitch moved with no key-on", self.slide_targets));
+            }
+            s.push('\n');
+        }
         if !self.dpcm_samples.is_empty() {
             s.push_str(&format!("dpcm     {} sample(s): {:02X?}\n", self.dpcm_samples.len(), self.dpcm_samples));
         }
@@ -846,9 +1040,107 @@ pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> 
                 report.row_collisions += 1;
                 continue;
             }
-            rows[r][c] = Cell { note: Some(n), instr: 0, vol: cell_volume(cf.level), fx: None, hold: false };
+            let motion = classify(&periods_played(t, c, f.frame), c);
+            rows[r][c] = Cell { note: Some(n), instr: 0, vol: cell_volume(cf.level), fx: motion.fx(), hold: false };
             report.notes[c] += 1;
+            if motion != Motion::Steady {
+                report.effects += 1;
+            }
             placed.push((r, c, NoteEnv { ch: c, duty: cf.duty, levels: played(t, c, f.frame) }));
+        }
+    }
+
+    // Slide targets. Portamento moves a channel to a new pitch without
+    // retriggering it, so there is no key-on to notice and the note it slides
+    // *to* would otherwise be lost entirely — the transcription would hold
+    // the old pitch through a passage that audibly moves. A pitch that
+    // changes with no key-on is that, and the row it arrives on is where the
+    // tracker wrote the target note.
+    for c in [PU1, PU2, TRI] {
+        let mut sounding: Option<u8> = None;
+        let mut active: Option<(u8, u8)> = None;
+        for r in 0..n_rows {
+            if let Some(n) = rows[r][c].note {
+                sounding = Some(n);
+                active = rows[r][c].fx;
+                continue;
+            }
+            let Some(&from) = grid.starts.get(r) else { continue };
+            let ps = row_periods(t, c, &grid.starts, r);
+            if ps.len() < 2 {
+                continue;
+            }
+            // Two rows for the classification, one for the answer. An
+            // arpeggio needs a couple of full cycles before its three pitches
+            // outnumber the frames caught between them.
+            let mut wide = ps.clone();
+            wide.extend(row_periods(t, c, &grid.starts, r + 1));
+            let note_of = |p: u16| if c == TRI { tri_note(p) } else { pulse_note(p) };
+            let level = t.iter().find(|f| f.frame == from).map(|f| f.ch[c].level).unwrap_or(0);
+            if level == 0 || sounding.is_none() {
+                continue;
+            }
+            // What this row did, judged on this row alone. A whole note's
+            // worth of frames would run past the next effect.
+            let (note, fx) = match classify(&wide, c) {
+                // An arpeggio is written on its root, not on whichever of
+                // its three pitches the row happened to end on.
+                Motion::Arpeggio { x, y } => {
+                    let root = ps.iter().filter_map(|&p| note_of(p)).min();
+                    match root {
+                        Some(n) => (n, Some((b'A', (x << 4) | y))),
+                        None => continue,
+                    }
+                }
+                _ => {
+                    let Some(now) = note_of(*ps.last().unwrap()) else { continue };
+                    if sounding == Some(now) {
+                        continue;
+                    }
+                    // Portamento moves a fixed number of period units per
+                    // frame, so its first step is its speed — measured from
+                    // where the pitch was at the end of the row before, since
+                    // by this row's first frame it has already moved once.
+                    let prev = row_periods(t, c, &grid.starts, r.wrapping_sub(1));
+                    let before = prev.last().copied().unwrap_or(ps[0]);
+                    let speed = (ps[0] as i32 - before as i32).unsigned_abs().min(255) as u8;
+                    (now, Some((b'S', speed)))
+                }
+            };
+            // Nothing has changed: the effect is still running on the note
+            // it started on, and a tracker writes that once. Repeating it
+            // every row would turn one arpeggiated chord into a wall of
+            // retriggers the original never played.
+            if sounding == Some(note) && fx == active {
+                continue;
+            }
+            active = fx;
+            rows[r][c] = Cell { note: Some(note), instr: 0, vol: cell_volume(level), fx, hold: false };
+            report.notes[c] += 1;
+            report.slide_targets += 1;
+            sounding = Some(note);
+            placed.push((r, c, NoteEnv { ch: c, duty: 2, levels: played(t, c, from) }));
+        }
+    }
+
+    // Effects persist on a channel until they are changed, so a plain note
+    // after a modulated one has to say so. Without the off-form it inherits
+    // the vibrato of the note before it and the transcription wobbles where
+    // the original was still.
+    for c in 0..CHANNELS {
+        let mut active: Option<(u8, u8)> = None;
+        for r in 0..n_rows {
+            if rows[r][c].note.is_none() {
+                continue;
+            }
+            match (active, rows[r][c].fx) {
+                (Some(prev), None) => {
+                    rows[r][c].fx = Motion::Steady.off().or(Some((prev.0, 0)));
+                    active = None;
+                }
+                (_, Some(f)) => active = if f.1 == 0 { None } else { Some(f) },
+                (None, None) => {}
+            }
         }
     }
 

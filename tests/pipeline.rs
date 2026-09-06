@@ -486,3 +486,48 @@ fn note_grid(vip: &str) -> Vec<[String; 5]> {
 fn rows_of(vip: &str) -> Vec<String> {
     vip.lines().filter(|l| l.starts_with("  ") && l.trim_start().len() > 2).map(|l| l.trim_end().to_string()).collect()
 }
+
+/// Effects, against a fixture written for the purpose.
+///
+/// Nothing else in the repo uses an effect column, so before this test the
+/// path from a `.vip` through the driver to the registers had never been
+/// exercised by a song in either direction.
+#[test]
+fn ripping_recovers_vibrato_portamento_and_arpeggio() {
+    let tmp = std::env::temp_dir().join(format!("viper_fx_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/effects.vip");
+    let nsf = tmp.join("fx.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let ripped = tmp.join("fx.vip");
+    // The tempo is supplied here. Sixteen rows with four notes in them are
+    // not enough evidence to pin one, and this test is about the effects.
+    let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", "150"]).arg("-o").arg(&ripped).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let got = std::fs::read_to_string(&ripped).unwrap();
+    let cell = |step: &str| -> String {
+        got.lines()
+            .find(|l| l.trim_start().starts_with(step) && l.contains(':'))
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    // Every parameter comes back exactly, because each effect leaves its own
+    // number in the register stream in a recoverable form. Vibrato spans
+    // `depth - 1` period units peak to peak and repeats every `32 / rate`
+    // frames; portamento moves `speed` units on its first frame; and an
+    // arpeggio's offsets are simply the notes it visits.
+    assert_eq!(cell("00"), "C-4:00:0F:V42", "vibrato, depth and rate");
+    assert_eq!(cell("08"), "E-4:00:0F:S20", "portamento, and the note it slid to");
+    assert_eq!(cell("0C"), "C-4:00:0F:A47", "arpeggio, on its root rather than whichever pitch a row ended on");
+
+    // The slide is the case that would otherwise lose music outright:
+    // portamento does not retrigger, so there is no key-on to notice, and a
+    // ripper that only followed key-ons would hold C-4 through a passage
+    // that audibly climbs to E-4.
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("notes    PU1 4"), "four notes, two of them found without a key-on: {}", report);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

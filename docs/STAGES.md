@@ -422,6 +422,43 @@ lives in viper.
   and a few notes ring a row further; after that, recompiling and ripping
   again changes nothing at all.
 
+- **Stage 36d** ✅ — **The effect columns.** Vibrato, portamento and
+  arpeggio come back with their parameters intact. `projects/effects.vip`
+  writes `V42`, `S20` and `A47`; compiled, ripped and compared, all three
+  return exactly.
+
+  **Every parameter survives, because each effect leaves its own number in
+  the register stream.** Measured against the reference driver: vibrato
+  spans `depth - 1` period units peak to peak and repeats every `32 / rate`
+  frames, portamento moves `speed` units on its first frame, and an
+  arpeggio's offsets are simply the notes it visits. None of this is fitted.
+
+  **Portamento is the case that would otherwise lose music outright.** It
+  moves a channel to a new pitch without retriggering it, so there is no
+  key-on to notice, and a ripper that followed key-ons alone would hold the
+  old note through a passage that audibly climbs. A pitch that changes with
+  no key-on is that, and the row it lands on is where the target note goes.
+
+  Three constraints stop the detector inventing effects. The window for
+  reading a note's motion closes once the pitch has moved elsewhere and
+  stayed for two frames, so a note that is later slid away from is still a
+  plain note where it starts — two frames rather than one, because an
+  arpeggio visits its other pitches for exactly one frame each. Pitches
+  visited only once are dropped before counting, since a period is written a
+  byte at a time and a frame sampled mid-write names a note that never
+  sounded. And an arpeggio must step every frame: the stress song's triangle
+  rocks between E-2 and E-3 once a row, and without that rule its bassline
+  rewrites itself as one droning chord.
+
+  Effects persist on a channel until changed, so a plain note after a
+  modulated one is given the off form, and an effect already running is not
+  rewritten on every row it covers.
+
+  `projects/effects.vip` is new, and holds its notes across the rows the
+  effects act on. Writing it the obvious way, with a note-off between each,
+  produces a file where the driver slides and arpeggiates silence and
+  nothing reaches the registers at all.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first
