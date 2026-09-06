@@ -159,6 +159,57 @@ pub struct TrackMap {
     pub drums: bool,
     pub vibrato: Option<(u8, u8)>,
     pub vibrato_min_rows: usize,
+    /// Per-track override of the song's velocity handling.
+    pub velocity: Option<Velocity>,
+}
+
+/// What an imported note does with its MIDI velocity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Velocity {
+    /// Map 1..=127 onto viper's volume column, 1..=15. The default: a MIDI
+    /// file's dynamics are usually the difference between a cover that
+    /// breathes and one that is flat out at every hit.
+    #[default]
+    Dynamic,
+    /// Ignore velocity. Every note gets `vol: 0`, which viper reads as
+    /// "channel default", i.e. full. Useful when a source's velocities are
+    /// junk — tab exports often pin everything to one value.
+    Off,
+    /// Pin every note to one volume, 1..=15.
+    Fixed(u8),
+}
+
+impl Velocity {
+    fn parse(v: &str) -> Result<Self> {
+        match v {
+            "on" | "dynamic" => Ok(Self::Dynamic),
+            "off" | "none" | "full" => Ok(Self::Off),
+            n => {
+                let n: u8 = n.parse().map_err(|_| {
+                    anyhow!("velocity= wants on / off / a volume 1-15, got {:?}", v)
+                })?;
+                if !(1..=15).contains(&n) {
+                    bail!("velocity={} is out of range (1-15, or on / off)", n);
+                }
+                Ok(Self::Fixed(n))
+            }
+        }
+    }
+
+    /// The volume column for a note played at `vel`.
+    fn vol(self, vel: u8) -> u8 {
+        match self {
+            Self::Dynamic => {
+                // Linear across the usable MIDI range. Never 0: a cell with
+                // `vol: 0` means "default/full" everywhere else in viper, so
+                // mapping a quiet note to 0 would play it at full blast.
+                let v = vel.clamp(1, 127) as u32;
+                (1 + (v - 1) * 14 / 126) as u8
+            }
+            Self::Off => 0,
+            Self::Fixed(n) => n,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +225,8 @@ pub struct Map {
     pub arranger: String,
     pub bpm: Option<u16>,
     pub transpose: i32,
+    /// Song-wide default; a `@track` may override it.
+    pub velocity: Velocity,
     pub tracks: Vec<TrackMap>,
     pub drums: BTreeMap<u8, DrumTarget>,
     pub priority_dpcm: Vec<u8>,
@@ -234,12 +287,13 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "arranger" => m.arranger = v,
                         "bpm" => m.bpm = if v == "auto" { None } else { Some(v.parse().with_context(ctx)?) },
                         "transpose" => m.transpose = v.parse().with_context(ctx)?,
+                        "velocity" => m.velocity = Velocity::parse(&v).with_context(ctx)?,
                         _ => {}
                     }
                 }
             }
             "track" => {
-                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, vibrato: None, vibrato_min_rows: 2 };
+                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, vibrato: None, vibrato_min_rows: 2, velocity: None };
                 for (k, v) in kv(args) {
                     match k.as_str() {
                         "midi" => t.midi = v,
@@ -250,6 +304,7 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "drums" => t.drums = v == "1" || v == "on",
                         "vibrato" => t.vibrato = parse_fx(&v),
                         "vibrato_min_rows" => t.vibrato_min_rows = v.parse().with_context(ctx)?,
+                        "velocity" => t.velocity = Some(Velocity::parse(&v).with_context(ctx)?),
                         _ => {}
                     }
                 }
@@ -366,10 +421,21 @@ pub struct Report {
     pub drum_fallbacks: usize,
     pub drum_dropped: usize,
     pub noi_conflicts: usize,
+    /// Lowest and highest volume written, so a source with no dynamics is
+    /// visible rather than quietly disappointing.
+    pub vol_lo: u8,
+    pub vol_hi: u8,
     pub warnings: Vec<String>,
 }
 
 impl Report {
+    fn note_volume(&mut self, vol: u8) {
+        if self.vol_lo == 0 || vol < self.vol_lo {
+            self.vol_lo = vol;
+        }
+        self.vol_hi = self.vol_hi.max(vol);
+    }
+
     pub fn summary(&self) -> String {
         let mut s = format!(
             "{} BPM, {} rows → {} phrases ({} unique); tracks: {}\nchords flattened {} (voiced across PU1/PU2 {}), notes clamped {}\ndrums: DPCM conflicts {} (fallback {}, dropped {}), noise conflicts {}",
@@ -377,6 +443,15 @@ impl Report {
             self.chords_flattened, self.voiced_chords, self.notes_clamped,
             self.drum_dpcm_conflicts, self.drum_fallbacks, self.drum_dropped, self.noi_conflicts
         );
+        // vol 0 means "channel default", i.e. velocity was turned off.
+        s.push_str(&match (self.vol_lo, self.vol_hi) {
+            (0, 0) => "\nvelocity: off (every note at channel default)".to_string(),
+            (lo, hi) if lo == hi => format!(
+                "\nvelocity: flat at {} — the source has no dynamics; `velocity=off` says so explicitly",
+                hi,
+            ),
+            (lo, hi) => format!("\nvelocity: volumes {}-{}", lo, hi),
+        });
         for w in &self.warnings {
             s.push_str("\nwarning: ");
             s.push_str(w);
@@ -390,6 +465,17 @@ impl Report {
 struct RowNote {
     key: u8,
     len_rows: usize,
+    vel: u8,
+}
+
+/// One note competing for a row on one channel, before chord flattening.
+/// Named rather than a bare tuple because velocity made it a triple and the
+/// flatten rules read much better against field names.
+#[derive(Clone, Copy, Debug)]
+struct Cand {
+    key: u8,
+    len: usize,
+    vel: u8,
 }
 
 fn find_track<'a>(midi: &'a Midi, name: &str) -> Option<&'a MidiTrack> {
@@ -415,7 +501,7 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let to_row = |tick: u64| -> usize { ((tick as f64 / row_ticks as f64).round()) as usize };
 
     // --- pitched tracks: notes per row, chord sets kept for the cross-track rule
-    let mut chords: Vec<BTreeMap<usize, Vec<(u8, usize)>>> = Vec::new(); // per track: row -> [(key, len_rows)]
+    let mut chords: Vec<BTreeMap<usize, Vec<Cand>>> = Vec::new(); // per track: row -> candidates
     let mut pitched: Vec<(usize, &TrackMap)> = Vec::new();
     let mut drum_track: Option<(&MidiTrack, &TrackMap)> = None;
     for tm in &map.tracks {
@@ -427,11 +513,11 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
             drum_track = Some((t, tm));
             continue;
         }
-        let mut rows: BTreeMap<usize, Vec<(u8, usize)>> = BTreeMap::new();
+        let mut rows: BTreeMap<usize, Vec<Cand>> = BTreeMap::new();
         for n in &t.notes {
             let r = to_row(n.tick);
             let len = ((n.len as f64 / row_ticks as f64).round() as usize).max(1);
-            rows.entry(r).or_default().push((n.key, len));
+            rows.entry(r).or_default().push(Cand { key: n.key, len, vel: n.vel });
         }
         chords.push(rows);
         pitched.push((chords.len() - 1, tm));
@@ -446,10 +532,10 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
         for r in rows_a {
             let (Some(ca), Some(cb)) = (chords[a].get(&r), chords[b].get(&r)) else { continue };
             if ca.len() < 2 || cb.len() < 2 { continue; }
-            let pcs = |c: &Vec<(u8, usize)>| -> Vec<u8> { let mut v: Vec<u8> = c.iter().map(|(k, _)| k % 12).collect(); v.sort(); v.dedup(); v };
+            let pcs = |c: &Vec<Cand>| -> Vec<u8> { let mut v: Vec<u8> = c.iter().map(|c| c.key % 12).collect(); v.sort(); v.dedup(); v };
             if pcs(ca) != pcs(cb) { continue; }
-            let root = cb.iter().map(|(k, _)| *k).min().unwrap();
-            let fifth = ca.iter().map(|(k, _)| *k).filter(|k| (k + 12 - root % 12) % 12 == 7).min();
+            let root = cb.iter().map(|c| c.key).min().unwrap();
+            let fifth = ca.iter().map(|c| c.key).filter(|k| (k + 12 - root % 12) % 12 == 7).min();
             if let Some(f) = fifth {
                 voiced.insert((a, r), f);
                 voiced.insert((b, r), root);
@@ -463,31 +549,35 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     for &(ti, tm) in &pitched {
         let mut lane: BTreeMap<usize, RowNote> = BTreeMap::new();
         for (r, cands) in &chords[ti] {
-            let (key, len) = if let Some(&k) = voiced.get(&(ti, *r)) {
-                let l = cands.iter().find(|(kk, _)| *kk == k).map(|(_, l)| *l).unwrap_or(1);
-                (k, l)
+            let picked = if let Some(&k) = voiced.get(&(ti, *r)) {
+                // The voicing rule chose a pitch; take that candidate whole so
+                // its own velocity travels with it.
+                cands.iter().find(|c| c.key == k).copied()
+                    .unwrap_or(Cand { key: k, len: 1, vel: 100 })
             } else {
                 if cands.len() > 1 { report.chords_flattened += 1; }
-                let pick = match tm.flatten.as_str() {
-                    "root" => cands.iter().min_by_key(|(k, _)| *k),
-                    _ => cands.iter().max_by_key(|(k, _)| *k),
-                }.unwrap();
-                *pick
+                *match tm.flatten.as_str() {
+                    "root" => cands.iter().min_by_key(|c| c.key),
+                    _ => cands.iter().max_by_key(|c| c.key),
+                }.unwrap()
             };
+            let (key, len) = (picked.key, picked.len);
             let mut k = key as i32 + tm.octave * 12 + map.transpose;
             let floor = match tm.ch { Some(2) => 24, _ => 33 }; // TRI down to C1, pulses down to A-1
             if k < floor { k += 12 * ((floor - k + 11) / 12); report.notes_clamped += 1; }
             if k > 119 { k -= 12 * ((k - 119 + 11) / 12); report.notes_clamped += 1; }
-            lane.insert(*r, RowNote { key: k as u8, len_rows: len });
+            lane.insert(*r, RowNote { key: k as u8, len_rows: len, vel: picked.vel });
         }
         lanes.push((tm.ch.unwrap(), lane, tm));
     }
 
     // --- drums
-    let mut drum_rows: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    // (gm key, velocity) per row: a ghost note and an accent are the same
+    // drum, and dropping the difference is what made imported kits sound flat.
+    let mut drum_rows: BTreeMap<usize, Vec<(u8, u8)>> = BTreeMap::new();
     if let Some((t, _)) = drum_track {
         for n in &t.notes {
-            drum_rows.entry(to_row(n.tick)).or_default().push(n.key);
+            drum_rows.entry(to_row(n.tick)).or_default().push((n.key, n.vel));
         }
     }
 
@@ -506,7 +596,9 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     for (ch, lane, tm) in &lanes {
         for (r, n) in lane {
             let fx = if let Some(v) = tm.vibrato { if n.len_rows >= tm.vibrato_min_rows { Some(v) } else { None } } else { None };
-            grid[*r][*ch] = Cell { note: Some(n.key), instr: tm.instr, vol: 0, fx, hold: false };
+            let vol = tm.velocity.unwrap_or(map.velocity).vol(n.vel);
+            report.note_volume(vol);
+            grid[*r][*ch] = Cell { note: Some(n.key), instr: tm.instr, vol, fx, hold: false };
             for h in 1..n.len_rows {
                 let rr = r + h;
                 if rr >= total_rows { break; }
@@ -515,32 +607,37 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
             }
         }
     }
+    let drum_vel = drum_track
+        .map(|(_, tm)| tm.velocity.unwrap_or(map.velocity))
+        .unwrap_or(map.velocity);
     for (r, keys) in &drum_rows {
-        let mut dpcm_hits: Vec<(u8, u8)> = Vec::new(); // (gm key, slot)
-        let mut noi_hits: Vec<(u8, u8, u8)> = Vec::new(); // (gm key, note, instr)
+        let mut dpcm_hits: Vec<(u8, u8, u8)> = Vec::new(); // (gm key, slot, vel)
+        let mut noi_hits: Vec<(u8, u8, u8, u8)> = Vec::new(); // (gm key, note, instr, vel)
         let mut seen = Vec::new();
-        for &k in keys {
+        for &(k, vel) in keys {
             if seen.contains(&k) { continue; }
             seen.push(k);
             match map.drums.get(&k) {
-                Some(DrumTarget::Dpcm(slot)) => dpcm_hits.push((k, *slot)),
-                Some(DrumTarget::Noi { note, instr }) => noi_hits.push((k, *note, *instr)),
+                Some(DrumTarget::Dpcm(slot)) => dpcm_hits.push((k, *slot, vel)),
+                Some(DrumTarget::Noi { note, instr }) => noi_hits.push((k, *note, *instr, vel)),
                 None => {}
             }
         }
         let rank = |list: &Vec<u8>, k: u8| list.iter().position(|&x| x == k).unwrap_or(usize::MAX);
         if dpcm_hits.len() > 1 { report.drum_dpcm_conflicts += 1; }
-        dpcm_hits.sort_by_key(|(k, _)| rank(&map.priority_dpcm, *k));
+        dpcm_hits.sort_by_key(|(k, _, _)| rank(&map.priority_dpcm, *k));
         if noi_hits.len() > 1 { report.noi_conflicts += 1; }
-        noi_hits.sort_by_key(|(k, _, _)| rank(&map.priority_noi, *k));
-        if let Some((_, slot)) = dpcm_hits.first() {
-            grid[*r][4] = Cell { note: Some(60 + slot), instr: 0, vol: 0, fx: None, hold: false };
+        noi_hits.sort_by_key(|(k, _, _, _)| rank(&map.priority_noi, *k));
+        if let Some((_, slot, vel)) = dpcm_hits.first() {
+            let vol = drum_vel.vol(*vel);
+            report.note_volume(vol);
+            grid[*r][4] = Cell { note: Some(60 + slot), instr: 0, vol, fx: None, hold: false };
         }
         // losers on the DPCM slot may fall back to the noise channel
-        for (k, _) in dpcm_hits.iter().skip(1) {
+        for (k, _, vel) in dpcm_hits.iter().skip(1) {
             if let Some(DrumTarget::Noi { note, instr }) = map.fallback.get(k) {
                 if noi_hits.is_empty() {
-                    noi_hits.push((*k, *note, *instr));
+                    noi_hits.push((*k, *note, *instr, *vel));
                     report.drum_fallbacks += 1;
                 } else {
                     report.drum_dropped += 1;
@@ -549,8 +646,10 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
                 report.drum_dropped += 1;
             }
         }
-        if let Some((_, note, instr)) = noi_hits.first() {
-            grid[*r][3] = Cell { note: Some(*note), instr: *instr, vol: 0, fx: None, hold: false };
+        if let Some((_, note, instr, vel)) = noi_hits.first() {
+            let vol = drum_vel.vol(*vel);
+            report.note_volume(vol);
+            grid[*r][3] = Cell { note: Some(*note), instr: *instr, vol, fx: None, hold: false };
         }
     }
 
@@ -592,8 +691,20 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
 mod tests {
     use super::*;
 
-    /// Build a tiny format-1 SMF: tempo + one named track of (tick, len, key) notes.
+    /// Build a tiny format-1 SMF from (tick, len, key) notes, all at
+    /// velocity 100. Most tests do not care about dynamics.
     fn smf(bpm: u32, tracks: &[(&str, u8, &[(u64, u64, u8)])]) -> Vec<u8> {
+        let with_vel: Vec<(&str, u8, Vec<(u64, u64, u8, u8)>)> = tracks
+            .iter()
+            .map(|(n, c, ns)| (*n, *c, ns.iter().map(|(t, l, k)| (*t, *l, *k, 100u8)).collect()))
+            .collect();
+        let borrowed: Vec<(&str, u8, &[(u64, u64, u8, u8)])> =
+            with_vel.iter().map(|(n, c, ns)| (*n, *c, ns.as_slice())).collect();
+        smf_vel(bpm, &borrowed)
+    }
+
+    /// The same, with an explicit velocity per note.
+    fn smf_vel(bpm: u32, tracks: &[(&str, u8, &[(u64, u64, u8, u8)])]) -> Vec<u8> {
         fn vlq(v: u64) -> Vec<u8> {
             let mut b = vec![(v & 0x7F) as u8];
             let mut v = v >> 7;
@@ -615,8 +726,8 @@ mod tests {
         out.extend_from_slice(&chunk);
         for (name, ch, notes) in tracks {
             let mut ev: Vec<(u64, Vec<u8>)> = Vec::new();
-            for (t, l, k) in notes.iter() {
-                ev.push((*t, vec![0x90 | ch, *k, 100]));
+            for (t, l, k, vel) in notes.iter() {
+                ev.push((*t, vec![0x90 | ch, *k, *vel]));
                 ev.push((*t + *l, vec![0x80 | ch, *k, 0]));
             }
             ev.sort_by_key(|e| e.0);
@@ -703,4 +814,96 @@ mod tests {
         assert_eq!(p.cells[0][3].instr, 5);
         assert_eq!(rep.drum_fallbacks, 1);
     }
+    #[test]
+    fn velocity_maps_onto_the_volume_column() {
+        // The mapping never yields 0: viper reads `vol: 0` as "channel
+        // default", i.e. full, so a quiet note mapped to 0 would blare.
+        assert_eq!(Velocity::Dynamic.vol(1), 1);
+        assert_eq!(Velocity::Dynamic.vol(127), 15);
+        assert_eq!(Velocity::Dynamic.vol(64), 8);
+        assert_eq!(Velocity::Dynamic.vol(0), 1, "a zero-velocity note still sounds");
+        // Monotonic across the whole range.
+        let mut prev = 0;
+        for v in 1..=127u8 {
+            let got = Velocity::Dynamic.vol(v);
+            assert!(got >= prev && (1..=15).contains(&got), "vel {} -> {}", v, got);
+            prev = got;
+        }
+        assert_eq!(Velocity::Off.vol(90), 0);
+        assert_eq!(Velocity::Fixed(6).vol(127), 6);
+    }
+
+    #[test]
+    fn velocity_parses_its_three_forms_and_rejects_the_rest() {
+        assert_eq!(Velocity::parse("on").unwrap(), Velocity::Dynamic);
+        assert_eq!(Velocity::parse("off").unwrap(), Velocity::Off);
+        assert_eq!(Velocity::parse("9").unwrap(), Velocity::Fixed(9));
+        for bad in ["0", "16", "loud", ""] {
+            assert!(Velocity::parse(bad).is_err(), "{:?} should be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn an_imported_note_carries_its_own_velocity() {
+        // Three notes, quiet to loud, on the lead; the drum track gets an
+        // accent and a ghost note on the same drum.
+        let bytes = smf_vel(200, &[
+            ("Lead", 0, &[(0, 120, 64, 20), (120, 120, 65, 80), (240, 120, 66, 127)]),
+            ("Drums", 9, &[(0, 60, 36, 127), (120, 60, 36, 30)]),
+        ]);
+        let midi = parse_midi(&bytes).unwrap();
+        let map = parse_map(
+            "@song title=\"T\" bpm=auto\n@track midi=Lead ch=PU1 instr=00\n@track midi=Drums drums=1\n@drum 36 dpcm=0\n",
+        ).unwrap();
+        let (song, report) = import(&midi, &map).unwrap();
+        let p = &song.phrases[0];
+        assert_eq!(p.cells[0][0].vol, Velocity::Dynamic.vol(20));
+        assert_eq!(p.cells[1][0].vol, Velocity::Dynamic.vol(80));
+        assert_eq!(p.cells[2][0].vol, Velocity::Dynamic.vol(127));
+        assert!(p.cells[0][0].vol < p.cells[2][0].vol, "quiet note is quieter");
+        // Drums too: an accent and a ghost note are the same drum.
+        assert_eq!(p.cells[0][4].vol, Velocity::Dynamic.vol(127));
+        assert_eq!(p.cells[1][4].vol, Velocity::Dynamic.vol(30));
+        assert!(report.summary().contains("velocity: volumes"), "{}", report.summary());
+    }
+
+    #[test]
+    fn velocity_can_be_turned_off_globally_or_pinned_per_track() {
+        let bytes = smf_vel(200, &[
+            ("Lead", 0, &[(0, 120, 64, 20)]),
+            ("Bass", 2, &[(0, 120, 40, 20)]),
+        ]);
+        let midi = parse_midi(&bytes).unwrap();
+
+        // Off: every note back to the channel default, which is what the
+        // importer did before it read velocity at all.
+        let off = parse_map(
+            "@song bpm=auto velocity=off\n@track midi=Lead ch=PU1 instr=00\n@track midi=Bass ch=TRI instr=02\n",
+        ).unwrap();
+        let (song, report) = import(&midi, &off).unwrap();
+        assert_eq!(song.phrases[0].cells[0][0].vol, 0);
+        assert!(report.summary().contains("velocity: off"), "{}", report.summary());
+
+        // A per-track override beats the song default in both directions.
+        let mixed = parse_map(
+            "@song bpm=auto velocity=off\n@track midi=Lead ch=PU1 instr=00 velocity=on\n@track midi=Bass ch=TRI instr=02 velocity=12\n",
+        ).unwrap();
+        let (song, _) = import(&midi, &mixed).unwrap();
+        assert_eq!(song.phrases[0].cells[0][0].vol, Velocity::Dynamic.vol(20));
+        assert_eq!(song.phrases[0].cells[0][2].vol, 12);
+    }
+
+    #[test]
+    fn a_source_with_no_dynamics_says_so() {
+        // Tab exports routinely pin every note to one velocity. Mapping that
+        // is harmless but pointless, and the report should name it rather
+        // than leave you wondering why nothing varies.
+        let bytes = smf_vel(200, &[("Lead", 0, &[(0, 120, 64, 100), (120, 120, 65, 100)])]);
+        let midi = parse_midi(&bytes).unwrap();
+        let map = parse_map("@song bpm=auto\n@track midi=Lead ch=PU1 instr=00\n").unwrap();
+        let (_, report) = import(&midi, &map).unwrap();
+        assert!(report.summary().contains("velocity: flat at"), "{}", report.summary());
+        assert!(report.summary().contains("velocity=off"), "and suggests the fix");
+    }
+
 }

@@ -196,7 +196,7 @@ Effect state persists on the channel until changed.
 MIDI File into a `.vip` using a map in this same directive grammar:
 
 ```
-@song     title="..." artist="..." arranger="..." bpm=auto transpose=0
+@song     title="..." artist="..." arranger="..." bpm=auto transpose=0 velocity=on
 @track    midi="Lead"   ch=PU1 instr=00 flatten=top  octave=0 vibrato=V42 vibrato_min_rows=2
 @track    midi="Rhythm" ch=PU2 instr=01 flatten=root octave=-1
 @track    midi="Bass"   ch=TRI instr=02
@@ -212,6 +212,27 @@ Rows are 16ths; held notes become `===`; chords collapse per `flatten`
 (`top` keeps the highest, `root` the lowest), except that a chord shared
 by PU1 and PU2 is voiced root on PU2, fifth on PU1. `midi=` matches a
 track name case-insensitively by substring.
+
+### Velocity
+
+`velocity=` takes three forms, on `@song` as the default and on any
+`@track` as an override:
+
+| value | effect |
+|---|---|
+| `on` (default) | MIDI velocity 1–127 maps linearly onto the volume column, 1–15 |
+| `off` | ignore it; every note gets `vol 0`, which viper reads as the channel default (full) |
+| `1`–`15` | pin every note on that track to one volume |
+
+The mapping never produces 0, because a cell with `vol 0` means "full"
+everywhere else in viper — a quiet note mapped to 0 would blare. Drums
+carry velocity too, so an accent and a ghost note on the same drum stay
+different.
+
+The import report prints the volume range it wrote. If a source pins
+every note to one velocity, which tab exports routinely do, it says so
+and suggests `velocity=off` rather than leaving you to wonder why nothing
+varies.
 
 ## Parser error handling
 
