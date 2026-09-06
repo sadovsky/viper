@@ -157,14 +157,49 @@ Beyond the grid editor, viper is playable as an instrument:
 
 ## Visualizer & sprites
 
-Toggle the viz pane with `:viz`. Five renderers, all using half-blocks
+Toggle the viz pane with `:viz`. Six renderers, all using half-blocks
 and 24-bit color for 2× vertical terminal resolution:
 
 - **bars** — per-voice envelope levels
 - **scope** — synthesized waveform, tinted by loudest voice
 - **grid** — 4×4 step grid with a pulsing playhead
 - **orbit** — per-voice bodies orbiting a shared ring, pitch → angle
-- **sprites** — load 4-color PNG sprite sheets and animate them
+- **sprites** — load 4-color sprite sheets and animate them
+- **sheet** — a tile atlas of one sheet, with indices, for finding a tile
+
+### Sprites out of a NES ROM
+
+A sheet can come from a game rather than a PNG:
+
+```
+:sprite load ~/roms/megaman3.nes bank=4   # 256 tiles from one pattern table
+:sprite show megaman3                     # the atlas — see what you have
+:sprite page +1                           # page through it
+:sprite place megaman3 0x2A 12 8          # place the tile you found
+```
+
+This needs no emulation and loses nothing. NES character data is 2bpp
+planar — sixteen bytes per 8×8 tile, one bitplane for each bit of a 0–3
+index — which is *exactly* what a viper sprite sheet already is, so the
+graphics arrive as the artist drew them rather than quantized down to
+four colours the way a PNG has to be.
+
+What it cannot do is invent colour: which palette a tile is drawn with is
+chosen by the game's code, per frame, per attribute block. Sheets load with
+a legible grey ramp; `:sprite repalette` sets a real one.
+
+About half the library keeps nothing in the file: Metroid, Zelda, Contra,
+Final Fantasy and the rest hold their tiles compressed or generated, and
+write them into 8 KB of CHR-RAM as they boot. For those viper boots the
+cartridge and reads the RAM afterwards — mappers 0, 1, 2, 3 and 7, which
+covers most of the library. `frames=N` says how long to let it run; the
+default is five seconds, and a game with a long licence screen may want
+more.
+
+There is no picture and no sound in that path, because neither is needed
+to answer "what tiles did this game upload?". What is needed is bank
+switching, a real NMI, and the PPU's address and data ports — tiles arrive
+through `$2006`/`$2007` like everything else the PPU is told.
 
 Sprites can be bound to any audio-reactive source. The binding language
 is a small expression DSL — operators, parentheses, a handful of
@@ -278,6 +313,27 @@ An NSF records none of this, so all of it is inferred, and the report says
 which numbers were read and which were guessed — including when two tempos
 fit the evidence equally well. DPCM sample data is not extracted yet, so a
 ripped drum track plays the built-in bank.
+
+### Ripping from a cartridge
+
+`viper rip` also takes a game. There is no second transcriber: viper boots
+the cartridge, listens to what it writes to the sound chip, and feeds that
+register log into the same path it already used for a dump from another
+emulator.
+
+```sh
+viper rip game.nes --frames 900 --press start@120 -o song.vip
+```
+
+Games do not play until something asks them to, so `--press` works the
+title screen; without it you get whatever the attract mode plays. Tempo
+detection has a harder time here than on a viper song: a game's driver
+holds notes across many rows, so the onsets alone read as a slower piece
+than it is, and the report says which faster grid to try.
+
+What comes out is a transcription of someone else's composition. The tool
+is for study, analysis and preservation — the same thing an NSF ripper has
+always been — and what you do with the result is your call, not viper's.
 
 ## Contributing
 

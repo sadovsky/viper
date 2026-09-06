@@ -99,6 +99,10 @@ pub(crate) enum VizKind {
     Grid,
     Orbit,
     Sprites,
+    /// A tile atlas for one loaded sheet. Ripping 8192 tiles out of a ROM
+    /// is only useful if you can find the one you want, and `:sprite place
+    /// mm3 4271` is not a way to find anything.
+    Sheet,
     /// DESIGN.md's register panel: a mini rendering of what is in the yank
     /// register, so you can see the shape you are about to paste.
     Register,
@@ -112,6 +116,7 @@ impl VizKind {
             VizKind::Grid => "grid",
             VizKind::Orbit => "orbit",
             VizKind::Sprites => "sprites",
+            VizKind::Sheet => "sheet",
             VizKind::Register => "register",
         }
     }
@@ -123,6 +128,7 @@ impl VizKind {
             "grid" => Some(VizKind::Grid),
             "orbit" => Some(VizKind::Orbit),
             "sprites" | "sprite" => Some(VizKind::Sprites),
+            "sheet" | "tiles" | "atlas" => Some(VizKind::Sheet),
             "register" | "reg" => Some(VizKind::Register),
             _ => None,
         }
@@ -138,6 +144,8 @@ pub(crate) struct VizCtx<'a> {
     pub placements: &'a [crate::modulation::EffectivePlacement],
     pub palettes: &'a HashMap<String, [Color; PALETTE_SIZE]>,
     pub bg: Color,
+    /// Which sheet the atlas is showing, and which page of it.
+    pub browse: Option<(&'a str, u32)>,
     /// The unnamed yank register, for [`VizKind::Register`].
     pub register: &'a crate::Register,
     /// Foreground for register notes; the pane has no Theme of its own.
@@ -188,6 +196,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, kind: VizKind, ctx: &VizCtx) {
         VizKind::Grid => render_grid(f, inner, ctx.frame),
         VizKind::Orbit => render_orbit(f, inner, ctx.frame),
         VizKind::Sprites => render_sprites(f, inner, ctx),
+        VizKind::Sheet => render_sheet(f, inner, ctx),
         VizKind::Register => render_register(f, inner, ctx),
     }
 }
@@ -507,6 +516,151 @@ fn render_orbit(f: &mut Frame, area: Rect, frame: &VizFrame) {
 /// of rows into terminal cells. Later placements win pixel conflicts so
 /// the paint order is predictable (FIFO). Slot 0 is transparent — a
 /// transparent pixel never writes, so placements can overlap cleanly.
+/// How many tiles fit, and where they go: a shared answer so the renderer
+/// and the status line cannot disagree about what is on screen.
+pub(crate) struct Atlas {
+    pub gutter: u16,
+    pub tile_w: u16,
+    pub tile_h: u16,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+impl Atlas {
+    pub(crate) fn per_page(&self) -> u32 {
+        self.cols * self.rows
+    }
+}
+
+/// Lay out an atlas of `cell_w` x `cell_h` tiles in `area`.
+///
+/// One pixel of gap between tiles, because NES art runs to the edge of its
+/// cell and without a gap a row of tiles reads as one wide picture.
+pub(crate) fn atlas_layout(area: Rect, cell_w: u32, cell_h: u32) -> Atlas {
+    let gutter = 5u16; // "0000 "
+    let tile_w = cell_w.max(1) as u16 + 1;
+    let tile_h = cell_h.max(1) as u16 + 1;
+    let usable_w = area.width.saturating_sub(gutter);
+    let usable_h = area.height.saturating_mul(2); // half-block pixels
+    Atlas {
+        gutter,
+        tile_w,
+        tile_h,
+        cols: (usable_w / tile_w.max(1)) as u32,
+        rows: (usable_h / tile_h.max(1)) as u32,
+    }
+}
+
+/// The tile atlas: a page of a sheet's cells, with their indices down the
+/// side, so `:sprite place` can be given a number that means something.
+fn render_sheet(f: &mut Frame, area: Rect, ctx: &VizCtx) {
+    let mut hint = |msg: &str| {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(Color::DarkGray).bg(ctx.bg),
+            )))
+            .style(Style::default().bg(ctx.bg)),
+            area,
+        );
+    };
+    if ctx.sheets.is_empty() {
+        hint("no sheets — :sprite load <path|rom.nes> [WxH] [bank=N]");
+        return;
+    }
+    // Whichever sheet was asked for; failing that, the only one loaded, so
+    // `:viz sheet` does something useful without a second command.
+    let (name, page) = match ctx.browse {
+        Some((n, p)) if ctx.sheets.contains_key(n) => (n.to_string(), p),
+        _ => {
+            let mut names: Vec<&String> = ctx.sheets.keys().collect();
+            names.sort();
+            (names[0].clone(), 0)
+        }
+    };
+    let Some(sheet) = ctx.sheets.get(&name) else {
+        hint("no such sheet");
+        return;
+    };
+
+    // The header gets its own row. Painting it over the atlas costs the
+    // first row of tiles its index label, which is the one thing the atlas
+    // exists to provide.
+    let head = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+    let body = Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height.saturating_sub(1) };
+    if body.height == 0 {
+        hint("pane too short for the atlas");
+        return;
+    }
+    let area = body;
+    let lay = atlas_layout(area, sheet.cell_w, sheet.cell_h);
+    if lay.cols == 0 || lay.rows == 0 {
+        hint("pane too small for this sheet's cells");
+        return;
+    }
+    let total = sheet.cell_count();
+    let per_page = lay.per_page();
+    let pages = total.div_ceil(per_page.max(1));
+    let page = page.min(pages.saturating_sub(1));
+    let first = page * per_page;
+
+    let mut hb = HalfBlock::new(area.width, area.height);
+    for row in 0..lay.rows {
+        for col in 0..lay.cols {
+            let idx = first + row * lay.cols + col;
+            if idx >= total {
+                break;
+            }
+            let ox = lay.gutter as u32 + col * lay.tile_w as u32;
+            let oy = row * lay.tile_h as u32;
+            for py in 0..sheet.cell_h {
+                for px in 0..sheet.cell_w {
+                    let v = sheet.pixel(idx, px, py).unwrap_or(0);
+                    if v == 0 {
+                        continue;
+                    }
+                    hb.set((ox + px) as i32, (oy + py) as i32, sheet.palette[v as usize]);
+                }
+            }
+        }
+    }
+
+    // The gutter goes on afterwards, over the top of the collapsed lines:
+    // it is text, and the tiles are pixels at twice the vertical resolution.
+    let mut lines = hb.lines();
+    for row in 0..lay.rows {
+        let text_row = (row * lay.tile_h as u32 / 2) as usize;
+        let Some(line) = lines.get_mut(text_row) else { continue };
+        let idx = first + row * lay.cols;
+        if idx >= total {
+            break;
+        }
+        let label = format!("{:04X} ", idx);
+        let mut spans = vec![Span::styled(label, Style::default().fg(ctx.dim).bg(ctx.bg))];
+        spans.extend(line.spans.iter().skip(lay.gutter as usize).cloned());
+        *line = Line::from(spans);
+    }
+
+    let title = format!(
+        "{}  {} tiles  page {}/{}  {:04X}..{:04X}",
+        name,
+        total,
+        page + 1,
+        pages.max(1),
+        first,
+        (first + per_page).min(total).saturating_sub(1),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(title, Style::default().fg(ctx.fg).bg(ctx.bg))))
+            .style(Style::default().bg(ctx.bg)),
+        head,
+    );
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::NONE)).style(Style::default().bg(ctx.bg)),
+        area,
+    );
+}
+
 fn render_sprites(f: &mut Frame, area: Rect, ctx: &VizCtx) {
     let cols = area.width as usize;
     let rows = area.height as usize;

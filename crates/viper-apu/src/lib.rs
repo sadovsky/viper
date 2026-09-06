@@ -27,6 +27,7 @@ pub mod apu;
 pub mod cpu;
 pub mod host;
 pub mod midi;
+pub mod nes;
 pub mod nsf;
 pub mod render;
 pub mod trace;
