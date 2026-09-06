@@ -7,6 +7,7 @@
 //!               [--log writes.txt] [--loops N | --frames N] [--song N]
 //!               [--rate HZ] [--bpm B]
 //! viper info    song.nsf
+//! viper rip     song.nsf [--trace out.tsv]
 //! viper gen     --style DIR --seed N [-o songs/] [--count N] [--key K] [--bpm B]
 //! ```
 
@@ -47,6 +48,9 @@ usage:
       (NSFPlay, Mesen, FCEUX Lua — any `frame addr value` shape); exits 1
       on the first PLAY frame that differs. -o writes the other log in
       viper's canonical form.
+  viper rip song.nsf|writes.log [--song N] [--frames N] [--trace out.tsv]
+      read music back out of a compiled NSF, or out of any `frame addr
+      value` register dump another emulator produced
   viper gen --style DIR [--seed N] [--count N] [-o DIR|FILE] [--key E] [--bpm 200]
             [--scale NAME] [--motif on|off] [--form N] [--driver BIN --sym SYM]
             [--artist NAME] [--prefix NAME]
@@ -106,6 +110,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "render" => render(&a),
         "info" => info(&a),
         "verify" => verify(&a),
+        "rip" => rip(&a),
         _ => {
             print!("{}", USAGE);
             Ok(())
@@ -571,4 +576,100 @@ fn render(a: &Args) -> Result<()> {
         println!("log      → {} ({} writes)", p.display(), r.log.len());
     }
     Ok(())
+}
+
+/// `viper rip` — read music back out of a compiled NSF.
+///
+/// Stage one: decode the register traffic into a frame table and report what
+/// it found. Turning that into a `.vip` comes next; the decode is worth
+/// proving on its own first, because everything downstream believes it.
+fn rip(a: &Args) -> Result<()> {
+    let path = a.positional.first().map(PathBuf::from).context("rip: need an .nsf or a register log")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let song = a.num::<u8>("song")?.unwrap_or(0);
+    let frames = a.num::<u32>("frames")?;
+
+    // An NSF is run; a log is read. The log path is what makes material from
+    // a game ROM reachable — anything FCEUX, Mesen or NSFPlay can dump, viper
+    // can transcribe, without needing to emulate the game itself.
+    let (trace, loop_frames, source) = if bytes.starts_with(b"NESM\x1A") || bytes.starts_with(b"NSFE") {
+        let nsf = viper_apu::Nsf::parse(&bytes)?;
+        let (t, looped) = viper_apu::trace::trace_nsf(&nsf, song, frames)?;
+        (t, looped, format!("{} song {}", path.display(), song))
+    } else {
+        let log = viper_apu::verify::parse_log(&String::from_utf8_lossy(&bytes));
+        if log.is_empty() {
+            bail!("rip: no register writes recognised in {}", path.display());
+        }
+        let mut t = viper_apu::trace(&log);
+        if let Some(n) = frames {
+            t.truncate(n as usize);
+        }
+        (t, None, format!("{} (register log)", path.display()))
+    };
+    if trace.is_empty() {
+        bail!("rip: nothing to transcribe in {}", path.display());
+    }
+
+    if let Some(out) = a.get("trace") {
+        std::fs::write(out, viper_apu::trace::format_trace(&trace)).with_context(|| format!("write {}", out))?;
+        println!("trace → {}", out);
+    }
+    print!("{}", rip_report(&trace, &source, loop_frames));
+    Ok(())
+}
+
+/// What the frame table found, before any of it is called music.
+fn rip_report(t: &[viper_apu::FrameTrace], source: &str, loop_frames: Option<(u32, u32)>) -> String {
+    use viper_apu::trace::CHANNELS;
+    const NAMES: [&str; CHANNELS] = ["PU1", "PU2", "TRI", "NOI", "DPCM"];
+    let mut s = format!("source   {}, {} frames ({:.2}s)\n", source, t.len(), t.len() as f64 / 60.0988);
+    match loop_frames {
+        // The period is trustworthy; the start is not. RAM hashing reports
+        // the first frame whose driver state repeats, which can sit a whole
+        // pass after the musical loop point — so say what was measured
+        // rather than dressing it up as the song's structure.
+        Some((start, len)) => s.push_str(&format!(
+            "loop     {} frames, repeating from frame {} (driver RAM state; the start can overshoot)\n",
+            len, start
+        )),
+        None => s.push_str("loop     not detected\n"),
+    }
+
+    let mut keys = [0usize; CHANNELS];
+    let mut audible = [0usize; CHANNELS];
+    for f in t {
+        for c in 0..CHANNELS {
+            if f.ch[c].keyed {
+                keys[c] += 1;
+                if f.ch[c].level > 0 {
+                    audible[c] += 1;
+                }
+            }
+        }
+    }
+    s.push_str("key-ons  ");
+    for c in 0..CHANNELS {
+        s.push_str(&format!("{} {:<5}", NAMES[c], audible[c]));
+    }
+    s.push('\n');
+
+    // A key-on whose channel is silent is not a note. Saying so is the whole
+    // point: a ripper that counts them invents music that was never audible.
+    let silent: usize = (0..CHANNELS).map(|c| keys[c] - audible[c]).sum();
+    if silent > 0 {
+        s.push_str(&format!("         {} key-on{} suppressed (no volume at onset)\n", silent, if silent == 1 { "" } else { "s" }));
+    }
+
+    // Everything below is a thing viper cannot express, counted rather than
+    // dropped in silence.
+    let sweeps = t.iter().filter(|f| f.ch.iter().any(|c| c.sweep != 0)).count();
+    if sweeps > 0 {
+        s.push_str(&format!("unsupported  hardware sweep active on {} frames\n", sweeps));
+    }
+    let hw_env: usize = t.iter().filter(|f| f.ch.iter().take(4).any(|c| !c.constant_vol && c.level > 0)).count();
+    if hw_env > 0 {
+        s.push_str(&format!("             hardware envelopes on {} frames (levels simulated, not read)\n", hw_env));
+    }
+    s
 }

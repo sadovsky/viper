@@ -299,6 +299,44 @@ lives in viper.
   release ran, then ran again — and now reads `10 9 9 9 7 4 2 0`. No
   note, period or timing moved.
 
+### Transcription
+
+- **Stage 36a** ✅ — **The frame table.** `viper rip song.nsf` reads music
+  back out of a compiled NSF, or out of any `frame addr value` register dump
+  another emulator produced. This stage builds the layer everything else
+  will read: `viper_apu::trace` folds register traffic into per-frame,
+  per-channel state — period, audible level, duty, enable, key-on — so the
+  register semantics live in exactly one place. `--trace out.tsv` writes it
+  out, because a decode nobody can check by eye is not evidence.
+
+  Two things make it more than a `match` on the address.
+
+  **Volume is not the low nibble.** `$4000` bit 4 is the constant-volume
+  flag; when it is clear the nibble is the hardware envelope's divider and
+  the audible level is a decay counter the chip walks down itself. viper's
+  driver sets that bit on every write, so a nibble-reading ripper would pass
+  every test in this repo and produce nonsense on the first commercial NSF.
+  Running an NSF takes the level from `Apu::levels()`, which resolves it
+  exactly; a bare log simulates the envelope and length counters at their
+  real rates and says which frames were simulated.
+
+  **A key-on is not a note.** The length-reload registers are the closest
+  thing the chip has to a note-on, but a driver may key a channel whose
+  volume is zero — viper's does, on the empty last row of phrase 01, three
+  channels at once. Reading those as notes invents music that was never
+  audible, so the table records the key-on and the level separately and the
+  report counts what it suppressed.
+
+  Sweeps are recorded only when they would actually move the pitch. Drivers
+  routinely park the unit with `$08`, viper's included, and calling that an
+  unsupported feature would cry wolf on almost every NSF there is.
+
+  Verified against the golden log rather than only hand-written registers:
+  the table decodes back to the stress song's own first notes (E-5, the
+  harmonised C-5, E-2 on the triangle), and tracing the NSF and tracing its
+  log agree frame for frame — which is what makes the log path trustworthy
+  for material that can only ever arrive as a dump.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first

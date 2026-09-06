@@ -48,6 +48,14 @@ pub struct RenderResult {
     pub sample_rate: u32,
 }
 
+/// Find where the song loops, without rendering it. Wraps the same
+/// RAM-hashing pass the renderer uses, for callers that want the length
+/// but not the audio — `viper rip`, notably.
+pub fn find_loop(nsf: &Nsf, song: u8, max_seconds: f64) -> Result<Option<(u32, u32)>> {
+    let opts = RenderOptions { song, max_seconds, ..RenderOptions::default() };
+    Ok(analyze(nsf, &opts)?.0)
+}
+
 /// First pass: find the song length by RAM-state hashing and gather the
 /// DPCM samples used. Returns (loop_start_frame, loop_len_frames) when
 /// the driver state repeats, plus the frame count to render.

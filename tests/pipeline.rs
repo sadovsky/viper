@@ -256,3 +256,93 @@ fn custom_dpcm_bank_round_trip() {
     assert!(log.lines().any(|l| l.contains(" 4015 1F")), "DPCM start expected in the log");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The frame table, against the real golden log rather than hand-written
+/// registers. This is the decode every rip depends on, so it is worth
+/// pinning to music whose source is checked in beside it: every number
+/// below is derived from `projects/stress_melodeath.vip`.
+#[test]
+fn the_frame_table_decodes_the_golden_log_back_into_the_stress_song() {
+    let text = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
+    let log = viper_apu::verify::parse_log(&text);
+    let t = viper_apu::trace(&log);
+    assert_eq!(t.len(), 257, "one entry per frame in the log");
+
+    use viper_apu::trace::{NOI, PU1, PU2, TRI};
+    let keys = |c: usize| t.iter().filter(|f| f.ch[c].keyed).count();
+    let audible = |c: usize| t.iter().filter(|f| f.ch[c].keyed && f.ch[c].level > 0).count();
+    assert_eq!([keys(PU1), keys(PU2), keys(TRI), keys(NOI)], [52, 52, 48, 49]);
+
+    // Frame 127 is the last row of phrase 01, which is empty. The driver
+    // keys three channels there anyway, with every volume at zero. Reading
+    // key-ons as notes would invent three notes that were never audible —
+    // so the level, not the key-on, is what makes a note.
+    assert_eq!([audible(PU1), audible(PU2), audible(TRI)], [51, 51, 47]);
+    for c in [PU1, PU2, TRI] {
+        assert!(t[127].ch[c].keyed && t[127].ch[c].level == 0, "silent key-on at frame 127");
+    }
+
+    // Pitch: the source's first note on each pitched channel. Periods
+    // invert as f = CPU / (16(p+1)) for the pulses and 32(p+1) for the
+    // triangle, giving E-5, C-5 (the harmonised third) and E-2.
+    let note = |p: u16, div: f64| {
+        let f = 1_789_773.0 / (div * (p as f64 + 1.0));
+        (69.0 + 12.0 * (f / 440.0).log2()).round() as i32
+    };
+    assert_eq!(note(t[1].ch[PU1].period, 16.0), 76, "E-5");
+    assert_eq!(note(t[1].ch[PU2].period, 16.0), 72, "C-5");
+    assert_eq!(note(t[1].ch[TRI].period, 32.0), 40, "E-2");
+
+    // Volume: the driver's envelope after the held-note fix is a clean
+    // attack, sustain and single release. The doubled release the old
+    // driver produced (10 9 7 4 7 4 2 0) is what made note ends unreadable.
+    let pu1: Vec<u8> = (66..82).map(|f| t[f].ch[PU1].level).collect();
+    assert_eq!(pu1, vec![10, 9, 9, 9, 7, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    // Noise keeps its $400E index, which is already a tracker's value.
+    assert_eq!(t[1].ch[NOI].period, 14);
+    // The driver parks both sweep units at INIT with the usual $08, which
+    // moves no pitch and so is not reported as an unsupported feature.
+    assert!(text.lines().any(|l| l.ends_with(" 4001 08")), "the driver does write $4001");
+    assert!(t.iter().all(|f| f.ch.iter().all(|c| c.sweep == 0)));
+}
+
+/// The two ways into the frame table must agree.
+///
+/// Running the NSF takes each level from the chip, which resolves hardware
+/// envelopes and sweep muting exactly. Reading a register log simulates them
+/// instead, because a log is all there is. Where a song uses neither — as
+/// almost every driver-produced song does — the two must land on the same
+/// answer, and that is what makes the log path trustworthy for material
+/// that can only ever arrive as a dump.
+#[test]
+fn tracing_the_nsf_and_tracing_its_log_agree() {
+    let tmp = std::env::temp_dir().join(format!("viper_trace_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/stress_melodeath.vip");
+    let nsf_path = tmp.join("stress.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf_path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let text = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
+    let from_log = viper_apu::trace(&viper_apu::verify::parse_log(&text));
+
+    let nsf = viper_apu::Nsf::parse(&std::fs::read(&nsf_path).unwrap()).unwrap();
+    let (from_nsf, looped) = viper_apu::trace::trace_nsf(&nsf, 0, Some(from_log.len() as u32 - 1)).unwrap();
+    assert_eq!(looped.map(|(_, len)| len), Some(196), "the loop period is exact even when its start is not");
+
+    assert_eq!(from_nsf.len(), from_log.len());
+    for (a, b) in from_nsf.iter().zip(&from_log) {
+        assert_eq!(a, b, "frame {} differs between the NSF and its log", a.frame);
+    }
+
+    // And the CLI reaches the same place, including through the log.
+    for src in [nsf_path.as_path(), &root().join("tests/golden/stress_melodeath.log")] {
+        let out = viper().args(["rip"]).arg(src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("key-ons"), "{}", s);
+        assert!(s.contains("suppressed (no volume at onset)"), "the silent key-ons must be reported: {}", s);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
