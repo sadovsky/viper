@@ -201,7 +201,6 @@ struct INes {
     /// Byte offset of the CHR-ROM inside the file.
     chr_offset: usize,
     chr_bytes: usize,
-    mapper: u8,
 }
 
 /// Read the 16-byte iNES header.
@@ -219,7 +218,6 @@ fn ines_header(bytes: &[u8], what: &Path) -> Result<INes> {
     Ok(INes {
         chr_offset: 16 + trainer + prg,
         chr_bytes,
-        mapper: (bytes[6] >> 4) | (bytes[7] & 0xF0),
     })
 }
 
@@ -239,24 +237,41 @@ pub(crate) fn load_chr(
     cell_w: u32,
     cell_h: u32,
     bank: Option<u32>,
+    frames: u32,
 ) -> Result<SpriteSheet> {
     if cell_w == 0 || cell_h == 0 || !cell_w.is_multiple_of(8) || !cell_h.is_multiple_of(8) {
         bail!("CHR cells are whole 8x8 tiles, so {}x{} will not do", cell_w, cell_h);
     }
     let bytes = std::fs::read(path).with_context(|| format!("read ROM {}", path.display()))?;
     let h = ines_header(&bytes, path)?;
-    if h.chr_bytes == 0 {
-        bail!(
-            "{} has no CHR-ROM (mapper {}): this game builds its tiles in RAM as it \
-             runs, so there is no character data in the file to read",
-            path.display(),
-            h.mapper
-        );
-    }
-    let end = h.chr_offset + h.chr_bytes;
-    let chr = bytes
-        .get(h.chr_offset..end)
-        .ok_or_else(|| anyhow!("{} claims {} bytes of CHR but is too short", path.display(), h.chr_bytes))?;
+    // Two kinds of cartridge, and the difference is where the graphics
+    // live. Most keep their tiles in the file and we read them straight off
+    // disk. The rest — about half of the ones I tried — hold them
+    // compressed or generated, and write them into CHR-RAM as they boot.
+    // For those there is nothing in the file, so the game has to be run.
+    let ram;
+    let chr: &[u8] = if h.chr_bytes == 0 {
+        let dump = viper_apu::nes::run_for_chr(&bytes, frames).with_context(|| {
+            format!("{} keeps its tiles in RAM, so viper ran it to see them", path.display())
+        })?;
+        if dump.written == 0 {
+            bail!(
+                "{} wrote no tiles in {} frames (mapper {}); some games take longer to \
+                 get past a licence screen, so try frames={}",
+                path.display(),
+                frames,
+                dump.mapper,
+                frames.max(1) * 4
+            );
+        }
+        ram = dump.chr;
+        &ram
+    } else {
+        let end = h.chr_offset + h.chr_bytes;
+        bytes.get(h.chr_offset..end).ok_or_else(|| {
+            anyhow!("{} claims {} bytes of CHR but is too short", path.display(), h.chr_bytes)
+        })?
+    };
 
     let total = (chr.len() / 16) as u32;
     let (first, count) = match bank {
@@ -404,7 +419,7 @@ mod tests {
         let mut chr = diagonal_tile();
         chr.resize(8 * 1024, 0);
         let p = write(&rom(1, 1, false, |i| chr[i]));
-        let s = load_chr("t", &p, 8, 8, None).unwrap();
+        let s = load_chr("t", &p, 8, 8, None, 0).unwrap();
         assert_eq!(s.pixel(0, 0, 0), Some(3), "both planes set");
         assert_eq!(s.pixel(0, 7, 0), Some(2), "high plane only");
         assert_eq!(s.pixel(0, 1, 1), Some(1), "low plane only");
@@ -417,7 +432,7 @@ mod tests {
         // Every tile viewer ever written shows them this way, so a ripped
         // sheet looks like what a person expects.
         let p = write(&rom(1, 1, false, |i| if i / 16 == 17 { 0xFF } else { 0 }));
-        let s = load_chr("t", &p, 8, 8, None).unwrap();
+        let s = load_chr("t", &p, 8, 8, None, 0).unwrap();
         assert_eq!(s.width, 128);
         assert_eq!(s.cell_count(), 512, "an 8 KB bank is 512 tiles");
         // Tile 17 is the second tile of the second row.
@@ -434,7 +449,7 @@ mod tests {
         for trainer in [false, true] {
             for prg in [1u8, 2, 4] {
                 let p = write(&rom(prg, 1, trainer, |i| if i < 16 { 0xFF } else { 0 }));
-                let s = load_chr("t", &p, 8, 8, None).unwrap();
+                let s = load_chr("t", &p, 8, 8, None, 0).unwrap();
                 assert_eq!(s.pixel(0, 0, 0), Some(3), "prg {} trainer {}", prg, trainer);
                 let _ = std::fs::remove_file(&p);
             }
@@ -444,36 +459,38 @@ mod tests {
     #[test]
     fn a_bank_is_one_pattern_table_and_past_the_end_is_an_error() {
         let p = write(&rom(1, 2, false, |i| if i / 16 == 256 { 0xFF } else { 0 }));
-        let whole = load_chr("t", &p, 8, 8, None).unwrap();
+        let whole = load_chr("t", &p, 8, 8, None, 0).unwrap();
         assert_eq!(whole.cell_count(), 1024, "two 8 KB banks");
-        let one = load_chr("t", &p, 8, 8, Some(0)).unwrap();
+        let one = load_chr("t", &p, 8, 8, Some(0), 0).unwrap();
         assert_eq!(one.cell_count(), CHR_BANK_TILES, "one pattern table");
         // Tile 256 is the first tile of bank 1.
         assert_eq!(one.pixel(255, 0, 0), Some(0));
-        assert_eq!(load_chr("t", &p, 8, 8, Some(1)).unwrap().pixel(0, 0, 0), Some(3));
-        let err = load_chr("t", &p, 8, 8, Some(99)).unwrap_err().to_string();
+        assert_eq!(load_chr("t", &p, 8, 8, Some(1), 0).unwrap().pixel(0, 0, 0), Some(3));
+        let err = load_chr("t", &p, 8, 8, Some(99), 0).unwrap_err().to_string();
         assert!(err.contains("past the end") && err.contains("4 banks"), "{}", err);
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn a_rom_that_builds_its_tiles_at_runtime_says_so() {
-        // Seven of the seventeen ROMs I checked have no CHR-ROM at all —
-        // Metroid, Zelda, Contra, Final Fantasy among them. They generate
-        // tiles into CHR-RAM as they run, so there is genuinely nothing in
-        // the file to read, and saying "no tiles found" would be a lie about
-        // where the graphics went.
+    fn a_rom_with_no_chr_is_run_rather_than_refused() {
+        // Seven of the seventeen ROMs I checked keep nothing in the file —
+        // Metroid, Zelda, Contra, Final Fantasy among them — because they
+        // write their tiles into CHR-RAM as they boot. So the game is run.
+        //
+        // This fixture is not a game: its PRG is filler that decodes to
+        // nothing useful, so no tiles appear and the error has to say what
+        // to try next rather than blaming the file.
         let p = write(&rom(1, 0, false, |_| 0));
-        let err = load_chr("t", &p, 8, 8, None).unwrap_err().to_string();
-        assert!(err.contains("no CHR-ROM"), "{}", err);
-        assert!(err.contains("builds its tiles in RAM"), "and explains why: {}", err);
+        let err = load_chr("t", &p, 8, 8, None, 2).unwrap_err().to_string();
+        assert!(err.contains("wrote no tiles"), "{}", err);
+        assert!(err.contains("frames=8"), "and suggests running it longer: {}", err);
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn something_that_is_not_a_rom_is_refused() {
         let p = write(b"this is not a ROM at all, not even close");
-        assert!(load_chr("t", &p, 8, 8, None).is_err());
+        assert!(load_chr("t", &p, 8, 8, None, 0).is_err());
         assert!(!is_nes_rom(&p), "and is not mistaken for one");
         let _ = std::fs::remove_file(&p);
         // A ROM is recognised by its magic, not its extension.
@@ -488,10 +505,10 @@ mod tests {
     fn cells_must_be_whole_tiles() {
         let p = write(&rom(1, 1, false, |_| 0));
         // 8x16 is the hardware's tall-sprite mode and has to work.
-        assert!(load_chr("t", &p, 8, 16, None).is_ok());
-        assert!(load_chr("t", &p, 16, 16, None).is_ok());
+        assert!(load_chr("t", &p, 8, 16, None, 0).is_ok());
+        assert!(load_chr("t", &p, 16, 16, None, 0).is_ok());
         for bad in [(5, 8), (8, 5), (0, 8)] {
-            assert!(load_chr("t", &p, bad.0, bad.1, None).is_err(), "{:?}", bad);
+            assert!(load_chr("t", &p, bad.0, bad.1, None, 0).is_err(), "{:?}", bad);
         }
         let _ = std::fs::remove_file(&p);
     }
@@ -522,24 +539,25 @@ mod tests {
                 continue;
             }
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            match load_chr("rom", &path, 8, 8, None) {
+            match load_chr("rom", &path, 8, 8, None, 300) {
                 Ok(s) => {
                     with += 1;
                     assert!(s.cell_count() > 0);
                     assert!(s.indices.iter().all(|&v| v <= 3));
-                    println!("  {:<36} {} tiles", name, s.cell_count());
+                    let live = s.indices.iter().filter(|&&v| v != 0).count();
+                    println!("  {:<36} {:>5} tiles, {:>6} lit pixels", name, s.cell_count(), live);
                 }
                 Err(e) => {
-                    // The only acceptable failure is a game that builds its
-                    // tiles at runtime; anything else is a decoder bug.
+                    // A mapper viper does not know is a fair failure; a
+                    // decode error is not.
                     let msg = e.to_string();
-                    assert!(msg.contains("no CHR-ROM"), "{}: {}", name, msg);
+                    assert!(msg.contains("not supported") || msg.contains("wrote no tiles"), "{}: {}", name, msg);
                     without += 1;
-                    println!("  {:<36} CHR-RAM, nothing in the file", name);
+                    println!("  {:<36} {}", name, msg.lines().next().unwrap_or(""));
                 }
             }
         }
-        println!("{} ROMs with CHR-ROM, {} that build tiles at runtime", with, without);
+        println!("{} ROMs yielded tiles, {} did not", with, without);
     }
 
     #[test]
@@ -548,7 +566,7 @@ mod tests {
         // four colours and something is lost. CHR *is* four indices, so the
         // graphics arrive exactly as the artist drew them.
         let p = write(&rom(1, 1, false, |i| (i % 251) as u8));
-        let s = load_chr("t", &p, 8, 8, None).unwrap();
+        let s = load_chr("t", &p, 8, 8, None, 0).unwrap();
         assert!(!s.quantize, "nothing was approximated");
         assert!(s.indices.iter().all(|&v| v <= 3), "every pixel is already an index");
         assert!(s.indices.iter().any(|&v| v == 3), "and the range is used");

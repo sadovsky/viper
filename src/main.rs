@@ -4377,9 +4377,20 @@ fn sprite_load_args(app: &mut App, path: &str, rest: &[&str]) {
     let mut cell: Option<&&str> = None;
     let mut quantize = false;
     let mut bank: Option<u32> = None;
+    // Five seconds of boot. Enough for every cartridge I tried to get its
+    // tiles up, and short enough that a mistyped path fails quickly.
+    let mut frames: u32 = 300;
     for tok in rest {
         if is_quantize_flag(tok) {
             quantize = true;
+        } else if let Some(n) = tok.strip_prefix("frames=") {
+            match n.parse::<u32>() {
+                Ok(f) => frames = f,
+                Err(_) => {
+                    app.status = format!("sprite: bad frame count '{}'", n);
+                    return;
+                }
+            }
         } else if let Some(n) = tok.strip_prefix("bank=") {
             match n.parse::<u32>() {
                 Ok(b) => bank = Some(b),
@@ -4391,14 +4402,14 @@ fn sprite_load_args(app: &mut App, path: &str, rest: &[&str]) {
         } else if parse_cell_dim(tok).is_some() {
             cell = Some(tok);
         } else {
-            app.status = format!("sprite: unknown option '{}' (want WxH, q, or bank=N)", tok);
+            app.status = format!("sprite: unknown option '{}' (want WxH, q, bank=N or frames=N)", tok);
             return;
         }
     }
-    sprite_load_with(app, path, cell, quantize, bank)
+    sprite_load_with(app, path, cell, quantize, bank, frames)
 }
 
-fn sprite_load_with(app: &mut App, path_str: &str, cell: Option<&&str>, quantize: bool, bank: Option<u32>) {
+fn sprite_load_with(app: &mut App, path_str: &str, cell: Option<&&str>, quantize: bool, bank: Option<u32>, frames: u32) {
     let path = resolve_sprite_path(app, Path::new(path_str));
     // An NES ROM is recognised by its magic rather than its extension, so a
     // ROM is a ROM whatever it has been named.
@@ -4432,7 +4443,7 @@ fn sprite_load_with(app: &mut App, path_str: &str, cell: Option<&&str>, quantize
         (cw, ch)
     };
     let loaded = if is_rom {
-        sprite::load_chr(stem.clone(), &path, cw, ch, bank)
+        sprite::load_chr(stem.clone(), &path, cw, ch, bank, frames)
     } else {
         sprite::load_sheet(stem.clone(), &path, cw, ch, quantize)
     };
@@ -5779,6 +5790,34 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Print the atlas for a real ROM, to see the graphics rather than
+    /// assert about them:
+    ///
+    /// ```text
+    /// VIPER_CHR_ROM=~/roms/metroid.nes cargo test --bins show_a_rom -- --ignored --nocapture
+    /// ```
+    ///
+    /// Opt-in and environment-driven, because commercial ROMs cannot live
+    /// in this repository. `VIPER_CHR_PAGE` picks the page.
+    #[test]
+    #[ignore]
+    fn show_a_rom() {
+        let Ok(rom) = std::env::var("VIPER_CHR_ROM") else {
+            eprintln!("set VIPER_CHR_ROM to a .nes file");
+            return;
+        };
+        let page: u32 = std::env::var("VIPER_CHR_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, &format!("sprite load {} 8x8", rom));
+        println!("{}", app.status);
+        let Some(name) = app.sprite_sheets.keys().next().cloned() else { return };
+        execute_command(&mut app, &format!("sprite show {} {}", name, page));
+        for line in atlas_lines(&app, 118, 26) {
+            println!("{}", line.trim_end());
+        }
     }
 
     #[test]

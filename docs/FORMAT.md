@@ -112,7 +112,9 @@ Four details worth knowing:
   which is already 2bpp indexed and so needs no quantizing. `bank=N` takes
   one 256-tile pattern table; without it the whole of CHR is loaded, which
   for a large game is several thousand tiles. The bank is written back on
-  save, because reloading without it would renumber every placement.
+  save, because reloading without it would renumber every placement. A
+  cartridge that keeps no tiles in the file is booted and read afterwards;
+  `frames=N` says for how long.
 
 
 - **Palette colours are written without a leading `#`.** A `#` at the start of

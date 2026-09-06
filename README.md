@@ -188,9 +188,18 @@ What it cannot do is invent colour: which palette a tile is drawn with is
 chosen by the game's code, per frame, per attribute block. Sheets load with
 a legible grey ramp; `:sprite repalette` sets a real one.
 
-Some games have nothing to read. Roughly half the ROMs I tried build their
-tiles into CHR-RAM as they run — Metroid, Zelda, Contra, Final Fantasy —
-and viper says so rather than reporting an empty sheet.
+About half the library keeps nothing in the file: Metroid, Zelda, Contra,
+Final Fantasy and the rest hold their tiles compressed or generated, and
+write them into 8 KB of CHR-RAM as they boot. For those viper boots the
+cartridge and reads the RAM afterwards — mappers 0, 1, 2, 3 and 7, which
+covers most of the library. `frames=N` says how long to let it run; the
+default is five seconds, and a game with a long licence screen may want
+more.
+
+There is no picture and no sound in that path, because neither is needed
+to answer "what tiles did this game upload?". What is needed is bank
+switching, a real NMI, and the PPU's address and data ports — tiles arrive
+through `$2006`/`$2007` like everything else the PPU is told.
 
 Sprites can be bound to any audio-reactive source. The binding language
 is a small expression DSL — operators, parentheses, a handful of

@@ -164,6 +164,27 @@ impl Cpu {
     }
 
     /// Execute one instruction. Returns the cycle count.
+    /// Take an NMI: push the return address and flags, then vector through
+    /// `$FFFA`.
+    ///
+    /// Unlike `BRK` the pushed status has the B flag *clear* — that bit is
+    /// how an `RTI` handler tells a software break from a hardware
+    /// interrupt, and a game that checks it will take the wrong branch if
+    /// this is got wrong. The NSF host never needs this, since it drives
+    /// PLAY through a synthetic JSR, but a real cartridge does almost all
+    /// its work in the vblank handler.
+    pub fn nmi<Bu: Bus>(&mut self, bus: &mut Bu) -> u32 {
+        let pc = self.pc;
+        self.push(bus, (pc >> 8) as u8);
+        self.push(bus, pc as u8);
+        self.push(bus, (self.p & !B) | U);
+        self.set_flag(I, true);
+        let lo = bus.read(0xFFFA) as u16;
+        let hi = bus.read(0xFFFB) as u16;
+        self.pc = lo | (hi << 8);
+        7
+    }
+
     pub fn step<Bu: Bus>(&mut self, bus: &mut Bu) -> u32 {
         let op = self.fetch(bus);
         // Read-modify-write helper.
@@ -370,6 +391,30 @@ mod tests {
     impl Bus for Ram {
         fn read(&mut self, a: u16) -> u8 { self.0[a as usize] }
         fn write(&mut self, a: u16, v: u8) { self.0[a as usize] = v; }
+    }
+
+    #[test]
+    fn an_nmi_vectors_through_fffa_and_can_be_returned_from() {
+        let mut ram = Ram(vec![0; 0x10000]);
+        ram.0[0xFFFA] = 0x34;
+        ram.0[0xFFFB] = 0x12;
+        ram.0[0x1234] = 0x40; // RTI
+        let mut cpu = Cpu { pc: 0xC0DE, sp: 0xFF, p: U | C, ..Default::default() };
+        assert_eq!(cpu.nmi(&mut ram), 7);
+        assert_eq!(cpu.pc, 0x1234, "vectored through $FFFA");
+        assert!(cpu.p & I != 0, "and masked further interrupts");
+        // The pushed status has B clear: that bit is how an RTI handler tells
+        // a software BRK from a hardware interrupt, and a game that checks it
+        // takes the wrong branch if this is got wrong.
+        assert_eq!(ram.0[0x01FD] & B, 0, "B clear on the stack");
+        assert_eq!(ram.0[0x01FD] & U, U, "with the unused bit set");
+        assert_eq!(ram.0[0x01FF], 0xC0, "return address high");
+        assert_eq!(ram.0[0x01FE], 0xDE, "and low");
+        // RTI puts everything back.
+        cpu.step(&mut ram);
+        assert_eq!(cpu.pc, 0xC0DE);
+        assert_eq!(cpu.p & C, C, "the carry survived");
+        assert_eq!(cpu.sp, 0xFF);
     }
 
     fn run(prog: &[u8]) -> (Cpu, Ram) {
