@@ -148,7 +148,7 @@ fn onsets(t: &[FrameTrace]) -> Vec<u32> {
 /// Zero is never produced. It means "channel default" everywhere else in
 /// viper, so an audible note must not map to it.
 fn cell_volume(level: u8) -> u8 {
-    ((16 * level as u16 + 14) / 15).clamp(1, 15) as u8
+    (16 * level as u16).div_ceil(15).clamp(1, 15) as u8
 }
 
 /// Whether a note on this channel is still sounding when the *next* row

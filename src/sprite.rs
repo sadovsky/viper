@@ -112,7 +112,7 @@ pub(crate) fn load_sheet(
         }
     }
 
-    let chosen: Vec<[u8; 3]> = if counts.len() <= PALETTE_SIZE - 1 {
+    let chosen: Vec<[u8; 3]> = if counts.len() < PALETTE_SIZE {
         counts.iter().map(|(c, _)| *c).collect()
     } else if quantize {
         counts.sort_by(|a, b| b.1.cmp(&a.1));

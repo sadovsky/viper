@@ -257,7 +257,7 @@ fn quantize_trellis(target: &[f32], start: u8) -> Vec<u8> {
     let lvl = |i: usize| -> i32 { i as i32 * 2 + parity };
     let mut tgt: Vec<f32> = target.to_vec();
     // multiple of 8 bits, then room to come home
-    while tgt.len() % 8 != 0 {
+    while !tgt.len().is_multiple_of(8) {
         tgt.push(start as f32);
     }
     loop {
@@ -329,7 +329,7 @@ fn finish(bits: &[u8]) -> Vec<u8> {
         }
         out.push(b);
     }
-    let want = ((out.len().max(1) - 1 + 15) / 16) * 16 + 1;
+    let want = (out.len().max(1) - 1).div_ceil(16) * 16 + 1;
     while out.len() < want {
         out.push(0x55);
     }
@@ -437,8 +437,8 @@ pub fn encode_dmc(wave: &[f32]) -> Vec<u8> {
             bits.push(1);
         }
     }
-    let nbytes = (bits.len() + 7) / 8;
-    let nbytes = ((nbytes.max(1) - 1 + 15) / 16) * 16 + 1;
+    let nbytes = bits.len().div_ceil(8);
+    let nbytes = (nbytes.max(1) - 1).div_ceil(16) * 16 + 1;
     while bits.len() < nbytes * 8 {
         bits.push((bits.len() % 2) as u8);
     }

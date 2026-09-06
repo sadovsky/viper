@@ -676,7 +676,7 @@ impl Register {
     /// True if the register spans all CHANNELS (came from a full-row yank like
     /// `yy`, `yab`, `yip`). Row-wise pastes ignore cursor_ch.
     fn is_full_row(&self) -> bool {
-        self.rows.first().map_or(false, |r| r.len() == CHANNELS)
+        self.rows.first().is_some_and(|r| r.len() == CHANNELS)
     }
 }
 
@@ -1750,7 +1750,7 @@ fn viewport_top(viewport: usize, above: usize, cursor_step: usize, play: Option<
     // in the viewport at once. They live in the same 16-row phrase, so for
     // any viewport of 16 or more this interval is never empty.
     let (lo, hi) = match play {
-        Some(p) if (c - p as isize).abs() <= v - 1 => (c.max(p as isize) - v + 1, c.min(p as isize)),
+        Some(p) if (c - p as isize).abs() < v => (c.max(p as isize) - v + 1, c.min(p as isize)),
         _ => (c - v + 1, c),
     };
     top = top.clamp(lo, hi);
@@ -4653,7 +4653,7 @@ fn scene_clear(app: &mut App, n: &str) {
 }
 
 fn scene_launch_by_name(app: &mut App, n: &str) {
-    with_scene_slot(app, n, |a, i| queue_or_launch_scene(a, i));
+    with_scene_slot(app, n, queue_or_launch_scene);
 }
 
 /// Queue a scene for the next bar boundary while playing; jump immediately
@@ -5249,7 +5249,7 @@ impl<'a> PreviewCmd<'a> {
             ["gen", "style", ..] => None,
             ["gen", rest @ ..] => {
                 let name = rest.first()?;
-                PREVIEWABLE_GENERATORS.contains(name).then(|| Self::Gen(rest))
+                PREVIEWABLE_GENERATORS.contains(name).then_some(Self::Gen(rest))
             }
             ["transpose", n] | ["tr", n] => n.parse().ok().map(Self::Transpose),
             _ => None,
@@ -5467,7 +5467,7 @@ fn sync_audio(app: &mut App, engine: Option<&audio::AudioEngine>) {
     if app.playing
         && app.queued_scene.is_some()
         && app.play_step != app.prev_play_step
-        && app.play_step % 4 == 0
+        && app.play_step.is_multiple_of(4)
     {
         if let Some(slot) = app.queued_scene.take() {
             if let Some(phrase_idx) = app.scenes[slot] {

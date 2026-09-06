@@ -617,7 +617,7 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
         for (r, n) in lane { last_row = last_row.max(r + n.len_rows); }
     }
     if let Some((&r, _)) = drum_rows.iter().next_back() { last_row = last_row.max(r + 1); }
-    let total_rows = ((last_row + STEPS_PER_PHRASE - 1) / STEPS_PER_PHRASE) * STEPS_PER_PHRASE;
+    let total_rows = last_row.div_ceil(STEPS_PER_PHRASE) * STEPS_PER_PHRASE;
     report.rows = total_rows;
     let nphr = total_rows / STEPS_PER_PHRASE;
 
@@ -631,7 +631,7 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
                 if busy { continue; }
                 report.filled_rows += 1;
             }
-            let fx = if let Some(v) = tm.vibrato { if n.len_rows >= tm.vibrato_min_rows { Some(v) } else { None } } else { None };
+            let fx = tm.vibrato.filter(|&v| n.len_rows >= tm.vibrato_min_rows);
             let vol = tm.velocity.unwrap_or(map.velocity).vol(n.vel);
             report.note_volume(vol);
             grid[*r][*ch] = Cell { note: Some(n.key), instr: tm.instr, vol, fx, hold: false };

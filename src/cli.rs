@@ -383,7 +383,7 @@ fn compile_cmd(a: &Args) -> Result<()> {
     for w in &emitted.warnings {
         eprintln!("warning: {}", w);
     }
-    let is_nsfe = out.extension().map_or(false, |e| e.eq_ignore_ascii_case("nsfe"));
+    let is_nsfe = out.extension().is_some_and(|e| e.eq_ignore_ascii_case("nsfe"));
     let bytes = if is_nsfe { &emitted.nsfe } else { &emitted.nsf };
     std::fs::write(&out, bytes).with_context(|| format!("write {}", out.display()))?;
     if let Some(extra) = a.get("nsfe") {

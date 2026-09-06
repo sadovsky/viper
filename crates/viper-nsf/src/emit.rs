@@ -218,7 +218,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
             if data.is_empty() {
                 data.push(0x55);
             }
-            let want = ((data.len() - 1 + 15) / 16) * 16 + 1;
+            let want = (data.len() - 1).div_ceil(16) * 16 + 1;
             data.resize(want, 0x55);
             if data.len() > 0xFF1 {
                 bail!("DPCM sample `{}` is {} bytes; max is 4081", s.name, data.len());

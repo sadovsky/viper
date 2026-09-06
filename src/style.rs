@@ -426,7 +426,7 @@ impl Style {
                 "motif" => {
                     // `@motif 0 2 3` or `@motif name 0 2 3`
                     let mut toks: Vec<&str> = args.split_whitespace().collect();
-                    let name = if toks.first().map_or(false, |t| t.parse::<i32>().is_err()) {
+                    let name = if toks.first().is_some_and(|t| t.parse::<i32>().is_err()) {
                         toks.remove(0).to_string()
                     } else {
                         format!("motif{}", st.motifs.len() + 1)
@@ -926,7 +926,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
                 let (noi, dpcm) = drum_cells(style, &drums, last && bars > 1, b == 0 && si > 0, &mut ctx.rng);
                 let mut ph = Phrase::default();
                 let vol_at = |s: usize| -> u8 {
-                    let base = match riff.accent { Some((on, off)) => if s % 4 == 0 { on } else { off }, None => 0 };
+                    let base = match riff.accent { Some((on, off)) => if s.is_multiple_of(4) { on } else { off }, None => 0 };
                     if section.swell && bars > 1 {
                         // 6..15 across the bars; accents scale within it
                         let top = 6 + (9 * b / (bars - 1).max(1)) as u8;

@@ -464,7 +464,7 @@ pub fn bounce_to_wav(
     let render_sample = |voices: &mut [Voice; CHANNELS], samples: &mut Vec<f32>| {
         let mut mix = 0.0f32;
         for v in voices.iter_mut() {
-            mix += v.tick(sr_f, &bank);
+            mix += v.tick(sr_f, bank);
         }
         samples.push((mix * 0.2).clamp(-1.0, 1.0));
     };
@@ -691,7 +691,7 @@ where
                     tr.playing_phrase = tr.order[0];
                 }
                 if use_apu {
-                    let need = apu.as_ref().map_or(true, |a| a.generation != tr.nsf_generation);
+                    let need = apu.as_ref().is_none_or(|a| a.generation != tr.nsf_generation);
                     if need {
                         let nsf = tr.nsf.clone().unwrap();
                         match ApuState::new(&nsf, tr.nsf_generation, sample_rate_u, tr.order.len(), tr.loop_pos) {
