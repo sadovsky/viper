@@ -194,3 +194,85 @@ pub fn format_log(log: &[crate::host::RegWrite]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pulse on channel 1 and nothing else, hand-assembled — the same
+    /// trick `host.rs` uses, because viper cannot assemble 6502.
+    fn pulse_nsf(expansion: u8) -> Nsf {
+        let mut code: Vec<u8> = vec![
+            0xA9, 0x01, 0x8D, 0x15, 0x40, // LDA #$01 / STA $4015 — pulse 1 on
+            0xA9, 0xBF, 0x8D, 0x00, 0x40, // duty 2, halt, constant volume 15
+            0xA9, 0xFD, 0x8D, 0x02, 0x40, // period low
+            0xA9, 0x08, 0x8D, 0x03, 0x40, // length + period high
+            0x60,
+        ];
+        let play = 0x8000 + code.len() as u16;
+        code.push(0x60);
+        let header = Nsf::build_header(0x8000, 0x8000, play, 1, "p", "", "", expansion);
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&code);
+        Nsf::parse(&bytes).unwrap()
+    }
+
+    fn opts(stems: bool) -> RenderOptions {
+        RenderOptions { max_seconds: 0.5, stems, ..RenderOptions::default() }
+    }
+
+    #[test]
+    fn the_same_nsf_renders_bit_identically_every_time() {
+        // The first line of this module promises it. Nothing checked it, and
+        // the pipeline test that looks similar compares two register logs
+        // rather than two renders — so a nondeterministic mixer, resampler
+        // or loop detector would have slipped straight through.
+        let nsf = pulse_nsf(0);
+        let a = render_frames(&nsf, &opts(false), 60).unwrap();
+        let b = render_frames(&nsf, &opts(false), 60).unwrap();
+        assert_eq!(a.mix, b.mix, "audio");
+        assert_eq!(a.log, b.log, "register writes");
+        assert_eq!(a.total_frames, b.total_frames);
+    }
+
+    #[test]
+    fn a_stem_holds_one_channel_and_the_silent_ones_stay_silent() {
+        let r = render_frames(&pulse_nsf(0), &opts(true), 60).unwrap();
+        let names: Vec<&str> = r.stems.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.starts_with(&["pu1", "pu2", "tri", "noi"]), "{:?}", names);
+        let peak = |n: &str| {
+            r.stems.iter().find(|s| s.name == n).unwrap().samples.iter().fold(0f32, |a, b| a.max(b.abs()))
+        };
+        assert!(peak("pu1") > 0.01, "the channel that is playing");
+        for quiet in ["pu2", "noi"] {
+            assert!(peak(quiet) < 1e-6, "{} should be silent, peaked at {}", quiet, peak(quiet));
+        }
+        // Every stem is the same length as the mix, or they cannot be lined
+        // up in a DAW.
+        assert!(r.stems.iter().all(|s| s.samples.len() == r.mix.len()));
+    }
+
+    #[test]
+    fn the_expansion_byte_decides_how_many_stems_there_are() {
+        // A plain 2A03 file must render exactly the five it always did; the
+        // VRC6 three appear only when the header declares the chip, so
+        // adding expansion support cannot quietly change what an old song
+        // splits into.
+        assert_eq!(stem_specs(&pulse_nsf(0)).len(), 4, "plus DPCM, added separately");
+        let vrc6 = stem_specs(&pulse_nsf(0x01));
+        assert_eq!(vrc6.len(), 7);
+        assert!(vrc6.iter().any(|(n, _)| *n == "saw"));
+    }
+
+    #[test]
+    fn the_mix_lasts_as_long_as_the_frames_it_reports() {
+        // Not exact: frames run at 60.0988 a second and the resampler
+        // carries a fractional accumulator, so this catches a render that is
+        // half or double the length it claims rather than one sample out.
+        let r = render(&pulse_nsf(0), &opts(false)).unwrap();
+        assert!(r.total_frames > 0);
+        let want = r.total_frames as f64 * 44_100.0 / 60.0988;
+        let ratio = r.mix.len() as f64 / want;
+        assert!((0.99..=1.01).contains(&ratio), "{} samples for {} frames", r.mix.len(), r.total_frames);
+    }
+}
