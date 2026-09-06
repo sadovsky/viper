@@ -459,6 +459,70 @@ lives in viper.
   produces a file where the driver slides and arpeggiates silence and
   nothing reaches the registers at all.
 
+### Foundations
+
+- **Stage 37** ✅ — **Shore up what is untested.** No new features; the
+  emulator at the heart of the project had no tests and `cargo clippy` did
+  not run. 239 tests now, from 187, and zero warnings from either tool.
+
+  **`cargo clippy --workspace` exited 101 rather than reporting lints.** A
+  vestigial `root_deg * 0` in the generator tripped deny-by-default
+  `erasing_op`, so anyone who ran clippy got a build failure. The term
+  contributed nothing, but `style.rs` is the song generator, so "nothing"
+  was checked rather than asserted: twelve songs at seed 1 hash identically
+  before and after. That check is now a test, which also answers the seed
+  stability question `GENERATION.md` had left open.
+
+  **The 2A03 had one test, and it tested `decode_dmc` rather than the
+  chip.** Fifteen now, reading published hardware facts: the mixing tables
+  reach 0.99998 at full scale, which is why the host never clips; the noise
+  LFSR's period is 32767 long and 93 short and never reaches zero; a length
+  counter expires on the sequencer's tenth half clock at cycle 149,149; the
+  two pulses negate one apart. The golden log cannot see any of this — it
+  records what the driver *wrote*, and regenerating it absorbs any change
+  to what the chip does with those writes. Checked by mutation: flipping
+  the LFSR feedback bit, removing the negate quirk or nudging a mixer
+  constant each fail two or more.
+
+  Three more run a hand-assembled 2A03 NSF end to end. The amplitude test
+  derives its prediction rather than recording one, and the obvious
+  prediction is wrong by 23%: a first-order high-pass does not merely
+  centre a square wave, it droops within each half cycle, so the excursion
+  is `A / (1 + a^N)`, about 0.61 A. Getting that wrong is how a correct
+  mixer looks broken.
+
+  **Two identical envelope generators, with nothing asserting they agree.**
+  `apu.rs` drives the emulator and `trace.rs` keeps its own because it runs
+  on log timing. A divergence would be quiet: `viper rip` would read
+  volumes the emulator never produced, so viper would stop round-tripping
+  its own output. Both are now compared across the whole input space, which
+  is small enough to exhaust.
+
+  **Two CLI bugs, fixed rather than pinned.** `viper --version` opened the
+  tracker on a file called `--version`; `viper rip --bpm 0` reported
+  success and wrote a `.vip` that then refused to compile, landing the
+  failure one command after the mistake. The parser's other surprises are
+  pinned as they are, because changing them is a decision: a flag whose
+  value looks like a flag is silently dropped, and an unlisted boolean flag
+  swallows the next argument.
+
+  **viper's stdout is an interface.** Two printed lines are parsed by the
+  downstream album build. They are named functions now, with tests that
+  assert the shape a consumer needs rather than snapshotting the prose —
+  except the `viper gen` header marker, pinned verbatim including its em
+  dash, because normalising that one character would make every generated
+  song invisible to the tools that pick them.
+
+  Also: the row clock does not add up, and that is correct — at 120 BPM one
+  row costs 7 frames and two cost 15, because the driver restarts its
+  accumulator at the loop point, which the rip work made visible.
+  `render.rs`'s promise of bit-identical output is now checked. The HSV
+  round trip really is the identity for all 16.7 million colours, so the
+  renderer's short-circuit is an optimisation rather than a behaviour
+  switch. And an orphaned doc comment that had drifted 260 lines from its
+  function, where it appeared to document a different one, is back where it
+  belongs.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first
