@@ -496,6 +496,24 @@ lives in viper.
   implements it. `docs/NSF.md` claimed channels were "a table, not an enum"
   and that the emitter never special-cased expansion; both were false and
   are now corrected there.
+### Import
+
+- **Stage 34** ✅ — **MIDI velocity.** The importer read every note's
+  velocity and threw it away: each imported cell got `vol: 0`, which viper
+  reads as "channel default", so a cover came out flat out at every hit and
+  a ghost note hit as hard as an accent. The unused field was the repo's one
+  remaining build warning.
+
+  Velocity now flows through the chord-flattening and drum-selection
+  pipelines to the volume column, mapped linearly from 1–127 onto 1–15. The
+  mapping never yields 0, because that value means "full" everywhere else in
+  viper. `velocity=` on `@song` or any `@track` selects `on`, `off` (the old
+  behaviour, for sources whose velocities are junk) or a pinned 1–15, and
+  the import report prints the volume range — calling out a source that has
+  no dynamics rather than leaving you to wonder why nothing varies.
+
+  Checked against a real MIDI: a Black Dahlia Murder tab export imports with
+  volumes spread 7–11 where every note used to be full.
 
 ### Generators
 
