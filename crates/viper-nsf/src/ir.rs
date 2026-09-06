@@ -44,6 +44,9 @@ pub enum Event {
     Vibrato { depth: u8, rate: u8 },
     Arp { x: u8, y: u8 },
     EnvReset,
+    /// Set the row clock from this row on: 8.8 fixed-point frames per row.
+    /// Song-global; the lowering emits it on one channel only.
+    Speed(u16),
 }
 
 /// A volume envelope: one value per frame, with optional loop and

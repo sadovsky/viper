@@ -157,6 +157,9 @@ pub struct TrackMap {
     pub flatten: String,
     pub octave: i32,
     pub drums: bool,
+    /// Only write where the channel is still free (a second source for a
+    /// channel: a harmoniser under the rhythm part, strings in an intro).
+    pub fill: bool,
     pub vibrato: Option<(u8, u8)>,
     pub vibrato_min_rows: usize,
     /// Per-track override of the song's velocity handling.
@@ -221,6 +224,8 @@ pub enum DrumTarget {
 #[derive(Clone, Debug, Default)]
 pub struct Map {
     pub title: String,
+    /// Note value one row represents: 16 (default) or 32.
+    pub grid: usize,
     pub artist: String,
     pub arranger: String,
     pub bpm: Option<u16>,
@@ -235,6 +240,9 @@ pub struct Map {
     pub instruments: Vec<(usize, Instrument)>,
     pub samples: Vec<DpcmRef>,
     pub driver: Option<(PathBuf, PathBuf)>,
+    /// `@source midi=...` — the MIDI this map is written for, relative to
+    /// the map file. Lets `viper import --map x.vmap` stand alone.
+    pub source: Option<PathBuf>,
 }
 
 fn parse_noi_target(v: &str) -> Result<DrumTarget> {
@@ -266,7 +274,7 @@ fn strip_comment(s: &str) -> &str {
 }
 
 pub fn parse_map(text: &str) -> Result<Map> {
-    let mut m = Map::default();
+    let mut m = Map { grid: 16, ..Default::default() };
     for (ln, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
         if line.is_empty() {
@@ -288,12 +296,16 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "bpm" => m.bpm = if v == "auto" { None } else { Some(v.parse().with_context(ctx)?) },
                         "transpose" => m.transpose = v.parse().with_context(ctx)?,
                         "velocity" => m.velocity = Velocity::parse(&v).with_context(ctx)?,
+                        "grid" => {
+                            m.grid = v.parse().with_context(ctx)?;
+                            if m.grid != 16 && m.grid != 32 { bail!("{}: grid must be 16 or 32", ctx()); }
+                        }
                         _ => {}
                     }
                 }
             }
             "track" => {
-                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, vibrato: None, vibrato_min_rows: 2, velocity: None };
+                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, fill: false, vibrato: None, vibrato_min_rows: 2, velocity: None };
                 for (k, v) in kv(args) {
                     match k.as_str() {
                         "midi" => t.midi = v,
@@ -302,13 +314,14 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "flatten" => t.flatten = v,
                         "octave" => t.octave = v.parse().with_context(ctx)?,
                         "drums" => t.drums = v == "1" || v == "on",
+                        "fill" => t.fill = v == "1" || v == "on",
                         "vibrato" => t.vibrato = parse_fx(&v),
                         "vibrato_min_rows" => t.vibrato_min_rows = v.parse().with_context(ctx)?,
                         "velocity" => t.velocity = Some(Velocity::parse(&v).with_context(ctx)?),
                         _ => {}
                     }
                 }
-                if t.midi.is_empty() { bail!("{}: needs midi=", ctx()); }
+            if t.midi.is_empty() { bail!("{}: needs midi=", ctx()); }
                 if !t.drums && t.ch.is_none() { bail!("{}: needs ch= or drums=1", ctx()); }
                 m.tracks.push(t);
             }
@@ -382,6 +395,11 @@ pub fn parse_map(text: &str) -> Result<Map> {
                 }
                 m.samples[idx] = r;
             }
+            "source" => {
+                for (k, v) in kv(args) {
+                    if k == "midi" { m.source = Some(PathBuf::from(v)); }
+                }
+            }
             "driver" => {
                 let (mut bin, mut sym) = (None, None);
                 for (k, v) in kv(args) {
@@ -417,6 +435,8 @@ pub struct Report {
     pub chords_flattened: usize,
     pub voiced_chords: usize,
     pub notes_clamped: usize,
+    pub tempo_changes: usize,
+    pub filled_rows: usize,
     pub drum_dpcm_conflicts: usize,
     pub drum_fallbacks: usize,
     pub drum_dropped: usize,
@@ -438,9 +458,9 @@ impl Report {
 
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "{} BPM, {} rows → {} phrases ({} unique); tracks: {}\nchords flattened {} (voiced across PU1/PU2 {}), notes clamped {}\ndrums: DPCM conflicts {} (fallback {}, dropped {}), noise conflicts {}",
+            "{} BPM, {} rows → {} phrases ({} unique); tracks: {}\nchords flattened {} (voiced across PU1/PU2 {}), notes clamped {}, tempo changes {}, fill notes placed {}\ndrums: DPCM conflicts {} (fallback {}, dropped {}), noise conflicts {}",
             self.bpm, self.rows, self.phrases_total, self.phrases_unique, self.tracks.join(", "),
-            self.chords_flattened, self.voiced_chords, self.notes_clamped,
+            self.chords_flattened, self.voiced_chords, self.notes_clamped, self.tempo_changes, self.filled_rows,
             self.drum_dpcm_conflicts, self.drum_fallbacks, self.drum_dropped, self.noi_conflicts
         );
         // vol 0 means "channel default", i.e. velocity was turned off.
@@ -485,20 +505,18 @@ fn find_track<'a>(midi: &'a Midi, name: &str) -> Option<&'a MidiTrack> {
 
 pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let mut report = Report::default();
-    let bpm = match map.bpm {
-        Some(b) => b,
-        None => {
-            let first = midi.tempos.first().map(|t| t.1).unwrap_or(120.0);
-            if midi.tempos.iter().any(|t| (t.1 - first).abs() > 0.5) {
-                report.warnings.push(format!("tempo changes in the MIDI are ignored; using the first ({:.1} BPM)", first));
-            }
-            first.round() as u16
-        }
-    };
+    let first_tempo = midi.tempos.first().map(|t| t.1).unwrap_or(120.0);
+    let bpm = map.bpm.unwrap_or(first_tempo.round() as u16);
     report.bpm = bpm;
     let tpq = midi.ticks_per_quarter as u64;
-    let row_ticks = tpq / 4;
+    let rows_per_quarter = if map.grid == 32 { 8 } else { 4 } as u64;
+    let row_ticks = (tpq / rows_per_quarter).max(1);
     let to_row = |tick: u64| -> usize { ((tick as f64 / row_ticks as f64).round()) as usize };
+
+    // A row is a 16th (or 32nd with grid=32), so at grid=32 the row clock
+    // runs twice as fast: the driver's speed is set from bpm * 2 there, and
+    // mid-song tempo changes ride along in the same units.
+    let grid_mul = rows_per_quarter as f64 / 4.0;
 
     // --- pitched tracks: notes per row, chord sets kept for the cross-track rule
     let mut chords: Vec<BTreeMap<usize, Vec<Cand>>> = Vec::new(); // per track: row -> candidates
@@ -581,6 +599,18 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
         }
     }
 
+    // --- tempo map: every change after the first, at the row it lands on
+    let mut tempo_map: Vec<(usize, u16)> = Vec::new();
+    for (tick, t) in midi.tempos.iter().skip(1) {
+        let row = to_row(*tick);
+        let val = (t * grid_mul).round() as u16;
+        if tempo_map.last().map(|l| l.1) != Some(val) && val > 0 {
+            tempo_map.push((row, val));
+        }
+    }
+    tempo_map.dedup_by_key(|e| e.0);
+    report.tempo_changes = tempo_map.len();
+
     // --- total rows
     let mut last_row = 0usize;
     for (_, lane, _) in &lanes {
@@ -595,6 +625,12 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let mut grid: Vec<[Cell; CHANNELS]> = vec![[Cell::default(); CHANNELS]; total_rows];
     for (ch, lane, tm) in &lanes {
         for (r, n) in lane {
+            // a fill track only writes where its channel is still free
+            if tm.fill {
+                let busy = (0..n.len_rows).any(|h| r + h < total_rows && (grid[r + h][*ch].note.is_some() || grid[r + h][*ch].hold));
+                if busy { continue; }
+                report.filled_rows += 1;
+            }
             let fx = if let Some(v) = tm.vibrato { if n.len_rows >= tm.vibrato_min_rows { Some(v) } else { None } } else { None };
             let vol = tm.velocity.unwrap_or(map.velocity).vol(n.vel);
             report.note_volume(vol);
@@ -655,7 +691,8 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
 
     // --- phrases + order (dedupe identical phrases)
     let mut song = Song::default();
-    song.bpm = bpm;
+    song.bpm = ((bpm as f64 * grid_mul).round() as u16).max(1);
+    song.tempo_map = tempo_map;
     song.phrases.clear();
     let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     for p in 0..nphr {

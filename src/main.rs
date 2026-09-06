@@ -321,6 +321,9 @@ pub(crate) struct Song {
     pub copyright: String,
     /// `@meta key="E minor"` — informational, carried into manifests.
     pub key_name: String,
+    /// `@tempo ROW=BPM ...` — mid-song tempo changes, absolute row index
+    /// into the flattened order. Empty = one tempo for the whole song.
+    pub tempo_map: Vec<(usize, u16)>,
     /// `@driver bin=.. sym=..` — the NSF driver to compile against,
     /// relative to the `.vip` file.
     pub driver: Option<(PathBuf, PathBuf)>,
@@ -420,6 +423,7 @@ impl Default for Song {
             artist: String::new(),
             copyright: String::new(),
             key_name: String::new(),
+            tempo_map: Vec::new(),
             driver: None,
             samples: Vec::new(),
             chains: Vec::new(),
