@@ -299,8 +299,7 @@ impl Apu {
         for (i, v) in tnd_table.iter_mut().enumerate().skip(1) {
             *v = 163.67 / (24329.0 / i as f32 + 100.0);
         }
-        let mut pu1 = Pulse::default();
-        pu1.is_pulse1 = true;
+        let pu1 = Pulse { is_pulse1: true, ..Default::default() };
         Self {
             pu1,
             pu2: Pulse::default(),

@@ -3,6 +3,20 @@
 //! Stage-1: data model, modal input, phrase editor UI.
 //! Stage-2: cpal audio thread producing sound from the edited phrase.
 
+// Three lints turned off deliberately, with reasons, rather than worked
+// around. `type_complexity` fires on the channel-state tuples this codebase
+// passes around — `Vec<(usize, usize, NoteEnv)>` and friends — and naming a
+// dozen aliases for them would put a layer of indirection between a call
+// site and what it actually carries. `too_many_arguments` fires on the
+// renderers, which take a frame, an area and the several pieces of state
+// they draw; bundling those into a struct purely to get under a threshold
+// makes them harder to read, not easier. And `needless_range_loop` is
+// almost always wrong here: a loop index in this codebase is a channel, a
+// step or a row — a value with a meaning that gets compared, stored and
+// printed — so `for c in 0..CHANNELS` says what it means and
+// `for (c, x) in xs.iter().enumerate()` says less.
+#![allow(clippy::type_complexity, clippy::too_many_arguments, clippy::needless_range_loop)]
+
 mod audio;
 mod compile;
 mod dpcm;
@@ -498,9 +512,7 @@ impl Song {
     /// one chord per bar, with a lead on PU1, arp on PU2, bass on TRI, and a
     /// simple kick/snare/hat on NOI.
     pub(crate) fn demo() -> Self {
-        let mut song = Song::default();
-        song.bpm = 80;
-        song.edit_step = 1;
+        let mut song = Song { bpm: 80, edit_step: 1, ..Default::default() };
 
         // Instrument 00 — lead pulse: medium attack, punchy.
         song.instruments[0] = Instrument {
@@ -3895,7 +3907,6 @@ fn unmute_all(app: &mut App) {
     };
 }
 
-/// Parse "1".."5" or "pu1/pu2/tri/noi/dpcm" into a channel index.
 // ---------- Stage 23: chains, arrangement, groove, polymeter ----------
 
 fn song_show(app: &mut App) {
@@ -4154,6 +4165,7 @@ fn groove_cmd(app: &mut App, rest: &[&str]) {
     }
 }
 
+/// Parse "1".."5" or "pu1/pu2/tri/noi/dpcm" into a channel index.
 fn parse_channel_token(tok: &str) -> Option<usize> {
     if let Ok(n) = tok.parse::<usize>() {
         if (1..=CHANNELS).contains(&n) {

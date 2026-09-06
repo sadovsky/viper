@@ -862,8 +862,7 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
     let timbre_pick = if style.timbres.is_empty() { None } else { Some(rng.range(0, style.timbres.len() as u32) as usize) };
     let mut ctx = Ctx { style, motif: motif_pick, rng, key, scale, prog, motif_on };
 
-    let mut song = Song::default();
-    song.bpm = bpm;
+    let mut song = Song { bpm, ..Default::default() };
     for (idx, inst) in &style.instruments {
         song.instruments[*idx] = *inst;
     }

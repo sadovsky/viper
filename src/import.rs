@@ -692,8 +692,7 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     }
 
     // --- phrases + order (dedupe identical phrases)
-    let mut song = Song::default();
-    song.bpm = ((bpm as f64 * grid_mul).round() as u16).max(1);
+    let mut song = Song { bpm: ((bpm as f64 * grid_mul).round() as u16).max(1), ..Default::default() };
     song.tempo_map = tempo_map;
     let (phrases, order) = crate::phrases_from_rows(&grid)?;
     song.phrases = phrases;

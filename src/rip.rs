@@ -584,9 +584,8 @@ fn classify(periods: &[u16], ch: usize) -> Motion {
                 last = Some(i);
             }
         }
-        if cycle > 0 {
-            let rate = (32 / cycle).clamp(1, 15) as u8;
-            return Motion::Vibrato { depth: (span + 1).min(15), rate };
+        if let Some(rate) = 32usize.checked_div(cycle) {
+            return Motion::Vibrato { depth: (span + 1).min(15), rate: rate.clamp(1, 15) as u8 };
         }
     }
     Motion::Steady
