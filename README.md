@@ -34,6 +34,7 @@ viper compile song.vip --driver tests/fixtures/driver.bin -o song.nsf
 viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
 viper verify song.nsf --against fceux.log --vip song.vip  # diff vs another emulator
+viper rip song.nsf -o ripped.vip                 # read the music back out
 viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
 viper dpcm encode kick.wav -o kick.dmc                  # hand-crafted drum samples
 ```
@@ -254,7 +255,29 @@ chip the driver does not drive. *Authoring* for VRC6 is a separate job: the
 channel count is baked into the wire format, so it needs a driver that
 implements the extra channels.
 
-Next up: `viper rip`, turning an NSF back into an editable `.vip`.
+**Ripping.** `viper rip song.nsf -o song.vip` reads music back out of a
+compiled NSF — or out of any `frame addr value` register dump another
+emulator produced, which is how game music gets in without emulating the
+game. It runs the file, folds the register traffic into per-frame channel
+state, recovers the row grid by simulating the driver's fixed-point row
+clock at candidate tempos, and writes notes, volumes, holds, phrases and an
+order list. Ripping the bundled stress song recovers its tempo, its 48 rows
+and its 3 phrases exactly.
+
+Instruments come back too, read off the envelopes the notes played rather
+than guessed: the stress song's lead is written `s=0.90 r=60 duty=0.25
+vol=0.70` and rips as `s=0.909 r=67 duty=0.250 vol=0.733`, from the register
+log alone.
+
+Effect columns come back too. Vibrato, portamento and arpeggio all recover
+their parameters exactly, and a portamento target is found even though
+sliding never retriggers the channel — the case a ripper that followed
+key-ons alone would lose outright.
+
+An NSF records none of this, so all of it is inferred, and the report says
+which numbers were read and which were guessed — including when two tempos
+fit the evidence equally well. DPCM sample data is not extracted yet, so a
+ripped drum track plays the built-in bank.
 
 ## Contributing
 

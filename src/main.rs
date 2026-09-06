@@ -9,6 +9,12 @@ mod dpcm;
 mod gen;
 mod import;
 mod midi;
+mod rip;
+
+/// The DPCM column's index, named so `rip` does not repeat a bare `4`.
+pub(crate) fn rip_dmc() -> usize {
+    4
+}
 mod modulation;
 mod sprite;
 mod style;
@@ -75,6 +81,55 @@ impl Default for Phrase {
     fn default() -> Self {
         Self { cells: [[Cell::default(); CHANNELS]; STEPS_PER_PHRASE] }
     }
+}
+
+/// Cut a flat run of rows into phrases, collapsing identical ones, and
+/// return the phrases with the order list that plays them back.
+///
+/// Both importers need this and neither owns it: a MIDI file and a register
+/// log arrive as one long strip of rows, and what makes them a *song* is
+/// noticing that bar 5 is bar 1 again. Keeping one copy means the two can
+/// never disagree about what "the same phrase" means.
+///
+/// A trailing partial phrase is padded with empty rows rather than dropped.
+pub(crate) fn phrases_from_rows(rows: &[[Cell; CHANNELS]]) -> anyhow::Result<(Vec<Phrase>, Vec<usize>)> {
+    let n = rows.len().div_ceil(STEPS_PER_PHRASE);
+    let mut phrases: Vec<Phrase> = Vec::new();
+    let mut order: Vec<usize> = Vec::new();
+    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    for p in 0..n {
+        let mut ph = Phrase::default();
+        for s in 0..STEPS_PER_PHRASE {
+            if let Some(r) = rows.get(p * STEPS_PER_PHRASE + s) {
+                ph.cells[s] = *r;
+            }
+        }
+        // An empty cell and a hold cell both have no note, so the key has to
+        // separate them or `===` rows would dedupe onto blank ones.
+        let key: Vec<u8> = ph
+            .cells
+            .iter()
+            .flatten()
+            .flat_map(|c| {
+                [
+                    c.note.unwrap_or(if c.hold { 0xFE } else { 0xFF }),
+                    c.instr,
+                    c.vol,
+                    c.fx.map(|f| f.0).unwrap_or(0),
+                    c.fx.map(|f| f.1).unwrap_or(0),
+                ]
+            })
+            .collect();
+        let idx = *index.entry(key).or_insert_with(|| {
+            phrases.push(ph.clone());
+            phrases.len() - 1
+        });
+        order.push(idx);
+    }
+    if phrases.len() > 256 {
+        anyhow::bail!("{} unique phrases; the .vip format holds 256", phrases.len());
+    }
+    Ok((phrases, order))
 }
 
 // ---------- Stage 27: the overlay layer ----------
@@ -5468,7 +5523,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "rip" | "--help" | "-h" | "help" => {
                 return cli::run(&args);
             }
             _ => {}

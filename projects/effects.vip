@@ -1,0 +1,37 @@
+# effects.vip
+#
+# A fixture for the effect columns. Nothing else in this repo uses one:
+# before this file, the only effect anywhere was a single `fx=V42` inside a
+# style, so the path from a `.vip` through the driver to the registers had
+# never been exercised by a song, in either direction.
+#
+# One note per effect, held across the rows it acts on, because vibrato,
+# portamento and arpeggio all modulate a *sounding* note. Turning the note
+# off between them — the obvious way to write this — produces a file where
+# the driver slides and arpeggiates silence, and nothing reaches the
+# registers at all.
+#
+# Load:  :e projects/effects.vip
+
+@song  bpm=150  edit_step=1  current=00
+
+@instr 00  a=0  d=0  s=1.00  r=0  duty=0.50  vol=1.00   # a plain gate
+
+@phrase 00
+  # step   PU1
+  00       C-4:00:0F:V42    # vibrato, depth 4 rate 2
+  01       ===
+  02       ===
+  03       ===
+  04       ===
+  05       ===
+  06       ===
+  07       ===
+  08       E-4:00:0F:S20    # portamento up to E-4 at 32 period units a frame
+  09       ===
+  0A       ===
+  0B       ===
+  0C       C-4:00:0F:A47    # arpeggio: root, major third, fifth
+  0D       ===
+  0E       ===
+  0F       ===

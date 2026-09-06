@@ -299,6 +299,166 @@ lives in viper.
   release ran, then ran again — and now reads `10 9 9 9 7 4 2 0`. No
   note, period or timing moved.
 
+### Transcription
+
+- **Stage 36a** ✅ — **The frame table.** `viper rip song.nsf` reads music
+  back out of a compiled NSF, or out of any `frame addr value` register dump
+  another emulator produced. This stage builds the layer everything else
+  will read: `viper_apu::trace` folds register traffic into per-frame,
+  per-channel state — period, audible level, duty, enable, key-on — so the
+  register semantics live in exactly one place. `--trace out.tsv` writes it
+  out, because a decode nobody can check by eye is not evidence.
+
+  Two things make it more than a `match` on the address.
+
+  **Volume is not the low nibble.** `$4000` bit 4 is the constant-volume
+  flag; when it is clear the nibble is the hardware envelope's divider and
+  the audible level is a decay counter the chip walks down itself. viper's
+  driver sets that bit on every write, so a nibble-reading ripper would pass
+  every test in this repo and produce nonsense on the first commercial NSF.
+  Running an NSF takes the level from `Apu::levels()`, which resolves it
+  exactly; a bare log simulates the envelope and length counters at their
+  real rates and says which frames were simulated.
+
+  **A key-on is not a note.** The length-reload registers are the closest
+  thing the chip has to a note-on, but a driver may key a channel whose
+  volume is zero — viper's does, on the empty last row of phrase 01, three
+  channels at once. Reading those as notes invents music that was never
+  audible, so the table records the key-on and the level separately and the
+  report counts what it suppressed.
+
+  Sweeps are recorded only when they would actually move the pitch. Drivers
+  routinely park the unit with `$08`, viper's included, and calling that an
+  unsupported feature would cry wolf on almost every NSF there is.
+
+  Verified against the golden log rather than only hand-written registers:
+  the table decodes back to the stress song's own first notes (E-5, the
+  harmonised C-5, E-2 on the triangle), and tracing the NSF and tracing its
+  log agree frame for frame — which is what makes the log path trustworthy
+  for material that can only ever arrive as a dump.
+
+- **Stage 36b** ✅ — **Notes, and a `.vip` you can open.** `viper rip
+  song.nsf -o song.vip` now writes a song. Ripping the bundled stress song
+  recovers **220 BPM, 48 rows and 3 phrases**, matching the source exactly,
+  and 224 of its 240 note cells.
+
+  **The grid is the hard part, and neither obvious method finds it.**
+  Scoring candidate row lengths by how nearly the onsets fall on multiples
+  of them always picks one frame per row: any divisor of the true row length
+  fits at least as well, and the ambiguity only ever runs that way, so the
+  rule is the *largest* row length that fits rather than the best-fitting
+  one. That still is not the driver's grid, because the row clock is an 8.8
+  fixed-point accumulator, not a line — at 220 BPM it runs 4, 4, 4 and then
+  a 5. So detection ends by simulating that accumulator at each nearby
+  integer tempo. Where the driver sits inside its own fractional cycle is
+  invisible from outside, so that phase is searched too.
+
+  **Ties are the normal case, not a corner.** A row length is usually a
+  whole number of frames, so every tempo that rounds to it explains the same
+  onsets exactly: sixteen rows six frames apart are equally good evidence
+  for 149, 150 and 151 BPM. The middle of the tied range is taken, which is
+  both the best estimate and — not coincidentally — the round number a
+  composer typed, and the report names the range instead of sounding
+  certain.
+
+  **Three things had to be got right or the transcription drifts.**
+  Onsets are assigned to the *nearest* row rather than the row whose frame
+  window contains them, because a reconstructed grid can sit a frame from
+  the real one and a window rule then transcribes the same bar two ways on
+  two passes. A note is held only if it is still audible in the *next* row,
+  since an instrument's release sounds for several frames after the row that
+  ended it and "still making noise" would turn every note-off into a
+  sustain. And the volume column is inverted rather than copied: `Event::Vol`
+  scales the instrument envelope through a fixed-point multiply, so a
+  recompiled rip plays `(vol * 15) >> 4` and a song ripped five times over
+  fades away one step at a time.
+
+  Placeholder instruments are a flat gate — no attack, decay or release — so
+  note lengths come from the cells and nowhere else. viper's usual default
+  has a 120 ms release, and lending that to a ripped song makes every note
+  ring past the row that ended it.
+
+  **What the 16 remaining cells are.** Eight are noise:
+  `compile::noise_period_index` folds four semitones onto each index, so a
+  ripped noise note can only land somewhere in the right bucket. The other
+  eight are triangle rows where the source writes a note-off and the
+  register log shows the triangle still sounding into the next row — the rip
+  describes the chip, so a hold is the truthful transcription of what
+  happened. All six songs in `projects/` rip and recompile; five recover
+  their source tempo exactly and the sixth is one BPM out and says so.
+
+- **Stage 36c** ✅ — **Instruments, read rather than fitted.** A rip now
+  recovers the `@instr` table from the envelopes its notes played. Against
+  the stress song, whose lead is `a=0 d=20 s=0.90 r=60 duty=0.25 vol=0.70`,
+  it produces `a=0 d=17 s=0.909 r=67 duty=0.250 vol=0.733` — having seen
+  nothing but the register log.
+
+  **The inversion is a construction, not a search.** `Envelope::from_adsr`
+  lays a note out as an attack ramp, a decay to a sustain level, a looping
+  held frame and a release to zero, so those parts can be read straight back
+  off the shape — but only once the shape is in envelope units. The driver
+  plays `(vol * env) >> 4`, and undoing that first is what makes the
+  reconstruction exact: `10 9 9 9 7 4 2 0` at full column volume is the
+  envelope `11 10 10 10 8 5 3 0`, which is `a=0 d=1 s=10/11 r=4` and nothing
+  else.
+
+  **Grouping is on the normalised shape**, so one voice played loud and
+  quiet stays one instrument and the loudness goes to the volume column
+  where it belongs. Two details earn their keep. The key is a fixed three
+  frames, because in fast music most notes are cut off by the next key-on
+  and a key that grew with the note would file the same voice under a
+  different instrument depending on how long it happened to sound. And it is
+  quantised to eight buckets, because a quiet note carries less of its own
+  curve than a loud one — 9 of 10 and 4 of 5 are the same envelope and do
+  not look it at full resolution. Each group's ADSR is read from its longest
+  member, since a note cut short never reveals its release.
+
+  **DPCM** notes recover their sample slots: a kick and a snare come back as
+  the same two notes the source wrote. The sample *data* is not extracted
+  yet, so a recompiled rip plays the default bank, and the report says so.
+
+  A rip is now a fixed point after one round trip. The first pass can move,
+  because a recovered release of 67 ms is not the 60 ms the original used
+  and a few notes ring a row further; after that, recompiling and ripping
+  again changes nothing at all.
+
+- **Stage 36d** ✅ — **The effect columns.** Vibrato, portamento and
+  arpeggio come back with their parameters intact. `projects/effects.vip`
+  writes `V42`, `S20` and `A47`; compiled, ripped and compared, all three
+  return exactly.
+
+  **Every parameter survives, because each effect leaves its own number in
+  the register stream.** Measured against the reference driver: vibrato
+  spans `depth - 1` period units peak to peak and repeats every `32 / rate`
+  frames, portamento moves `speed` units on its first frame, and an
+  arpeggio's offsets are simply the notes it visits. None of this is fitted.
+
+  **Portamento is the case that would otherwise lose music outright.** It
+  moves a channel to a new pitch without retriggering it, so there is no
+  key-on to notice, and a ripper that followed key-ons alone would hold the
+  old note through a passage that audibly climbs. A pitch that changes with
+  no key-on is that, and the row it lands on is where the target note goes.
+
+  Three constraints stop the detector inventing effects. The window for
+  reading a note's motion closes once the pitch has moved elsewhere and
+  stayed for two frames, so a note that is later slid away from is still a
+  plain note where it starts — two frames rather than one, because an
+  arpeggio visits its other pitches for exactly one frame each. Pitches
+  visited only once are dropped before counting, since a period is written a
+  byte at a time and a frame sampled mid-write names a note that never
+  sounded. And an arpeggio must step every frame: the stress song's triangle
+  rocks between E-2 and E-3 once a row, and without that rule its bassline
+  rewrites itself as one droning chord.
+
+  Effects persist on a channel until changed, so a plain note after a
+  modulated one is given the off form, and an effect already running is not
+  rewritten on every row it covers.
+
+  `projects/effects.vip` is new, and holds its notes across the rows the
+  effects act on. Writing it the obvious way, with a note-off between each,
+  produces a file where the driver slides and arpeggiates silence and
+  nothing reaches the registers at all.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first

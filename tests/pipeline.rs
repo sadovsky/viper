@@ -256,3 +256,278 @@ fn custom_dpcm_bank_round_trip() {
     assert!(log.lines().any(|l| l.contains(" 4015 1F")), "DPCM start expected in the log");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The frame table, against the real golden log rather than hand-written
+/// registers. This is the decode every rip depends on, so it is worth
+/// pinning to music whose source is checked in beside it: every number
+/// below is derived from `projects/stress_melodeath.vip`.
+#[test]
+fn the_frame_table_decodes_the_golden_log_back_into_the_stress_song() {
+    let text = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
+    let log = viper_apu::verify::parse_log(&text);
+    let t = viper_apu::trace(&log);
+    assert_eq!(t.len(), 257, "one entry per frame in the log");
+
+    use viper_apu::trace::{NOI, PU1, PU2, TRI};
+    let keys = |c: usize| t.iter().filter(|f| f.ch[c].keyed).count();
+    let audible = |c: usize| t.iter().filter(|f| f.ch[c].keyed && f.ch[c].level > 0).count();
+    assert_eq!([keys(PU1), keys(PU2), keys(TRI), keys(NOI)], [52, 52, 48, 49]);
+
+    // Frame 127 is the last row of phrase 01, which is empty. The driver
+    // keys three channels there anyway, with every volume at zero. Reading
+    // key-ons as notes would invent three notes that were never audible —
+    // so the level, not the key-on, is what makes a note.
+    assert_eq!([audible(PU1), audible(PU2), audible(TRI)], [51, 51, 47]);
+    for c in [PU1, PU2, TRI] {
+        assert!(t[127].ch[c].keyed && t[127].ch[c].level == 0, "silent key-on at frame 127");
+    }
+
+    // Pitch: the source's first note on each pitched channel. Periods
+    // invert as f = CPU / (16(p+1)) for the pulses and 32(p+1) for the
+    // triangle, giving E-5, C-5 (the harmonised third) and E-2.
+    let note = |p: u16, div: f64| {
+        let f = 1_789_773.0 / (div * (p as f64 + 1.0));
+        (69.0 + 12.0 * (f / 440.0).log2()).round() as i32
+    };
+    assert_eq!(note(t[1].ch[PU1].period, 16.0), 76, "E-5");
+    assert_eq!(note(t[1].ch[PU2].period, 16.0), 72, "C-5");
+    assert_eq!(note(t[1].ch[TRI].period, 32.0), 40, "E-2");
+
+    // Volume: the driver's envelope after the held-note fix is a clean
+    // attack, sustain and single release. The doubled release the old
+    // driver produced (10 9 7 4 7 4 2 0) is what made note ends unreadable.
+    let pu1: Vec<u8> = (66..82).map(|f| t[f].ch[PU1].level).collect();
+    assert_eq!(pu1, vec![10, 9, 9, 9, 7, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    // Noise keeps its $400E index, which is already a tracker's value.
+    assert_eq!(t[1].ch[NOI].period, 14);
+    // The driver parks both sweep units at INIT with the usual $08, which
+    // moves no pitch and so is not reported as an unsupported feature.
+    assert!(text.lines().any(|l| l.ends_with(" 4001 08")), "the driver does write $4001");
+    assert!(t.iter().all(|f| f.ch.iter().all(|c| c.sweep == 0)));
+}
+
+/// The two ways into the frame table must agree.
+///
+/// Running the NSF takes each level from the chip, which resolves hardware
+/// envelopes and sweep muting exactly. Reading a register log simulates them
+/// instead, because a log is all there is. Where a song uses neither — as
+/// almost every driver-produced song does — the two must land on the same
+/// answer, and that is what makes the log path trustworthy for material
+/// that can only ever arrive as a dump.
+#[test]
+fn tracing_the_nsf_and_tracing_its_log_agree() {
+    let tmp = std::env::temp_dir().join(format!("viper_trace_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/stress_melodeath.vip");
+    let nsf_path = tmp.join("stress.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf_path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let text = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
+    let from_log = viper_apu::trace(&viper_apu::verify::parse_log(&text));
+
+    let nsf = viper_apu::Nsf::parse(&std::fs::read(&nsf_path).unwrap()).unwrap();
+    let (from_nsf, looped) = viper_apu::trace::trace_nsf(&nsf, 0, Some(from_log.len() as u32 - 1)).unwrap();
+    assert_eq!(looped.map(|(_, len)| len), Some(196), "the loop period is exact even when its start is not");
+
+    assert_eq!(from_nsf.len(), from_log.len());
+    for (a, b) in from_nsf.iter().zip(&from_log) {
+        assert_eq!(a, b, "frame {} differs between the NSF and its log", a.frame);
+    }
+
+    // And the CLI reaches the same place, including through the log.
+    for src in [nsf_path.as_path(), &root().join("tests/golden/stress_melodeath.log")] {
+        let out = viper().args(["rip"]).arg(src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("key-ons"), "{}", s);
+        assert!(s.contains("suppressed (no volume at onset)"), "the silent key-ons must be reported: {}", s);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The rip, end to end, against a song whose source is checked in beside it.
+///
+/// Every number here was measured, and the two kinds of difference that
+/// remain are both understood — which is the point. A transcriber that
+/// scores well without anyone knowing why is not evidence of anything.
+#[test]
+fn ripping_the_stress_song_recovers_its_notes_and_structure() {
+    let tmp = std::env::temp_dir().join(format!("viper_rip_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/stress_melodeath.vip");
+    let nsf = tmp.join("stress.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let ripped = tmp.join("ripped.vip");
+    let out = viper().args(["rip"]).arg(&nsf).arg("-o").arg(&ripped).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+
+    // The tempo is not read from the file — an NSF does not record one. It is
+    // recovered by simulating the driver's fixed-point row clock at candidate
+    // integer tempos, and "exact" means every onset landed on a row start.
+    assert!(report.contains("220 BPM"), "{}", report);
+    assert!(report.contains("INFERRED, exact"), "{}", report);
+    assert!(report.contains("rows     48 → 3 phrases (3 unique)"), "{}", report);
+    // The driver keys three channels on an empty row with no volume; those
+    // are not notes and must not be transcribed as any.
+    assert!(report.contains("3 key-ons suppressed"), "{}", report);
+
+    let src = std::fs::read_to_string(&vip).unwrap();
+    let got = std::fs::read_to_string(&ripped).unwrap();
+    let (a, b) = (note_grid(&src), note_grid(&got));
+    assert_eq!(a.len(), 48, "the source is three phrases");
+    assert_eq!(b.len(), a.len(), "and so is the rip");
+
+    let mut wrong: Vec<(usize, usize, String, String)> = Vec::new();
+    for r in 0..a.len() {
+        for c in 0..5 {
+            if a[r][c] != b[r][c] {
+                wrong.push((r, c, a[r][c].clone(), b[r][c].clone()));
+            }
+        }
+    }
+    // Both kinds of remaining difference are understood, so name them rather
+    // than accepting a percentage on trust.
+    for (r, c, want, got) in &wrong {
+        let noise_bucket = *c == 3 && want == "C-3" && got == "D#3";
+        // `compile::noise_period_index` folds four semitones onto each index,
+        // so a ripped noise note can only ever be somewhere in the right
+        // bucket. This one is irreducible, not a bug to be fixed later.
+        let triangle_rang_on = *c == 2 && want == "---" && got == "===";
+        // The source writes a note-off here, but the register log shows the
+        // triangle still sounding into the next row: the driver's release
+        // outlives the row that ended it. The rip describes the chip, so
+        // `===` is the truthful transcription of what actually happened.
+        assert!(noise_bucket || triangle_rang_on, "unexplained difference at row {} channel {}: {} → {}", r, c, want, got);
+    }
+    assert!(wrong.len() <= 16, "{} cells differ, expected at most 16", wrong.len());
+
+    // Instruments are recovered from the envelopes the notes played, not
+    // guessed. The source's lead is `a=0 d=20 s=0.90 r=60 duty=0.25
+    // vol=0.70`, and the rip has to land near it without ever having seen
+    // the file — the only evidence is that its notes played 10 9 9 9 7 4 2 0.
+    assert!(report.contains("instr    4 synthesised"), "one instrument per voice: {}", report);
+    let lead = got.lines().find(|l| l.starts_with("@instr 00")).expect("a lead instrument");
+    for (field, want, tol) in [("s=", 0.90f32, 0.05f32), ("duty=", 0.25, 0.001), ("vol=", 0.70, 0.05)] {
+        let v: f32 = lead.split(field).nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!((v - want).abs() <= tol, "instr 00 {}{} should be near {}", field, v, want);
+    }
+    // The release is only visible on notes long enough to show one, and most
+    // of this song's are cut off by the next key-on. Finding it at all means
+    // the longest note in each group is what was read.
+    let r: u16 = lead.split("r=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    assert!((50..=80).contains(&r), "release {} ms should be near the source's 60", r);
+
+    // A rip must settle. Recompiling one and ripping it again may move once,
+    // because the placeholder instruments are a flat gate rather than the
+    // envelopes the original used — that is Stage 36c's job. After that it
+    // must not drift at all, or the tool cannot be used iteratively.
+    let mut prev = std::fs::read_to_string(&ripped).unwrap();
+    let mut settled = None;
+    for i in 0..4 {
+        let n = tmp.join(format!("r{}.nsf", i));
+        let v = tmp.join(format!("r{}.vip", i));
+        let out = viper().args(["compile"]).arg(tmp.join(if i == 0 { "ripped.vip".into() } else { format!("r{}.vip", i - 1) })).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&n).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = viper().args(["rip"]).arg(&n).arg("-o").arg(&v).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let now = std::fs::read_to_string(&v).unwrap();
+        if rows_of(&now) == rows_of(&prev) && settled.is_none() {
+            settled = Some(i);
+        }
+        prev = now;
+    }
+    assert!(matches!(settled, Some(i) if i <= 1), "a rip must reach a fixed point, settled at {:?}", settled);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The note name in every cell of every phrase, in order.
+///
+/// Rows are placed by their step number, not by the order they appear: a
+/// `.vip` omits rows that are entirely empty, so counting lines would silently
+/// shorten a sparse phrase and misalign everything after it.
+fn note_grid(vip: &str) -> Vec<[String; 5]> {
+    let blank = || std::array::from_fn(|_| "---".to_string());
+    let mut out: Vec<[String; 5]> = Vec::new();
+    let mut base = 0usize;
+    let mut in_phrase = false;
+    for line in vip.lines() {
+        if line.starts_with("@phrase") {
+            base = out.len();
+            out.resize_with(base + 16, blank);
+            in_phrase = true;
+            continue;
+        }
+        if line.starts_with('@') {
+            in_phrase = false;
+        }
+        let t = line.trim_start();
+        if !in_phrase || t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        let mut f = t.split_whitespace();
+        let Some(step) = f.next() else { continue };
+        let Ok(step) = usize::from_str_radix(step, 16) else { continue };
+        if step >= 16 {
+            continue;
+        }
+        for (i, c) in f.take(5).enumerate() {
+            out[base + step][i] = c.split(':').next().unwrap_or("---").to_string();
+        }
+    }
+    out
+}
+
+/// Just the pattern rows of a `.vip`, for comparing two of them.
+fn rows_of(vip: &str) -> Vec<String> {
+    vip.lines().filter(|l| l.starts_with("  ") && l.trim_start().len() > 2).map(|l| l.trim_end().to_string()).collect()
+}
+
+/// Effects, against a fixture written for the purpose.
+///
+/// Nothing else in the repo uses an effect column, so before this test the
+/// path from a `.vip` through the driver to the registers had never been
+/// exercised by a song in either direction.
+#[test]
+fn ripping_recovers_vibrato_portamento_and_arpeggio() {
+    let tmp = std::env::temp_dir().join(format!("viper_fx_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/effects.vip");
+    let nsf = tmp.join("fx.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let ripped = tmp.join("fx.vip");
+    // The tempo is supplied here. Sixteen rows with four notes in them are
+    // not enough evidence to pin one, and this test is about the effects.
+    let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", "150"]).arg("-o").arg(&ripped).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let got = std::fs::read_to_string(&ripped).unwrap();
+    let cell = |step: &str| -> String {
+        got.lines()
+            .find(|l| l.trim_start().starts_with(step) && l.contains(':'))
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    // Every parameter comes back exactly, because each effect leaves its own
+    // number in the register stream in a recoverable form. Vibrato spans
+    // `depth - 1` period units peak to peak and repeats every `32 / rate`
+    // frames; portamento moves `speed` units on its first frame; and an
+    // arpeggio's offsets are simply the notes it visits.
+    assert_eq!(cell("00"), "C-4:00:0F:V42", "vibrato, depth and rate");
+    assert_eq!(cell("08"), "E-4:00:0F:S20", "portamento, and the note it slid to");
+    assert_eq!(cell("0C"), "C-4:00:0F:A47", "arpeggio, on its root rather than whichever pitch a row ended on");
+
+    // The slide is the case that would otherwise lose music outright:
+    // portamento does not retrigger, so there is no key-on to notice, and a
+    // ripper that only followed key-ons would hold C-4 through a passage
+    // that audibly climbs to E-4.
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("notes    PU1 4"), "four notes, two of them found without a key-on: {}", report);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
