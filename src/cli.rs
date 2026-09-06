@@ -48,9 +48,11 @@ usage:
       (NSFPlay, Mesen, FCEUX Lua — any `frame addr value` shape); exits 1
       on the first PLAY frame that differs. -o writes the other log in
       viper's canonical form.
-  viper rip song.nsf|writes.log [--song N] [--frames N] [--trace out.tsv]
+  viper rip song.nsf|writes.log [-o out.vip] [--bpm B] [--song N]
+                                [--frames N] [--trace out.tsv]
       read music back out of a compiled NSF, or out of any `frame addr
-      value` register dump another emulator produced
+      value` register dump another emulator produced; without -o it only
+      reports what it found. --bpm skips tempo detection.
   viper gen --style DIR [--seed N] [--count N] [-o DIR|FILE] [--key E] [--bpm 200]
             [--scale NAME] [--motif on|off] [--form N] [--driver BIN --sym SYM]
             [--artist NAME] [--prefix NAME]
@@ -101,6 +103,13 @@ pub fn run(args: &[String]) -> Result<()> {
     let cmd = args[0].as_str();
     let a = Args::parse(&args[1..]);
     match cmd {
+        // Anything the dispatcher does not know is treated as a filename to
+        // open in the tracker, so a missing arm here is not an error message
+        // but an editor full of a file called `--version`.
+        "--version" | "-V" | "version" => {
+            println!("viper {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "check" => check(&a),
         "dpcm" => dpcm_cmd(&a),
         "import" => import_cmd(&a),
@@ -613,7 +622,16 @@ fn rip(a: &Args) -> Result<()> {
         println!("trace → {}", out);
     }
 
-    let opts = crate::rip::RipOptions { bpm: a.num::<u16>("bpm")? };
+    // A tempo out of range produces a .vip that parses and then refuses to
+    // compile — `frames per row exceeds 255` — long after the rip reported
+    // success. Detection cannot reach these values; only a user can.
+    let bpm = a.num::<u16>("bpm")?;
+    if let Some(b) = bpm {
+        if !(4..=900).contains(&b) {
+            bail!("--bpm {} is out of range; a row must last between 1 and 255 frames, so 4..=900", b);
+        }
+    }
+    let opts = crate::rip::RipOptions { bpm };
     let (mut song, mut report, _grid) = crate::rip::rip(&trace, &opts)?;
     report.source = source;
     report.loop_frames = loop_frames;
@@ -645,4 +663,71 @@ fn provenance(r: &crate::rip::Report, src: &Path) -> String {
         r.bpm,
         r.fit.unwrap_or(crate::rip::Fit::Told),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_flag_whose_value_looks_like_a_flag_is_silently_dropped() {
+        // `viper rip x.nsf --frames --song 0` runs the whole song rather
+        // than one frame, and says nothing. Pinned because it is surprising,
+        // not because it is right: whoever changes this should have to come
+        // here and delete a test that explains what the old behaviour was.
+        let a = parse(&["x.nsf", "--frames", "--song", "0"]);
+        assert_eq!(a.get("frames"), None, "--frames swallowed nothing and vanished");
+        assert_eq!(a.get("song"), Some("0"));
+        assert_eq!(a.positional, vec!["x.nsf"]);
+    }
+
+    #[test]
+    fn an_unlisted_boolean_flag_swallows_the_next_argument() {
+        // `takes_value` is a hardcoded exception list. A flag on it behaves;
+        // one that is not eats whatever follows, including the input file.
+        // This is the test that fails the day someone adds a boolean flag
+        // and forgets to add it to the list.
+        let listed = parse(&["--stems-only", "a.nsf"]);
+        assert_eq!(listed.positional, vec!["a.nsf"], "a listed flag leaves the file alone");
+
+        let unlisted = parse(&["--stems", "a.nsf"]);
+        assert_eq!(unlisted.get("stems"), Some("a.nsf"), "and an unlisted one eats it");
+        assert!(unlisted.positional.is_empty());
+    }
+
+    #[test]
+    fn a_negative_number_is_a_value_not_a_flag() {
+        // `viper dpcm encode --trim -60` has to work; only `--` starts a
+        // flag, so a leading minus is fine.
+        assert_eq!(parse(&["--trim", "-60"]).get("trim"), Some("-60"));
+    }
+
+    #[test]
+    fn a_trailing_output_flag_yields_no_path_rather_than_an_error() {
+        let a = parse(&["compile", "song.vip", "-o"]);
+        assert_eq!(a.get("out"), None, "the output path is quietly absent");
+        assert_eq!(a.positional, vec!["compile", "song.vip"]);
+        // And `-o` takes whatever follows, flag-looking or not.
+        assert_eq!(parse(&["-o", "--stems"]).get("out"), Some("--stems"));
+    }
+
+    #[test]
+    fn a_repeated_flag_keeps_the_last_one() {
+        // `.rev().find()` — an undocumented contract that scripts building
+        // command lines by appending depend on.
+        assert_eq!(parse(&["--song", "1", "--song", "2"]).get("song"), Some("2"));
+    }
+
+    #[test]
+    fn a_numeric_flag_says_which_flag_was_wrong() {
+        let a = parse(&["--song", "x"]);
+        let err = a.num::<u32>("song").unwrap_err().to_string();
+        assert!(err.contains("--song") && err.contains("number"), "{}", err);
+        // Absent is not an error; it is a default the caller chooses.
+        assert!(a.num::<u32>("frames").unwrap().is_none());
+    }
 }

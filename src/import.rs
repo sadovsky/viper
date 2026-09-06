@@ -631,7 +631,9 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
                 if busy { continue; }
                 report.filled_rows += 1;
             }
-            let fx = tm.vibrato.filter(|&v| n.len_rows >= tm.vibrato_min_rows);
+            // The predicate ignores the vibrato itself: a note shorter than the
+            // threshold gets no vibrato whatever depth was configured.
+            let fx = tm.vibrato.filter(|_| n.len_rows >= tm.vibrato_min_rows);
             let vol = tm.velocity.unwrap_or(map.velocity).vol(n.vel);
             report.note_volume(vol);
             grid[*r][*ch] = Cell { note: Some(n.key), instr: tm.instr, vol, fx, hold: false };

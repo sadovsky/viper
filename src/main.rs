@@ -5523,7 +5523,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
         match first.as_str() {
-            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "rip" | "--help" | "-h" | "help" => {
+            "check" | "compile" | "render" | "info" | "verify" | "fmt" | "gen" | "dpcm" | "import" | "rip" | "--help" | "-h" | "help" | "--version" | "-V" | "version" => {
                 return cli::run(&args);
             }
             _ => {}

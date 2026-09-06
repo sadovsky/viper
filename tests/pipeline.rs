@@ -580,3 +580,38 @@ fn ripping_recovers_vibrato_portamento_and_arpeggio() {
     assert!(report.contains("notes    PU1 4"), "four notes, two of them found without a key-on: {}", report);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The subcommand dispatcher, and two ways it used to go wrong quietly.
+#[test]
+fn the_command_line_refuses_what_it_cannot_do() {
+    // Anything the dispatcher does not recognise is treated as a filename to
+    // open in the tracker, so `viper --version` used to launch the editor on
+    // a file called `--version` rather than print anything.
+    for flag in ["--version", "-V", "version"] {
+        let out = viper().arg(flag).output().unwrap();
+        assert!(out.status.success(), "{} failed", flag);
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.starts_with("viper "), "{} printed {:?}", flag, s);
+        assert!(s.trim().len() > "viper ".len(), "and an actual version");
+    }
+
+    let tmp = std::env::temp_dir().join(format!("viper_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let nsf = tmp.join("s.nsf");
+    let out = viper().args(["compile"]).arg(root().join("projects/stress_melodeath.vip")).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // A tempo outside the driver's row clock used to be accepted, reported
+    // as a success, and written to a .vip that then refused to compile —
+    // the failure landing one command later than the mistake.
+    for bad in ["0", "1", "5000"] {
+        let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", bad]).arg("-o").arg(tmp.join("bad.vip")).output().unwrap();
+        assert!(!out.status.success(), "--bpm {} should be refused", bad);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("out of range"), "--bpm {}", bad);
+    }
+    // The tempo the report itself suggests is of course still accepted.
+    let out = viper().args(["rip"]).arg(&nsf).args(["--bpm", "220"]).arg("-o").arg(tmp.join("ok.vip")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("TOLD"), "a supplied tempo is not an inference");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
