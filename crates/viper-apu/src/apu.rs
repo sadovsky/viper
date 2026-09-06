@@ -568,6 +568,309 @@ pub fn decode_dmc(data: &[u8], rate_idx: u8, start_level: u8) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// An APU with every channel enabled, as a driver leaves it after INIT.
+    fn apu() -> Apu {
+        let mut a = Apu::new();
+        a.write(0x4015, 0x0F);
+        a
+    }
+
+    /// Run `n` CPU cycles with no DPCM data behind the bus.
+    fn run(a: &mut Apu, n: u32) {
+        for _ in 0..n {
+            a.clock(|_| 0);
+        }
+    }
+
+    #[test]
+    fn the_mixer_reaches_full_scale_without_clipping() {
+        let a = Apu::new();
+        // Both published constants conspire so that everything at maximum —
+        // two pulses at 15, triangle 15, noise 15, DMC 127 — lands one part
+        // in fifty thousand *below* unity. That is why the host never clips,
+        // and it is a coincidence of 95.52 and 163.67 that no refactor of
+        // these tables is allowed to break.
+        // Pinned tightly, because these are published hardware figures
+        // rather than tuning knobs: 95.52 and 163.67 come from the chip, and
+        // a plausible-looking 95.5 would shift every render by a hair that
+        // no ear and no loose tolerance would catch.
+        assert!((a.pulse_table[30] - 0.257_512_6).abs() < 1e-6, "{}", a.pulse_table[30]);
+        assert!((a.tnd_table[202] - 0.742_467_6).abs() < 1e-6, "{}", a.tnd_table[202]);
+        let full = a.pulse_table[30] + a.tnd_table[202];
+        assert!((full - 0.999_980).abs() < 1e-5, "full scale is {}", full);
+        assert_eq!(a.pulse_table[0], 0.0);
+        assert_eq!(a.tnd_table[0], 0.0);
+        assert!(a.pulse_table.iter().chain(a.tnd_table.iter()).all(|v| v.is_finite()));
+        assert!(a.pulse_table.windows(2).all(|w| w[1] > w[0]), "monotone");
+    }
+
+    #[test]
+    fn the_mixer_is_not_linear() {
+        // Two pulses at volume 15 are quieter than twice one of them. This
+        // is the whole reason for the lookup tables — a linear sum would be
+        // both wrong and louder — so assert the inequality rather than the
+        // formula, which would just restate the source.
+        let a = Apu::new();
+        assert!(a.pulse_table[30] < 2.0 * a.pulse_table[15]);
+    }
+
+    #[test]
+    fn the_noise_lfsr_has_the_periods_the_hardware_does() {
+        // 32767 in long mode, 93 in short: the published figures, and the
+        // reason a snare sounds like a snare rather than a buzz. A
+        // one-character slip here — `>> 6` for `>> 7`, `<< 14` for `<< 15` —
+        // changes the timbre of every drum in every song and is completely
+        // invisible to the golden register log, which only records the
+        // $400E write that chose the mode.
+        for (mode, want) in [(false, 32767u32), (true, 93)] {
+            let mut n = Noise { mode, timer: 0, ..Noise::default() };
+            let start = n.shift;
+            let mut steps = 0u32;
+            loop {
+                n.clock_timer();
+                steps += 1;
+                assert_ne!(n.shift, 0, "the register must never reach zero, or it locks up");
+                if n.shift == start {
+                    break;
+                }
+                assert!(steps <= 40000, "no cycle found in {} mode", if mode { "short" } else { "long" });
+            }
+            assert_eq!(steps, want, "{} mode", if mode { "short" } else { "long" });
+        }
+    }
+
+    #[test]
+    fn a_length_counter_expires_on_the_frame_sequencers_tenth_half_clock() {
+        // Length index 0 loads 10. In 4-step mode the half-frame clocks fall
+        // at CPU cycles 14913 and 29829 of each 29830-cycle period, so the
+        // tenth lands at 149,149 — and that one number pins the length
+        // table, both sequencer positions and the period reset together.
+        let mut a = apu();
+        a.write(0x4000, 0x10); // constant volume, halt clear so the counter runs
+        a.write(0x4003, 0x00); // length index 0 -> 10
+        run(&mut a, 149_148);
+        assert_eq!(a.read_status() & 1, 1, "still sounding one cycle before");
+        run(&mut a, 1);
+        assert_eq!(a.read_status() & 1, 0, "expired at 149,149");
+    }
+
+    #[test]
+    fn a_pulse_is_muted_by_its_sweep_target_even_when_the_sweep_is_disabled() {
+        // The rule people get wrong: `muted()` is consulted by `output()`
+        // unconditionally, so a period whose sweep *target* overflows 11 bits
+        // silences the channel whether or not the sweep unit is running.
+        let mut a = apu();
+        a.write(0x4000, 0x1F); // constant volume 15
+        a.write(0x4001, 0x01); // sweep DISABLED (bit 7 clear), shift 1
+        a.write(0x4002, 0x00);
+        a.write(0x4003, 0x0E); // timer 0x600, length index 1
+        assert_eq!(a.pu1.timer, 0x600);
+        assert!(a.pu1.target_period() > 0x7FF, "target is {}", a.pu1.target_period());
+        assert!(a.pu1.muted());
+        assert_eq!(a.pu1.output(), 0, "silent despite the sweep being off");
+        // And the other half of the rule: a period below 8 mutes too.
+        a.write(0x4002, 0x07);
+        a.write(0x4003, 0x08);
+        assert!(a.pu1.muted());
+    }
+
+    #[test]
+    fn the_two_pulses_negate_differently() {
+        // Pulse 1 subtracts an extra one where pulse 2 does not — ones'
+        // complement against two's. It is a real hardware asymmetry, it is
+        // why the two channels drift apart under a downward sweep, and it is
+        // exactly the kind of off-by-one a rewrite would tidy away.
+        let mut a = apu();
+        for base in [0x4000u16, 0x4004] {
+            a.write(base, 0x1F); // constant volume 15
+            a.write(base + 1, 0x89); // sweep on, period 0, negate, shift 1
+            a.write(base + 2, 0x00);
+            a.write(base + 3, 0x0A); // timer 0x200, length index 1
+        }
+        assert_eq!(a.pu1.target_period(), 0xFF, "0x200 - 0x100 - 1");
+        assert_eq!(a.pu2.target_period(), 0x100, "0x200 - 0x100");
+        a.clock_half();
+        assert_eq!(a.pu2.timer - a.pu1.timer, 1, "the swept periods stay one apart");
+    }
+
+    #[test]
+    fn a_sweep_never_writes_back_a_negative_period() {
+        // `clock_sweep` guards its write-back with `t >= 0`. That guard is
+        // unreachable in practice and it is worth knowing why rather than
+        // deleting it: a negative target needs a shift of 0, but a shift of
+        // 0 also fails the `sweep_shift > 0` condition on the same line, and
+        // every period small enough to go negative at a larger shift is
+        // already muted by the `timer < 8` rule.
+        let mut a = apu();
+        a.write(0x4000, 0x1F);
+        a.write(0x4001, 0x88); // negate, shift 0 -> target is -1
+        a.write(0x4002, 0x00);
+        a.write(0x4003, 0x0A);
+        assert_eq!(a.pu1.target_period(), -1);
+        let before = a.pu1.timer;
+        a.clock_half();
+        assert_eq!(a.pu1.timer, before, "shift 0 disables the sweep entirely");
+    }
+
+    #[test]
+    fn a_pulse_waveform_repeats_every_sixteen_cycles_per_period_unit() {
+        // The timer clocks on alternate CPU cycles and advances an 8-step
+        // sequence every `timer + 1` of those, so one whole waveform is
+        // exactly 16 * (timer + 1) CPU cycles. Exact, no floats: after that
+        // many clocks both the sequence position and the divider are back
+        // where they started.
+        for timer in [8u16, 100, 253] {
+            let mut a = apu();
+            a.write(0x4000, 0xBF); // duty 2, halt, constant volume 15
+            a.write(0x4002, (timer & 0xFF) as u8);
+            a.write(0x4003, 0x08 | ((timer >> 8) as u8));
+            let (seq0, counter0) = (a.pu1.seq, a.pu1.counter);
+            let period = 16 * (timer as u32 + 1);
+            let mut high = 0u32;
+            for _ in 0..period {
+                if a.pu1.output() > 0 {
+                    high += 1;
+                }
+                a.clock(|_| 0);
+            }
+            assert_eq!((a.pu1.seq, a.pu1.counter), (seq0, counter0), "timer {}", timer);
+            // Duty 2 is high for four of eight steps.
+            assert_eq!(high, period / 2, "duty 2 is a square wave at timer {}", timer);
+        }
+    }
+
+    #[test]
+    fn duty_three_is_the_inverted_quarter_not_a_three_quarter_wave() {
+        // The row of the duty table that gets transcribed wrong: 10011111 is
+        // 25% duty inverted, so it reads as six steps of eight high.
+        assert_eq!(DUTY[3].iter().filter(|&&v| v == 1).count(), 6);
+        assert_eq!(DUTY[2].iter().filter(|&&v| v == 1).count(), 4);
+        assert_eq!(DUTY[1].iter().filter(|&&v| v == 1).count(), 2);
+        assert_eq!(DUTY[0].iter().filter(|&&v| v == 1).count(), 1);
+    }
+
+    #[test]
+    fn the_triangle_is_gated_by_its_linear_counter() {
+        // Quarter-frame clocks decrement the linear counter; when it reaches
+        // zero the sequence freezes, which is how a driver silences the
+        // triangle without a volume it does not have.
+        let mut a = apu();
+        a.write(0x4008, 0x01); // control clear, linear reload 1
+        a.write(0x400A, 0x40);
+        a.write(0x400B, 0x08);
+        a.clock_quarter(); // reload_flag was set by $400B: linear = 1
+        assert_eq!(a.tri.linear, 1);
+        a.clock_quarter(); // no reload now, so it counts down
+        assert_eq!(a.tri.linear, 0);
+        let seq = a.tri.seq;
+        run(&mut a, 500);
+        assert_eq!(a.tri.seq, seq, "a zero linear counter freezes the sequence");
+    }
+
+    #[test]
+    fn an_ultrasonic_triangle_holds_still_instead_of_popping() {
+        // Below period 2 the real chip runs faster than it can be sampled;
+        // viper returns the averaged mid-level rather than let the sequence
+        // alias into a click. Deliberate, documented, and untested until now.
+        let mut t = Triangle { timer: 0, ..Default::default() };
+        assert_eq!(t.output(), 7);
+        t.timer = 1;
+        assert_eq!(t.output(), 7);
+        t.timer = 2;
+        t.seq = 0;
+        assert_eq!(t.output(), 15, "at period 2 the sequence is live again");
+    }
+
+    #[test]
+    fn dmc_fetches_walk_the_sample_and_wrap_from_ffff_to_8000() {
+        // $4012 is the sample address in 64-byte units above $C000 and $4013
+        // its length in 16-byte units plus one. The wrap at the top of the
+        // address space is either right or an infinite loop, and no register
+        // log can see it.
+        let mut a = apu();
+        a.write(0x4010, 0x0F); // fastest rate, no loop
+        a.write(0x4012, 0x01); // $C040
+        a.write(0x4013, 0x02); // 33 bytes
+        a.write(0x4015, 0x1F); // start
+        assert_eq!(a.dmc.sample_addr, 0xC040);
+        assert_eq!(a.dmc.sample_len, 33);
+        // 33 bytes at the fastest rate is 54 cycles a bit, so about 14,300.
+        let mut seen = Vec::new();
+        for _ in 0..20_000 {
+            a.clock(|addr| {
+                seen.push(addr);
+                0
+            });
+        }
+        assert_eq!(seen.len(), 33, "one fetch per byte, then it stops");
+        assert_eq!(seen[0], 0xC040);
+        assert_eq!(*seen.last().unwrap(), 0xC060);
+        assert!(seen.windows(2).all(|w| w[1] == w[0] + 1), "consecutive");
+
+        // From the top of the address space it wraps to $8000, not past it.
+        let mut a = apu();
+        a.write(0x4010, 0x0F);
+        a.write(0x4012, 0xFF); // $FFC0
+        a.write(0x4013, 0x0F);
+        a.write(0x4015, 0x1F);
+        // 64 bytes from $FFC0 to the top, at 432 cycles a byte.
+        let mut seen = Vec::new();
+        for _ in 0..40_000 {
+            a.clock(|addr| {
+                seen.push(addr);
+                0
+            });
+        }
+        let at = seen.iter().position(|&x| x == 0xFFFF).expect("reaches the top");
+        assert_eq!(seen[at + 1], 0x8000, "wraps to the start of the image");
+    }
+
+    #[test]
+    fn a_dmc_sample_only_restarts_once_it_has_finished() {
+        // $4015 bit 4 is a start, not a retrigger: writing it again while a
+        // sample is playing must not reset it, or a drum stutters.
+        let mut a = apu();
+        a.write(0x4010, 0x0F);
+        a.write(0x4012, 0x01);
+        a.write(0x4013, 0x0F);
+        a.write(0x4015, 0x1F);
+        run(&mut a, 200);
+        let left = a.dmc.remaining;
+        assert!(left > 0 && left < 241);
+        a.write(0x4015, 0x1F);
+        assert_eq!(a.dmc.remaining, left, "an already-playing sample is untouched");
+    }
+
+    #[test]
+    fn the_five_step_sequence_is_longer_and_clocks_immediately() {
+        // Writing $4017 with bit 7 clocks quarter and half at once — drivers
+        // lean on that to resync — and stretches the period from 29,830 to
+        // 37,282 cycles, which is one fewer length tick per unit time.
+        let mut a = apu();
+        a.write(0x4000, 0x10);
+        a.write(0x4003, 0x10); // length index 2 -> 20
+        let before = a.pu1.length;
+        a.write(0x4017, 0x80);
+        assert_eq!(a.pu1.length, before - 1, "the write itself clocked a half frame");
+
+        let halves = |mode5: u8, cycles: u32| {
+            let mut a = apu();
+            a.write(0x4017, mode5);
+            a.write(0x4000, 0x10);
+            a.write(0x4003, 0xF8); // length index 31 -> 30, long enough not to expire
+            let start = a.pu1.length;
+            run(&mut a, cycles);
+            start - a.pu1.length
+        };
+        // Over the same 60,000 cycles the 4-step sequence clocks halves at
+        // 14913, 29829, 44743 and 59659; the 5-step one only at 14913, 37281
+        // and 52195. The same wall-clock time buys fewer length ticks in the
+        // longer sequence, which is the whole audible consequence of the mode
+        // bit and the reason a driver has to know which one it set.
+        assert_eq!(halves(0x00, 60_000), 4);
+        assert_eq!(halves(0x80, 60_000), 3);
+    }
+
     #[test]
     fn decode_dmc_matches_hardware_rules() {
         let up = decode_dmc(&[0xFF; 17], 15, 64);
