@@ -109,7 +109,13 @@ pub struct Style {
     pub drums: Vec<Drums>,
     pub sections: Vec<Section>,
     pub forms: Vec<Vec<String>>,
-    pub motif: Vec<i32>,
+    /// Named motifs; the generator picks one per song. A bare `@motif`
+    /// with no name is stored as "motif".
+    pub motifs: Vec<(String, Vec<i32>)>,
+    /// Named instrument palettes: overrides applied to the style's
+    /// instruments, one palette per song, so two songs from the same
+    /// riff vocabulary do not share a timbre.
+    pub timbres: Vec<(String, Vec<(usize, Vec<(String, String)>)>)>,
     pub title_adj: Vec<String>,
     pub title_noun: Vec<String>,
     /// Hat / crash notes on NOI and their instruments.
@@ -400,7 +406,35 @@ impl Style {
                     st.samples[idx] = smp;
                 }
                 "form" => st.forms.push(args.split_whitespace().map(String::from).collect()),
-                "motif" => st.motif = args.split_whitespace().map(|t| t.parse::<i32>()).collect::<Result<_, _>>().with_context(ctx)?,
+                "timbre" => {
+                    let mut it = args.split_whitespace();
+                    let name = it.next().unwrap_or("").to_string();
+                    let idx_tok = it.next().unwrap_or("").to_string();
+                    let rest = it.collect::<Vec<_>>().join(" ");
+                    let (idx_tok, rest) = (idx_tok.as_str(), rest.as_str());
+                    if name.is_empty() || idx_tok.is_empty() {
+                        bail!("{}: want NAME II key=value ...", ctx());
+                    }
+                    let idx = usize::from_str_radix(idx_tok, 16).with_context(ctx)?;
+                    if idx >= INSTRUMENTS { bail!("{}: instrument {:X} out of range", ctx(), idx); }
+                    let kvs: Vec<(String, String)> = kv(rest);
+                    match st.timbres.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, list)) => list.push((idx, kvs)),
+                        None => st.timbres.push((name, vec![(idx, kvs)])),
+                    }
+                }
+                "motif" => {
+                    // `@motif 0 2 3` or `@motif name 0 2 3`
+                    let mut toks: Vec<&str> = args.split_whitespace().collect();
+                    let name = if toks.first().map_or(false, |t| t.parse::<i32>().is_err()) {
+                        toks.remove(0).to_string()
+                    } else {
+                        format!("motif{}", st.motifs.len() + 1)
+                    };
+                    let steps: Vec<i32> = toks.iter().map(|t| t.parse::<i32>()).collect::<Result<_, _>>().with_context(ctx)?;
+                    if steps.is_empty() { bail!("{}: empty motif", ctx()); }
+                    st.motifs.push((name, steps));
+                }
                 "title" => {
                     for (k, v) in kv(args) {
                         match k.as_str() {
@@ -536,6 +570,8 @@ struct Chord {
 
 struct Ctx<'a> {
     style: &'a Style,
+    /// Index into `style.motifs` for this song.
+    motif: usize,
     rng: Rng,
     key: u8,
     scale: Vec<u8>,
@@ -596,7 +632,7 @@ fn lead_bar(ctx: &mut Ctx, riff: &Riff, chord: Chord, bar_in_section: usize, use
     let fifth_deg = ctx.nearest_degree(chord.root + chord.fifth);
     let chord_degs = [root_deg, third_deg, fifth_deg];
     let oct = riff.octave;
-    let contour = if use_motif && !ctx.style.motif.is_empty() { "motif" } else { riff.contour.as_str() };
+    let contour = if use_motif && !ctx.style.motifs.is_empty() { "motif" } else { riff.contour.as_str() };
     let mut pitches: Vec<i32> = Vec::with_capacity(hits.len());
     match contour {
         "pedal" | "pedal_jumps" | "pedal_then_run" => {
@@ -673,7 +709,7 @@ fn lead_bar(ctx: &mut Ctx, riff: &Riff, chord: Chord, bar_in_section: usize, use
             }
         }
         "motif" => {
-            let m = &ctx.style.motif;
+            let m = &ctx.style.motifs[ctx.motif.min(ctx.style.motifs.len() - 1)].1;
             for i in 0..hits.len() {
                 pitches.push(root_deg + m[i % m.len()]);
             }
@@ -788,6 +824,9 @@ pub struct GenInfo {
     pub progression: String,
     pub form: usize,
     pub motif: bool,
+    /// Which named motif and instrument palette this song drew.
+    pub motif_name: String,
+    pub timbre: String,
 }
 
 /// Generate a song from a style.
@@ -818,13 +857,32 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
     let prog = prog_ref.chords.clone();
     let form_idx = p.form.unwrap_or_else(|| rng.range(0, style.forms.len() as u32) as usize).min(style.forms.len() - 1);
     let form = style.forms[form_idx].clone();
-    let motif_on = p.motif.unwrap_or(true) && !style.motif.is_empty();
-    let mut ctx = Ctx { style, rng, key, scale, prog, motif_on };
+    let motif_on = p.motif.unwrap_or(true) && !style.motifs.is_empty();
+    let motif_pick = if style.motifs.is_empty() { 0 } else { rng.range(0, style.motifs.len() as u32) as usize };
+    let timbre_pick = if style.timbres.is_empty() { None } else { Some(rng.range(0, style.timbres.len() as u32) as usize) };
+    let mut ctx = Ctx { style, motif: motif_pick, rng, key, scale, prog, motif_on };
 
     let mut song = Song::default();
     song.bpm = bpm;
     for (idx, inst) in &style.instruments {
         song.instruments[*idx] = *inst;
+    }
+    // A per-song instrument palette: same riffs, different voice.
+    if let Some(t) = timbre_pick {
+        for (idx, kvs) in &style.timbres[t].1 {
+            let inst = &mut song.instruments[*idx];
+            for (k, v) in kvs {
+                match k.as_str() {
+                    "a" => inst.attack_ms = v.parse().unwrap_or(inst.attack_ms),
+                    "d" => inst.decay_ms = v.parse().unwrap_or(inst.decay_ms),
+                    "s" => inst.sustain = v.parse().unwrap_or(inst.sustain),
+                    "r" => inst.release_ms = v.parse().unwrap_or(inst.release_ms),
+                    "duty" => inst.duty = v.parse().unwrap_or(inst.duty),
+                    "vol" => inst.volume = v.parse().unwrap_or(inst.volume),
+                    _ => {}
+                }
+            }
+        }
     }
     song.phrases.clear();
     let mut phrase_index: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -931,7 +989,12 @@ pub fn generate_with_info(style: &Style, p: &GenParams) -> Result<(Song, GenInfo
     song.driver = p.driver.clone();
     song.key_name = format!("{} {}", crate::vip::key_name(key), scale_name);
     song.samples = style.samples.iter().map(|s| crate::DpcmRef { name: s.name.clone(), path: s.path.clone(), rate: s.rate }).collect();
-    let info = GenInfo { key, scale: scale_name, progression: prog_name, form: form_idx, motif: motif_section.is_some() };
+    let info = GenInfo {
+        key, scale: scale_name, progression: prog_name, form: form_idx,
+        motif: motif_section.is_some(),
+        motif_name: style.motifs.get(motif_pick).map(|m| m.0.clone()).unwrap_or_default(),
+        timbre: timbre_pick.map(|t| style.timbres[t].0.clone()).unwrap_or_else(|| "default".into()),
+    };
     let _ = ctx.motif_on;
     Ok((song, info))
 }
