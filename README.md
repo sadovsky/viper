@@ -157,14 +157,40 @@ Beyond the grid editor, viper is playable as an instrument:
 
 ## Visualizer & sprites
 
-Toggle the viz pane with `:viz`. Five renderers, all using half-blocks
+Toggle the viz pane with `:viz`. Six renderers, all using half-blocks
 and 24-bit color for 2× vertical terminal resolution:
 
 - **bars** — per-voice envelope levels
 - **scope** — synthesized waveform, tinted by loudest voice
 - **grid** — 4×4 step grid with a pulsing playhead
 - **orbit** — per-voice bodies orbiting a shared ring, pitch → angle
-- **sprites** — load 4-color PNG sprite sheets and animate them
+- **sprites** — load 4-color sprite sheets and animate them
+- **sheet** — a tile atlas of one sheet, with indices, for finding a tile
+
+### Sprites out of a NES ROM
+
+A sheet can come from a game rather than a PNG:
+
+```
+:sprite load ~/roms/megaman3.nes bank=4   # 256 tiles from one pattern table
+:sprite show megaman3                     # the atlas — see what you have
+:sprite page +1                           # page through it
+:sprite place megaman3 0x2A 12 8          # place the tile you found
+```
+
+This needs no emulation and loses nothing. NES character data is 2bpp
+planar — sixteen bytes per 8×8 tile, one bitplane for each bit of a 0–3
+index — which is *exactly* what a viper sprite sheet already is, so the
+graphics arrive as the artist drew them rather than quantized down to
+four colours the way a PNG has to be.
+
+What it cannot do is invent colour: which palette a tile is drawn with is
+chosen by the game's code, per frame, per attribute block. Sheets load with
+a legible grey ramp; `:sprite repalette` sets a real one.
+
+Some games have nothing to read. Roughly half the ROMs I tried build their
+tiles into CHR-RAM as they run — Metroid, Zelda, Contra, Final Fantasy —
+and viper says so rather than reporting an empty sheet.
 
 Sprites can be bound to any audio-reactive source. The binding language
 is a small expression DSL — operators, parentheses, a handful of

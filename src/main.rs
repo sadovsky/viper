@@ -846,6 +846,8 @@ struct App {
     /// Active sprite placements drawn in order — later placements win
     /// pixel conflicts. Stage 12 will make placements mutable.
     sprite_placements: Vec<sprite::Placement>,
+    /// Which sheet the tile atlas is showing, and which page of it.
+    sheet_browse: Option<(String, u32)>,
     /// User-defined 4-color palettes keyed by name. Used to recolor
     /// sheets without reloading the source PNG.
     sprite_palettes: HashMap<String, [ratatui::style::Color; sprite::PALETTE_SIZE]>,
@@ -922,6 +924,7 @@ impl App {
             still: false,
             sprite_sheets: HashMap::new(),
             sprite_placements: Vec::new(),
+            sheet_browse: None,
             sprite_palettes: HashMap::new(),
             bindings: Vec::new(),
             effective_placements: Vec::new(),
@@ -2258,6 +2261,9 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         row(":unmute [N|off]",  "unmute specific / all channels"),
         row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites / register)"),
         row(":sprite load P WxH [q]", "load PNG sheet (≤3 opaque colors, or 'q' to quantize)"),
+        row(":sprite load ROM.nes [bank=N]", "read tiles out of an NES ROM's CHR data"),
+        row(":sprite show NAME [page]", "tile atlas: see the sheet and its indices"),
+        row(":sprite page +1|-1|N",  "move the atlas"),
         row(":sprite place N I x y", "place sheet N's tile I at viz pixel (x,y)"),
         row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
         row(":sprite repalette N P", "apply palette P to sheet N"),
@@ -2787,6 +2793,7 @@ fn ui(f: &mut Frame, app: &App) {
     }
     if let Some(area) = viz_area {
         let ctx = viz::VizCtx {
+            browse: app.sheet_browse.as_ref().map(|(n, p)| (n.as_str(), *p)),
             frame: &app.viz_frame,
             tick: app.viz_tick,
             sheets: &app.sprite_sheets,
@@ -3570,14 +3577,10 @@ fn execute_command(app: &mut App, cmd: &str) {
             app.status = format!("sprite: cleared {} placement{}",
                 n, if n == 1 { "" } else { "s" });
         }
-        ["sprite", "load", path] => sprite_load_cmd(app, path, None, false),
-        ["sprite", "load", path, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, None, true),
-        ["sprite", "load", path, cell] => sprite_load_cmd(app, path, Some(cell), false),
-        ["sprite", "load", path, cell, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, Some(cell), true),
-        ["sprites", "load", path] => sprite_load_cmd(app, path, None, false),
-        ["sprites", "load", path, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, None, true),
-        ["sprites", "load", path, cell] => sprite_load_cmd(app, path, Some(cell), false),
-        ["sprites", "load", path, cell, tail] if is_quantize_flag(tail) => sprite_load_cmd(app, path, Some(cell), true),
+        ["sprite" | "sprites", "load", path, rest @ ..] => sprite_load_args(app, path, rest),
+        ["sprite" | "sprites", "show", name] => sprite_show_cmd(app, name, None),
+        ["sprite" | "sprites", "show", name, page] => sprite_show_cmd(app, name, Some(page)),
+        ["sprite" | "sprites", "page", delta] => sprite_page_cmd(app, delta),
         ["sprite", "place", name, idx, x, y] => sprite_place_cmd(app, name, idx, x, y),
         ["sprite", "palette", pname, c0, c1, c2, c3] =>
             sprite_palette_cmd(app, pname, &[c0, c1, c2, c3]),
@@ -3588,7 +3591,7 @@ fn execute_command(app: &mut App, cmd: &str) {
                 app.show_viz = true;
                 app.status = format!("viz: {}", k.name());
             }
-            None => app.status = format!("viz: unknown kind '{}' (bars/scope/grid/orbit)", kind),
+            None => app.status = format!("viz: unknown kind '{}' (bars/scope/grid/orbit/sprites/sheet/register)", kind),
         },
         ["mute"] => { toggle_mute(app, app.cursor_ch); }
         ["mute", "off"] | ["unmute"] => { unmute_all(app); }
@@ -4310,9 +4313,96 @@ fn is_quantize_flag(tok: &str) -> bool {
     matches!(tok, "quantize" | "q" | "-q" | "--quantize")
 }
 
-fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>, quantize: bool) {
+/// `:sprite load PATH [WxH] [q] [bank=N]`, in any order after the path.
+///
+/// Parsed rather than matched arm by arm: the options are independent, and
+/// four of them in fixed positions is sixteen match arms that all call the
+/// same function.
+/// `:sprite show NAME [PAGE]` — put the tile atlas on screen.
+///
+/// Loading a ROM can produce eight thousand tiles, and a placement command
+/// takes an index. Without a way to look at them, that index can only come
+/// from a separate tile viewer, which rather defeats the point.
+fn sprite_show_cmd(app: &mut App, name: &str, page: Option<&&str>) {
+    if !app.sprite_sheets.contains_key(name) {
+        let mut have: Vec<&str> = app.sprite_sheets.keys().map(|s| s.as_str()).collect();
+        have.sort();
+        app.status = if have.is_empty() {
+            "sprite: no sheets loaded (:sprite load <path|rom.nes>)".into()
+        } else {
+            format!("sprite: no sheet '{}' (have {})", name, have.join(", "))
+        };
+        return;
+    }
+    let p = match page {
+        Some(t) => match t.parse::<u32>() {
+            Ok(n) => n.saturating_sub(1), // pages read 1-based, count from 0
+            Err(_) => {
+                app.status = format!("sprite: bad page '{}'", t);
+                return;
+            }
+        },
+        None => 0,
+    };
+    app.sheet_browse = Some((name.to_string(), p));
+    app.viz_kind = viz::VizKind::Sheet;
+    app.show_viz = true;
+    let tiles = app.sprite_sheets.get(name).map(|s| s.cell_count()).unwrap_or(0);
+    app.status = format!("sprite: showing {} ({} tiles) — :sprite page +1 to page through", name, tiles);
+}
+
+/// `:sprite page +1 | -1 | N` — move the atlas.
+fn sprite_page_cmd(app: &mut App, delta: &str) {
+    let Some((name, page)) = app.sheet_browse.clone() else {
+        app.status = "sprite: nothing on show (:sprite show <name>)".into();
+        return;
+    };
+    let next = if let Some(rest) = delta.strip_prefix('+') {
+        rest.parse::<u32>().ok().map(|n| page.saturating_add(n))
+    } else if let Some(rest) = delta.strip_prefix('-') {
+        rest.parse::<u32>().ok().map(|n| page.saturating_sub(n))
+    } else {
+        delta.parse::<u32>().ok().map(|n| n.saturating_sub(1))
+    };
+    match next {
+        Some(n) => {
+            app.sheet_browse = Some((name.clone(), n));
+            app.status = format!("sprite: {} page {}", name, n + 1);
+        }
+        None => app.status = format!("sprite: bad page '{}' (want N, +N or -N)", delta),
+    }
+}
+
+fn sprite_load_args(app: &mut App, path: &str, rest: &[&str]) {
+    let mut cell: Option<&&str> = None;
+    let mut quantize = false;
+    let mut bank: Option<u32> = None;
+    for tok in rest {
+        if is_quantize_flag(tok) {
+            quantize = true;
+        } else if let Some(n) = tok.strip_prefix("bank=") {
+            match n.parse::<u32>() {
+                Ok(b) => bank = Some(b),
+                Err(_) => {
+                    app.status = format!("sprite: bad bank '{}' (want bank=N)", n);
+                    return;
+                }
+            }
+        } else if parse_cell_dim(tok).is_some() {
+            cell = Some(tok);
+        } else {
+            app.status = format!("sprite: unknown option '{}' (want WxH, q, or bank=N)", tok);
+            return;
+        }
+    }
+    sprite_load_with(app, path, cell, quantize, bank)
+}
+
+fn sprite_load_with(app: &mut App, path_str: &str, cell: Option<&&str>, quantize: bool, bank: Option<u32>) {
     let path = resolve_sprite_path(app, Path::new(path_str));
-    // Default cell dimension: the full image — auto-derived after load.
+    // An NES ROM is recognised by its magic rather than its extension, so a
+    // ROM is a ROM whatever it has been named.
+    let is_rom = sprite::is_nes_rom(&path);
     let (cw, ch) = match cell {
         Some(c) => match parse_cell_dim(c) {
             Some(d) => d,
@@ -4321,13 +4411,15 @@ fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>, quantize:
                 return;
             }
         },
+        // A ROM's natural cell is one 8x8 tile. An image's is the whole
+        // picture, which we have to open the file to learn.
+        None if is_rom => (8, 8),
         None => (0, 0),
     };
     let stem = path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "sheet".into());
-    // If no cell dim given, we need to peek at the image dims first.
     let (cw, ch) = if cw == 0 || ch == 0 {
         match image::image_dimensions(&path) {
             Ok((w, h)) => (w, h),
@@ -4339,9 +4431,23 @@ fn sprite_load_cmd(app: &mut App, path_str: &str, cell: Option<&&str>, quantize:
     } else {
         (cw, ch)
     };
-    match sprite::load_sheet(stem.clone(), &path, cw, ch, quantize) {
+    let loaded = if is_rom {
+        sprite::load_chr(stem.clone(), &path, cw, ch, bank)
+    } else {
+        sprite::load_sheet(stem.clone(), &path, cw, ch, quantize)
+    };
+    match loaded {
         Ok(sheet) => {
-            let q_tag = if quantize { " [quantized]" } else { "" };
+            let q_tag = if is_rom {
+                match bank {
+                    Some(b) => format!(" [CHR bank {}]", b),
+                    None => " [CHR]".to_string(),
+                }
+            } else if quantize {
+                " [quantized]".to_string()
+            } else {
+                String::new()
+            };
             let tiles = sheet.cell_count();
             // Auto-place at (0,0) on first load so `:viz sprites` shows
             // something immediately. A user who already has placements
@@ -4505,11 +4611,18 @@ fn collect_extras(app: &App) -> Vec<String> {
     sheets.sort_by(|a, b| a.name.cmp(&b.name));
     for s in sheets {
         out.push(format!(
-            "sprite load {} {}x{}{}",
+            "sprite load {} {}x{}{}{}",
             s.source.display(),
             s.cell_w,
             s.cell_h,
             if s.quantize { " q" } else { "" },
+            // Without the bank a ROM sheet reloads as the whole of CHR —
+            // thousands of tiles where there were 256, and every placement
+            // index pointing at the wrong picture.
+            match s.chr_bank {
+                Some(b) => format!(" bank={}", b),
+                None => String::new(),
+            },
         ));
         if let Some(p) = &s.palette_name {
             out.push(format!("sprite repalette {} {}", s.name, p));
@@ -5611,6 +5724,147 @@ mod tests {
             .collect()
     }
 
+    /// A minimal iNES file with one bank of CHR: two tiles set, the rest
+    /// blank. Synthetic because viper's tests must not carry commercial
+    /// ROMs, and the format is the format.
+    fn chr_rom_file() -> std::path::PathBuf {
+        let mut v = b"NES\x1A".to_vec();
+        v.push(1); // 16 KB PRG
+        v.push(1); // 8 KB CHR = 512 tiles
+        v.resize(16, 0);
+        v.extend(std::iter::repeat_n(0u8, 16 * 1024));
+        let mut chr = vec![0u8; 8 * 1024];
+        for t in [0usize, 300] {
+            for b in 0..16 {
+                chr[t * 16 + b] = 0xFF; // both planes: a solid tile
+            }
+        }
+        v.extend(chr);
+        // A counter, because these tests run in parallel and two of them
+        // writing one path tears the file in a way that looks like a bug in
+        // the decoder.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "viper_atlas_{}_{}.nes",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&p, v).unwrap();
+        p
+    }
+
+    fn atlas_lines(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| {
+            let ctx = viz::VizCtx {
+                browse: app.sheet_browse.as_ref().map(|(n, p)| (n.as_str(), *p)),
+                frame: &app.viz_frame,
+                tick: app.viz_tick,
+                sheets: &app.sprite_sheets,
+                placements: &app.effective_placements,
+                palettes: &app.sprite_palettes,
+                bg: app.theme.viz_bg,
+                register: &app.register,
+                fg: app.theme.note,
+                dim: app.theme.dim,
+            };
+            viz::render(f, f.area(), viz::VizKind::Sheet, &ctx);
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rom_loads_its_tiles_and_the_atlas_can_find_them() {
+        // The whole point of reading CHR: a ROM holds thousands of tiles, so
+        // `:sprite place rom 4271` is only usable if you can look at them
+        // first and see which index you want.
+        let rom = chr_rom_file();
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, &format!("sprite load {} 8x8", rom.display()));
+        let sheet = app.sprite_sheets.values().next().expect("loaded");
+        assert_eq!(sheet.cell_count(), 512, "one 8 KB bank");
+        assert!(app.status.contains("[CHR]"), "the report says where it came from: {}", app.status);
+
+        let name = app.sprite_sheets.keys().next().unwrap().clone();
+        execute_command(&mut app, &format!("sprite show {}", name));
+        assert_eq!(app.viz_kind, viz::VizKind::Sheet, "and puts it on screen");
+
+        let lines = atlas_lines(&app, 100, 18);
+        let head = lines.iter().find(|l| l.contains("512 tiles")).expect("a header naming the sheet");
+        assert!(head.contains("page 1/"), "{}", head);
+        // The pane has a border, so the gutter starts one column in.
+        assert!(lines.iter().any(|l| l.trim_start_matches('│').starts_with("0000")), "the first index is in the gutter");
+        assert!(lines.iter().any(|l| l.contains('█')), "and tile 0 is drawn");
+    }
+
+    #[test]
+    fn the_atlas_pages_to_where_a_tile_actually_is() {
+        // Tile 300 is blank on page 1 and solid wherever it lands, which is
+        // what paging is for.
+        let rom = chr_rom_file();
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, &format!("sprite load {} 8x8", rom.display()));
+        let name = app.sprite_sheets.keys().next().unwrap().clone();
+        execute_command(&mut app, &format!("sprite show {}", name));
+
+        // Walk forward until the gutter shows a row containing tile 300.
+        let mut found = None;
+        for _ in 0..40 {
+            let lines = atlas_lines(&app, 100, 18);
+            let gutter = |l: &String| -> Option<u32> {
+                l.trim_start_matches('│').get(..4).and_then(|h| u32::from_str_radix(h, 16).ok())
+            };
+            if lines.iter().any(|l| l.contains('█')) && lines.iter().filter_map(gutter).any(|i| (i..i + 10).contains(&300)) {
+                found = Some(app.sheet_browse.clone().unwrap().1);
+                break;
+            }
+            execute_command(&mut app, "sprite page +1");
+        }
+        assert!(found.is_some(), "paging reaches tile 300");
+        // And paging is clamped rather than running off the end.
+        execute_command(&mut app, "sprite page 9999");
+        let lines = atlas_lines(&app, 100, 18);
+        assert!(lines.iter().any(|l| l.contains("tiles")), "a page past the end still renders: {:?}", &lines[..2]);
+    }
+
+    #[test]
+    fn a_rom_sheet_remembers_its_bank_across_a_save() {
+        // Without the bank a reload takes the whole of CHR — thousands of
+        // tiles where there were 256 — and every placement index then points
+        // at a different picture.
+        let rom = chr_rom_file();
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, &format!("sprite load {} 8x8 bank=1", rom.display()));
+        assert!(app.status.contains("[CHR bank 1]"), "{}", app.status);
+        let extras = collect_extras(&app);
+        let line = extras.iter().find(|l| l.starts_with("sprite load ")).expect("serialised");
+        assert!(line.ends_with("bank=1"), "{}", line);
+        assert!(line.contains("8x8"), "{}", line);
+    }
+
+    #[test]
+    fn asking_for_a_sheet_that_is_not_loaded_says_what_is() {
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, "sprite show nothing");
+        assert!(app.status.contains("no sheets loaded"), "{}", app.status);
+        let rom = chr_rom_file();
+        execute_command(&mut app, &format!("sprite load {} 8x8", rom.display()));
+        execute_command(&mut app, "sprite show nothing");
+        assert!(app.status.contains("no sheet 'nothing'") && app.status.contains("have "), "{}", app.status);
+    }
+
     #[test]
     fn mix_blends_rgb_and_switches_named_colors_at_the_halfway_point() {
         let a = Color::Rgb(0, 0, 0);
@@ -6108,6 +6362,7 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(50, 12)).unwrap();
             t.draw(|f| {
                 let ctx = viz::VizCtx {
+                browse: None,
                     frame: &app.viz_frame, tick: 0, sheets: &app.sprite_sheets,
                     placements: &app.effective_placements, palettes: &app.sprite_palettes,
                     bg: app.theme.viz_bg, register: &app.register,

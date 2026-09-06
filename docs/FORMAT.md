@@ -99,12 +99,21 @@ either needs:
 @scene 3  phrase=02
 @sprite palette dusk 102030 405060 708090 transparent
 @sprite load sprites/mario.png 16x16 q
+@sprite load roms/megaman3.nes 8x8 bank=4
 @sprite repalette mario dusk
 @sprite place mario 0 10 10
 @bind mario.0 scale = tri.env * 0.5 + 1.0
 ```
 
-Three details worth knowing:
+Four details worth knowing:
+
+- **A sheet can be an NES ROM.** `@sprite load` recognises one by its magic
+  rather than its extension and reads tiles straight out of the CHR-ROM,
+  which is already 2bpp indexed and so needs no quantizing. `bank=N` takes
+  one 256-tile pattern table; without it the whole of CHR is loaded, which
+  for a large game is several thousand tiles. The bank is written back on
+  save, because reloading without it would renumber every placement.
+
 
 - **Palette colours are written without a leading `#`.** A `#` at the start of
   a token opens a comment, so `#102030` would be stripped and the palette would
