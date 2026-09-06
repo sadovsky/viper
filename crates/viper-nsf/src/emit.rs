@@ -265,19 +265,31 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
                 bail!("song {}: order references pattern {} but there are {}", si, o, song.patterns.len());
             }
         }
+        if driver.abi < 2 && song.patterns.iter().any(|p| p.rows.iter().any(|r| r.iter().any(|c| c.iter().any(|e| matches!(e, Event::Speed(_)))))) {
+            bail!("song {}: mid-song tempo changes need a driver of ABI v2 or newer", si);
+        }
         if song.instruments.len() > 64 {
             bail!("song {}: more than 64 instruments", si);
         }
 
-        // header + order list as one object (the driver indexes into it)
+        // header + order list as one object (the driver indexes into it).
+        // ABI v3 widened the order length and loop position to 16 bits,
+        // which moved the two pointers and the start of the order list.
+        let wide = driver.abi >= 3;
+        let hdr_len = if wide { 11 } else { 9 };
         let (sp_lo, sp_hi) = fixed_8_8(song.frames_per_row)?;
-        let mut header = vec![
-            sp_lo, sp_hi, song.rows_per_pattern,
-            (song.order.len() & 0xFF) as u8, (song.order.len() >> 8) as u8,
-            (song.loop_pos & 0xFF) as u8, (song.loop_pos >> 8) as u8,
-            0, 0, 0, 0,
-        ];
-        header.resize(11 + 10 * song.order.len(), 0);
+        if !wide && song.order.len() > 255 {
+            bail!("song {}: order list of {} entries needs a driver of ABI v3 or newer", si, song.order.len());
+        }
+        let mut header = if wide {
+            vec![sp_lo, sp_hi, song.rows_per_pattern,
+                 (song.order.len() & 0xFF) as u8, (song.order.len() >> 8) as u8,
+                 (song.loop_pos & 0xFF) as u8, (song.loop_pos >> 8) as u8,
+                 0, 0, 0, 0]
+        } else {
+            vec![sp_lo, sp_hi, song.rows_per_pattern, song.order.len() as u8, song.loop_pos as u8, 0, 0, 0, 0]
+        };
+        header.resize(hdr_len + 10 * song.order.len(), 0);
         let song_addr = lay.place(&header)?;
         lay.patch16(table_at + 2 * si, song_addr);
         data_bytes += header.len();
@@ -322,8 +334,8 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         }
         let dpcm_table = lay.place(&dtab)?;
         data_bytes += dtab.len();
-        lay.patch16(song_addr + 7, instr_table);
-        lay.patch16(song_addr + 9, dpcm_table);
+        lay.patch16(song_addr + hdr_len - 4, instr_table);
+        lay.patch16(song_addr + hdr_len - 2, dpcm_table);
 
         // streams, deduplicated by content
         let mut stream_addr: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -348,7 +360,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         }
         for (oi, &pi) in song.order.iter().enumerate() {
             for ci in 0..5 {
-                lay.patch16(song_addr + 11 + oi * 10 + ci * 2, pattern_streams[pi][ci]);
+                lay.patch16(song_addr + hdr_len + oi * 10 + ci * 2, pattern_streams[pi][ci]);
             }
         }
     }

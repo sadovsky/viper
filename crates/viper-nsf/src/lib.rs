@@ -19,8 +19,12 @@ pub mod emit;
 pub use emit::{emit, EmitResult};
 pub use ir::*;
 
-/// Supported driver ABI.
+/// The driver ABI this build emits by default, and the oldest it can
+/// still link against. Keeping the older layouts alive means a driver
+/// binary captured with a song — an external emulator's receipt, say —
+/// stays reproducible after the ABI moves on.
 pub const DRIVER_ABI_VERSION: u32 = 3;
+pub const DRIVER_ABI_MIN: u32 = 1;
 
 /// A sound driver binary + the symbols the emitter links against.
 #[derive(Clone, Debug)]
@@ -56,8 +60,8 @@ impl Driver {
             symbols.get(n).copied().ok_or_else(|| anyhow!("driver.sym is missing symbol `{}`", n))
         };
         let abi = get("DRIVER_ABI_VERSION")?;
-        if abi != DRIVER_ABI_VERSION {
-            bail!("driver ABI version {} is not supported (viper speaks v{})", abi, DRIVER_ABI_VERSION);
+        if !(DRIVER_ABI_MIN..=DRIVER_ABI_VERSION).contains(&abi) {
+            bail!("driver ABI version {} is not supported (viper speaks v{}..v{})", abi, DRIVER_ABI_MIN, DRIVER_ABI_VERSION);
         }
         let init = get("driver_init")? as u16;
         let play = get("driver_play")? as u16;
