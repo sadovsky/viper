@@ -91,6 +91,22 @@ fn run(nsf: &Nsf, opts: &RenderOptions, frames: u32, mask: u8, dmc_filter: Optio
     Ok(p)
 }
 
+/// The per-channel stems this NSF has. The VRC6 three appear only when the
+/// header declares the chip, so a plain 2A03 file still renders exactly the
+/// five it always did. Shared because `render` and `render_frames` had the
+/// same list written out twice.
+fn stem_specs(nsf: &Nsf) -> Vec<(&'static str, u8)> {
+    let mut v = vec![("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)];
+    if nsf.expansion & 0x01 != 0 {
+        v.extend_from_slice(&[
+            ("vp1", crate::vrc6::CH_VP1),
+            ("vp2", crate::vrc6::CH_VP2),
+            ("saw", crate::vrc6::CH_SAW),
+        ]);
+    }
+    v
+}
+
 pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
     let (loop_info, dpcm_samples) = analyze(nsf, opts)?;
     let fps = 60.0988;
@@ -112,7 +128,7 @@ pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
         sample_rate: opts.sample_rate,
     };
     if opts.stems {
-        for (name, mask) in [("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)] {
+        for (name, mask) in stem_specs(nsf) {
             let p = run(nsf, opts, total_frames, mask, None, false)?;
             result.stems.push(Stem { name: name.to_string(), samples: p.samples });
         }
@@ -145,7 +161,7 @@ pub fn render_frames(nsf: &Nsf, opts: &RenderOptions, frames: u32) -> Result<Ren
         sample_rate: opts.sample_rate,
     };
     if opts.stems {
-        for (name, mask) in [("pu1", CH_PU1), ("pu2", CH_PU2), ("tri", CH_TRI), ("noi", CH_NOI)] {
+        for (name, mask) in stem_specs(nsf) {
             let p = run(nsf, opts, frames, mask, None, false)?;
             result.stems.push(Stem { name: name.to_string(), samples: p.samples });
         }

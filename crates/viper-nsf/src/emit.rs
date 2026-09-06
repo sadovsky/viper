@@ -58,7 +58,10 @@ fn build_nsfe(module: &Module, driver: &Driver, image: &[u8]) -> Vec<u8> {
     info.extend_from_slice(&driver.init.to_le_bytes());
     info.extend_from_slice(&driver.play.to_le_bytes());
     info.push(0); // NTSC
-    info.push(module.expansion.nsf_bits());
+    // From the driver, not the song: the header describes what the file's
+    // code actually drives. `emit` has already refused any song asking for
+    // more than the driver declares.
+    info.push(driver.expansion);
     info.push(module.songs.len() as u8);
     info.push(0); // starting track (0-based)
     chunk(&mut out, b"INFO", &info);
@@ -350,8 +353,19 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     if image.len() > 0x8000 {
         bail!("image is {} bytes; max 32768", image.len());
     }
-    if module.expansion != Expansion::None {
-        warnings.push("expansion audio requested but the ABI v1 driver is strict 2A03; header flag set anyway".into());
+    // The song asks; the driver decides. Setting the header bit anyway used to
+    // produce a file claiming a chip that nothing in it ever writes to — and
+    // nothing downstream could catch it, because the header was the only claim
+    // and it was self-consistent. Refusing is what makes "an NSF's expansion
+    // byte is backed by code" mechanically true.
+    let want = module.expansion.nsf_bits();
+    if want & !driver.expansion != 0 {
+        bail!(
+            "song requests expansion ${:02X} but the linked driver (ABI v{}) declares ${:02X}; \
+             the NSF header would claim a chip nothing writes to. Link a driver built with that \
+             chip, or set `expansion=none`.",
+            want, driver.abi, driver.expansion,
+        );
     }
 
     let title = if module.songs.len() == 1 || module.album.is_empty() { module.songs[0].title.as_str() } else { module.album.as_str() };
@@ -363,7 +377,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
         title,
         &module.artist,
         &module.copyright,
-        module.expansion.nsf_bits(),
+        driver.expansion,
     );
     let mut nsf = Vec::with_capacity(128 + image.len());
     nsf.extend_from_slice(&header);
@@ -436,4 +450,65 @@ mod tests {
         assert_eq!(fixed_8_8(4.5).unwrap(), (0x80, 0x04));
         assert!(fixed_8_8(0.9).is_err());
     }
+    /// A minimal driver stub: the emitter only needs the four symbols and a
+    /// blob whose length puts `song_table` right after it.
+    fn stub_driver(expansion: u8) -> Driver {
+        let bin = vec![0x60u8; 16]; // RTS padding, never executed here
+        let mut sym = std::collections::HashMap::new();
+        sym.insert("DRIVER_ABI_VERSION".to_string(), 1);
+        sym.insert("driver_init".to_string(), 0x8000);
+        sym.insert("driver_play".to_string(), 0x8008);
+        sym.insert("song_table".to_string(), 0x8000 + bin.len() as u32);
+        if expansion != 0 {
+            sym.insert("DRIVER_EXPANSION".to_string(), expansion as u32);
+        }
+        Driver::from_parts(bin, sym).unwrap()
+    }
+
+    fn one_note_module(expansion: Expansion) -> Module {
+        let mut pat = Pattern::new(16);
+        pat.rows[0][0].push(Event::Note(40));
+        Module {
+            songs: vec![Song {
+                title: "t".into(),
+                frames_per_row: 6.0,
+                rows_per_pattern: 16,
+                patterns: vec![pat],
+                order: vec![0],
+                loop_pos: 0,
+                instruments: vec![Instrument { duty: None, envelope: None }],
+                samples: Vec::new(),
+            }],
+            album: String::new(),
+            artist: String::new(),
+            copyright: String::new(),
+            expansion,
+        }
+    }
+
+    #[test]
+    fn the_header_cannot_claim_a_chip_the_driver_does_not_drive() {
+        // Before this, an `expansion=vrc6` song against a 2A03 driver emitted
+        // a warning and set the header bit anyway — a file claiming a chip
+        // that nothing in it ever writes to, which no downstream check could
+        // detect because the header was the only claim.
+        let err = emit(&one_note_module(Expansion::Vrc6), &stub_driver(0)).unwrap_err().to_string();
+        assert!(err.contains("nothing writes to"), "{}", err);
+        assert!(err.contains("expansion=none"), "and says how to fix it: {}", err);
+
+        // A driver that declares VRC6 may carry the flag.
+        let ok = emit(&one_note_module(Expansion::Vrc6), &stub_driver(0x01)).unwrap();
+        assert_eq!(ok.nsf[0x7B], 0x01);
+
+        // And the byte comes from the driver, so a VRC6-capable driver still
+        // flags the file even when the song asks for nothing: its init code
+        // touches those registers, and a player must map the chip to see them.
+        let plain = emit(&one_note_module(Expansion::None), &stub_driver(0x01)).unwrap();
+        assert_eq!(plain.nsf[0x7B], 0x01);
+
+        // The ordinary case is unchanged.
+        let strict = emit(&one_note_module(Expansion::None), &stub_driver(0)).unwrap();
+        assert_eq!(strict.nsf[0x7B], 0x00);
+    }
+
 }
