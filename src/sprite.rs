@@ -33,6 +33,15 @@ pub(crate) struct SpriteSheet {
     /// The sheet's active 4-entry palette. Slot 0 always renders as
     /// transparent; slots 1..=3 render with their RGB.
     pub palette: [Color; PALETTE_SIZE],
+    /// Whether the source PNG was remapped to its top three colours on load.
+    /// Recorded so a saved song can reload the sheet: without the flag a
+    /// quantized sheet fails on reload, because the file still holds more
+    /// than three opaque colours.
+    pub quantize: bool,
+    /// The named palette applied by `:sprite repalette`, if any. `palette`
+    /// alone cannot round-trip, since it holds the resulting colours rather
+    /// than the name that produced them.
+    pub palette_name: Option<String>,
 }
 
 impl SpriteSheet {
@@ -155,6 +164,8 @@ pub(crate) fn load_sheet(
         cell_h,
         indices,
         palette,
+        quantize,
+        palette_name: None,
     })
 }
 

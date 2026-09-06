@@ -210,6 +210,14 @@ pub fn to_vip(song: &Song) -> String {
         writeln!(out, "@length  pu1={}  pu2={}  tri={}  noi={}  dpcm={}\n", l[0], l[1], l[2], l[3], l[4]).unwrap();
     }
 
+    // Scene slots and visualizer state, verbatim (see `Song::extras`).
+    if !song.extras.is_empty() {
+        for line in &song.extras {
+            writeln!(out, "@{}", line).unwrap();
+        }
+        out.push('\n');
+    }
+
     for (i, inst) in song.instruments.iter().enumerate() {
         writeln!(
             out,
@@ -240,10 +248,12 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
     let mut groove_pos = 0usize;
     let mut warnings: Vec<String> = Vec::new();
 
-    // Directives reserved in FORMAT.md but not yet implemented; parsing them
-    // shouldn't error, but silently dropping them has burned us in hand-edited
-    // files, so warn.
-    const RESERVED: &[&str] = &["scene", "bind", "sprite"];
+    // Stage 31: the tracker's scene slots and visualizer state. `Song` does
+    // not model them — they live on `App` — but they belong to the file, so
+    // the lines are carried through verbatim rather than dropped. `viper fmt`
+    // is then lossless without knowing their grammar; the TUI parses them on
+    // load and regenerates them on save.
+    const CARRIED: &[&str] = &["scene", "bind", "sprite"];
 
     for (line_no, raw) in text.lines().enumerate() {
         let line_num = line_no + 1;
@@ -316,11 +326,9 @@ pub fn from_vip(text: &str) -> Result<(Song, Vec<String>)> {
                         .with_context(|| format!("line {}: @dpcm", line_num))?;
                     section = Section::None;
                 }
-                d if RESERVED.contains(&d) => {
-                    warnings.push(format!(
-                        "line {}: @{} reserved but not implemented — ignored",
-                        line_num, d
-                    ));
+                d if CARRIED.contains(&d) => {
+                    song.extras.push(line.trim_start_matches('@').trim().to_string());
+                    section = Section::None;
                 }
                 _ => {
                     warnings.push(format!(
@@ -743,11 +751,13 @@ mod tests {
 
     #[test]
     fn reserved_directive_warns() {
+        // `@scene`/`@sprite`/`@bind` are carried verbatim now, not warned
+        // about; only a genuinely unknown directive should complain.
         let text = "@song bpm=120\n@phrase 00\n@scene 1 phrase=00\n@bogus foo=bar\n";
-        let (_, warns) = from_vip(text).unwrap();
-        assert_eq!(warns.len(), 2);
-        assert!(warns[0].contains("@scene"));
-        assert!(warns[1].contains("@bogus"));
+        let (song, warns) = from_vip(text).unwrap();
+        assert_eq!(warns.len(), 1, "{:?}", warns);
+        assert!(warns[0].contains("@bogus"));
+        assert_eq!(song.extras, vec!["scene 1 phrase=00".to_string()]);
     }
 
     #[test]

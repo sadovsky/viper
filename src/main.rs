@@ -342,6 +342,17 @@ pub(crate) struct Song {
     /// Per-channel wrap length in steps (1..=16). A channel shorter than
     /// the phrase cycles inside it — polymeter.
     pub channel_length: [u8; CHANNELS],
+    /// Stage 31: `@scene`, `@sprite` and `@bind` lines, kept verbatim.
+    ///
+    /// These describe the tracker's scene slots and its visualizer, which
+    /// live on `App` rather than in the song data proper — but they belong
+    /// to the *file*, and dropping them on save was a round-trip bug that
+    /// silently destroyed every sprite sheet, placement, palette and
+    /// modulation binding a song had. Holding the raw lines keeps `Song`
+    /// small (it is deep-cloned on every undo snapshot) and makes
+    /// `viper fmt` lossless without teaching the CLI their grammar; the
+    /// TUI regenerates them from live state on save.
+    pub extras: Vec<String>,
 }
 
 impl Song {
@@ -416,6 +427,7 @@ impl Default for Song {
             arr_loop: 0,
             groove: [0; 16],
             channel_length: [STEPS_PER_PHRASE as u8; CHANNELS],
+            extras: Vec::new(),
             expansion: false,
         }
     }
@@ -4367,7 +4379,190 @@ fn sprite_repalette_cmd(app: &mut App, sheet: &str, pname: &str) {
         app.status = format!("sprite: no sheet '{}'", sheet); return;
     };
     s.palette = palette;
+    // Remember which palette, not just its colours, so the swap survives a save.
+    s.palette_name = Some(pname.to_string());
     app.status = format!("sprite: {} repainted with palette '{}'", sheet, pname);
+}
+
+// ---------- Stage 31: scene + visualizer persistence ----------
+
+/// Render a palette entry back to hex, or `transparent` for the slot-0
+/// placeholder, so `:sprite palette` round-trips through the file.
+///
+/// Written **without** a leading `#`: in a `.vip` a `#` at the start of a
+/// token opens a comment, so `#102030` would be eaten by the line stripper
+/// and the palette would come back empty. `sprite::parse_hex` accepts bare
+/// hex, so this costs nothing.
+fn color_to_hex(c: Color) -> String {
+    match c {
+        Color::Rgb(0, 0, 0) => "transparent".to_string(),
+        Color::Rgb(r, g, b) => format!("{:02x}{:02x}{:02x}", r, g, b),
+        // Named colours cannot appear here: `:sprite palette` only accepts
+        // hex or `transparent`. Fall back to black rather than inventing RGB.
+        _ => "transparent".to_string(),
+    }
+}
+
+/// The `@scene`, `@sprite` and `@bind` lines describing the tracker's scene
+/// slots and visualizer, regenerated from live state.
+///
+/// Emitted in dependency order: palettes before the sheets that may name one,
+/// sheets before the placements that address them, placements before the
+/// bindings that modulate them. Written without the leading `@`, which
+/// [`vip::to_vip`] adds, and in exactly the grammar the matching `:` commands
+/// accept — so [`apply_extras`] can replay them through `execute_command`
+/// rather than growing a second parser that could drift.
+fn collect_extras(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for (slot, phrase) in app.scenes.iter().enumerate() {
+        if let Some(p) = phrase {
+            out.push(format!("scene {} phrase={:02X}", slot + 1, p));
+        }
+    }
+
+    // Palettes are a HashMap; sort so a save is byte-stable rather than
+    // reordering itself on every write.
+    let mut palettes: Vec<_> = app.sprite_palettes.iter().collect();
+    palettes.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, colors) in palettes {
+        let hex: Vec<String> = colors.iter().map(|c| color_to_hex(*c)).collect();
+        out.push(format!("sprite palette {} {}", name, hex.join(" ")));
+    }
+
+    let mut sheets: Vec<_> = app.sprite_sheets.values().collect();
+    sheets.sort_by(|a, b| a.name.cmp(&b.name));
+    for s in sheets {
+        out.push(format!(
+            "sprite load {} {}x{}{}",
+            s.source.display(),
+            s.cell_w,
+            s.cell_h,
+            if s.quantize { " q" } else { "" },
+        ));
+        if let Some(p) = &s.palette_name {
+            out.push(format!("sprite repalette {} {}", s.name, p));
+        }
+    }
+
+    for p in &app.sprite_placements {
+        out.push(format!("sprite place {} {} {} {}", p.sheet, p.idx, p.x, p.y));
+    }
+
+    for b in &app.bindings {
+        out.push(format!("bind {} {} = {}", b.addr(), b.target.name(), b.expr_src));
+    }
+    out
+}
+
+/// Rebuild scene slots and visualizer state from a loaded song's `extras`.
+/// Returns how many lines could not be restored.
+///
+/// Everything except `@scene` replays through `execute_command`, so the file
+/// grammar and the `:` grammar are the same thing by construction. Scenes go
+/// direct because `:scene N save` captures the *current* phrase rather than a
+/// named one, which is the wrong shape for a file.
+fn apply_extras(app: &mut App) -> usize {
+    let lines = app.song.extras.clone();
+    let is_place = |l: &str| l.starts_with("sprite place ");
+    let mut want = Counts::default();
+
+    // Pass 1: scenes, palettes, sheets, repalettes and bindings.
+    for line in lines.iter().filter(|l| !is_place(l)) {
+        want.count(line);
+        if let Some(rest) = line.strip_prefix("scene ") {
+            if !apply_scene_line(app, rest) {
+                want.scene_failed += 1;
+            }
+            continue;
+        }
+        // FORMAT.md's published example writes `@bind sprite mario.0 …` with
+        // an extra token the `:bind` command does not take. Accept it rather
+        // than making files copied from the doc fail: forgiving reader,
+        // strict writer.
+        let line = line
+            .strip_prefix("bind sprite ")
+            .map(|rest| format!("bind {}", rest))
+            .unwrap_or_else(|| line.clone());
+        execute_command(app, &line);
+    }
+
+    // `:sprite load` drops a placement at (0,0) as a convenience so a freshly
+    // loaded sheet is visible. A file already records every placement it
+    // wants, so discard those before replaying them — otherwise placements
+    // would breed on every save/load cycle.
+    app.sprite_placements.clear();
+
+    // Pass 2: the placements the file actually asked for.
+    for line in lines.iter().filter(|l| is_place(l)) {
+        want.count(line);
+        execute_command(app, line);
+    }
+
+    // Judge success by what actually landed, not by the status text: the
+    // command handlers report success and failure through the same prefix.
+    want.shortfall(app)
+}
+
+/// How many of each kind of line the file asked for.
+#[derive(Default)]
+struct Counts {
+    palettes: usize,
+    sheets: usize,
+    places: usize,
+    binds: usize,
+    scene_failed: usize,
+}
+
+impl Counts {
+    fn count(&mut self, line: &str) {
+        if line.starts_with("sprite palette ") {
+            self.palettes += 1;
+        } else if line.starts_with("sprite load ") {
+            self.sheets += 1;
+        } else if line.starts_with("sprite place ") {
+            self.places += 1;
+        } else if line.starts_with("bind ") {
+            self.binds += 1;
+        }
+    }
+
+    fn shortfall(&self, app: &App) -> usize {
+        let missing = |want: usize, got: usize| want.saturating_sub(got);
+        self.scene_failed
+            + missing(self.palettes, app.sprite_palettes.len())
+            + missing(self.sheets, app.sprite_sheets.len())
+            + missing(self.places, app.sprite_placements.len())
+            + missing(self.binds, app.bindings.len())
+    }
+}
+
+/// `scene N phrase=NN`. Returns false if the slot or phrase is out of range.
+fn apply_scene_line(app: &mut App, rest: &str) -> bool {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let phrase = parts
+        .iter()
+        .find_map(|t| t.strip_prefix("phrase="))
+        .and_then(|v| usize::from_str_radix(v, 16).ok());
+    match (parts.first().and_then(|n| n.parse::<usize>().ok()), phrase) {
+        (Some(slot), Some(p)) if (1..=9).contains(&slot) && p < app.song.phrases.len() => {
+            app.scenes[slot - 1] = Some(p);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Drop the previous song's scene slots and visualizer. These belong to the
+/// song now, so opening another one must not inherit them.
+fn clear_song_extras(app: &mut App) {
+    app.scenes = [None; 9];
+    app.queued_scene = None;
+    app.sprite_sheets.clear();
+    app.sprite_placements.clear();
+    app.sprite_palettes.clear();
+    app.bindings.clear();
+    app.effective_placements.clear();
 }
 
 // ---------- Stage 7: scene launching ----------
@@ -4761,6 +4956,10 @@ fn write_current(app: &mut App) -> bool {
 
 /// Returns `true` on a successful write. Sets `app.status` either way.
 fn write_to(app: &mut App, path: &Path) -> bool {
+    // Scene slots and the visualizer live on `App`, not in `Song`, so refresh
+    // the carried lines from live state before writing. Without this they save
+    // as whatever was loaded, and anything set up since is lost.
+    app.song.extras = collect_extras(app);
     match vip::save(&app.song, path) {
         Ok(()) => {
             app.current_file = Some(path.to_path_buf());
@@ -4802,6 +5001,9 @@ fn edit_file(app: &mut App, path: &Path) {
             app.nsf_cache = None;
             app.song = song;
             app.current_file = Some(path.to_path_buf());
+            // These belong to the song, so the previous one's must not linger.
+            clear_song_extras(app);
+            let unrestored = apply_extras(app);
             reload_bank(app);
             app.cursor_step = 0;
             app.cursor_ch = 0;
@@ -4824,6 +5026,15 @@ fn edit_file(app: &mut App, path: &Path) {
                     warnings[0],
                 )
             };
+            // A sprite whose PNG has moved should not swallow the song, but
+            // it must not be silent either — you would otherwise open a file
+            // and simply find your visualizer gone.
+            if unrestored > 0 {
+                app.status = format!(
+                    "{} — {} line(s) could not be restored",
+                    app.status, unrestored,
+                );
+            }
         }
         Err(e) => { app.status = format!("error: {}", e); }
     }
@@ -6274,4 +6485,183 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.help_scroll, 0);
     }
+
+    // ---------- Stage 31: round-trip losslessness ----------
+
+    /// Build a 4x4 two-colour PNG so sprite tests do not need a fixture file.
+    fn write_test_png(path: &std::path::Path) {
+        use std::io::Write;
+        // A 4x4 indexed image is easier to hand-roll as raw RGBA through the
+        // `image` crate than as PNG bytes.
+        let mut img = image::RgbaImage::new(4, 4);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = if (x + y) % 2 == 0 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([255, 0, 0, 255])
+            };
+        }
+        img.save(path).unwrap();
+        let _ = std::io::stdout().flush();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("viper_s31_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    #[test]
+    fn scenes_sprites_and_bindings_survive_a_save_and_reload() {
+        // The bug this stage exists to end: all of this used to be dropped on
+        // save, so an entire visualizer setup could not be persisted at all.
+        let png = scratch("sheet.png");
+        write_test_png(&png);
+        let song_path = scratch("round.vip");
+
+        let mut app = App::new();
+        app.show_splash = false;
+        app.song.phrases.push(Phrase::default());
+        app.scenes[0] = Some(0);
+        app.scenes[4] = Some(1);
+        execute_command(&mut app, &format!("sprite palette dusk #102030 #405060 #708090 transparent"));
+        execute_command(&mut app, &format!("sprite load {} 4x4", png.display()));
+        execute_command(&mut app, "sprite repalette sheet dusk");
+        execute_command(&mut app, "sprite place sheet 0 3 5");
+        execute_command(&mut app, "bind sheet.0 scale = tri.env * 0.5 + 1.0");
+        assert_eq!(app.sprite_sheets.len(), 1, "sheet loaded: {}", app.status);
+        assert_eq!(app.bindings.len(), 1, "binding parsed: {}", app.status);
+
+        assert!(write_to(&mut app, &song_path), "{}", app.status);
+        let text = std::fs::read_to_string(&song_path).unwrap();
+        for want in ["@scene 1 phrase=00", "@scene 5 phrase=01", "@sprite palette dusk 102030",
+                     "@sprite load", "@sprite repalette sheet dusk", "@sprite place sheet 0 3 5",
+                     "@bind sheet.0 scale = tri.env * 0.5 + 1.0"] {
+            assert!(text.contains(want), "missing {:?} in:\n{}", want, text);
+        }
+
+        // Reload into a fresh app and compare the live state, not just the text.
+        let mut fresh = App::new();
+        fresh.show_splash = false;
+        edit_file(&mut fresh, &song_path);
+        assert_eq!(fresh.scenes[0], Some(0));
+        assert_eq!(fresh.scenes[4], Some(1));
+        assert_eq!(fresh.sprite_palettes.len(), 1);
+        assert_eq!(fresh.sprite_sheets.len(), 1);
+        assert_eq!(fresh.sprite_sheets["sheet"].palette_name.as_deref(), Some("dusk"));
+        // Two placements: `:sprite load` drops one at (0,0) so a fresh sheet
+        // is visible, and the test placed a second explicitly.
+        assert_eq!(fresh.sprite_placements.len(), 2);
+        assert!(fresh.sprite_placements.iter().any(|p| (p.x, p.y) == (3, 5)));
+        assert_eq!(fresh.bindings.len(), 1);
+        assert_eq!(fresh.bindings[0].expr_src, "tri.env * 0.5 + 1.0");
+
+        // And a second save is byte-identical, so the round trip is stable.
+        let again = scratch("round2.vip");
+        assert!(write_to(&mut fresh, &again));
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), text);
+    }
+
+    #[test]
+    fn a_quantized_sheet_reloads_because_the_flag_is_remembered() {
+        // Without recording `quantize`, reloading fails: the PNG still has more
+        // opaque colours than a sheet allows.
+        let png = scratch("many.png");
+        let mut img = image::RgbaImage::new(4, 4);
+        let colors = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]];
+        for (i, px) in img.pixels_mut().enumerate() {
+            let c = colors[i % colors.len()];
+            *px = image::Rgba([c[0], c[1], c[2], 255]);
+        }
+        img.save(&png).unwrap();
+
+        let mut app = App::new();
+        app.show_splash = false;
+        execute_command(&mut app, &format!("sprite load {} 4x4 q", png.display()));
+        assert_eq!(app.sprite_sheets.len(), 1, "{}", app.status);
+        assert!(app.sprite_sheets["many"].quantize);
+        let line = collect_extras(&app).into_iter().find(|l| l.starts_with("sprite load")).unwrap();
+        assert!(line.ends_with(" q"), "the quantize flag is written back: {:?}", line);
+
+        let path = scratch("quant.vip");
+        assert!(write_to(&mut app, &path));
+        let mut fresh = App::new();
+        fresh.show_splash = false;
+        edit_file(&mut fresh, &path);
+        assert_eq!(fresh.sprite_sheets.len(), 1, "reloaded: {}", fresh.status);
+    }
+
+    #[test]
+    fn opening_another_song_does_not_inherit_the_last_one() {
+        let png = scratch("inherit.png");
+        write_test_png(&png);
+        let a = scratch("a.vip");
+        let b = scratch("b.vip");
+
+        let mut app = App::new();
+        app.show_splash = false;
+        app.scenes[2] = Some(0);
+        execute_command(&mut app, &format!("sprite load {} 4x4", png.display()));
+        execute_command(&mut app, "sprite place inherit 0 1 1");
+        execute_command(&mut app, "bind inherit.0 y = 4");
+        assert!(write_to(&mut app, &a));
+
+        let mut plain = App::new();
+        plain.show_splash = false;
+        assert!(write_to(&mut plain, &b), "{}", plain.status);
+
+        // Load the decorated song, then a plain one: nothing may carry over.
+        edit_file(&mut app, &a);
+        assert!(!app.sprite_sheets.is_empty() && app.scenes[2].is_some());
+        edit_file(&mut app, &b);
+        assert!(app.sprite_sheets.is_empty(), "sheets carried over");
+        assert!(app.sprite_placements.is_empty(), "placements carried over");
+        assert!(app.sprite_palettes.is_empty(), "palettes carried over");
+        assert!(app.bindings.is_empty(), "bindings carried over");
+        assert_eq!(app.scenes, [None; 9], "scene slots carried over");
+    }
+
+    #[test]
+    fn a_missing_sprite_file_warns_rather_than_refusing_the_song() {
+        let path = scratch("missing.vip");
+        std::fs::write(&path, "@song  bpm=120\n@sprite load /nonexistent/nope.png 8x8\n@phrase 00\n").unwrap();
+        let mut app = App::new();
+        app.show_splash = false;
+        edit_file(&mut app, &path);
+        assert_eq!(app.song.bpm, 120, "the song still loads: {}", app.status);
+        assert!(app.sprite_sheets.is_empty());
+        assert!(app.status.contains("could not be restored"), "and says so: {}", app.status);
+    }
+
+    #[test]
+    fn the_documented_bind_form_still_parses() {
+        // FORMAT.md's canonical example writes `@bind sprite mario.0 …`; a file
+        // copied from the docs must not warn.
+        let png = scratch("doc.png");
+        write_test_png(&png);
+        let path = scratch("doc.vip");
+        std::fs::write(&path, format!(
+            "@song  bpm=120\n@sprite load {} 4x4\n@sprite place doc 0 0 0\n@bind sprite doc.0 scale = tri.env * 0.5 + 1.0\n@phrase 00\n",
+            png.display())).unwrap();
+        let mut app = App::new();
+        app.show_splash = false;
+        edit_file(&mut app, &path);
+        assert_eq!(app.bindings.len(), 1, "legacy bind form accepted: {}", app.status);
+        assert!(!app.status.contains("could not be restored"), "{}", app.status);
+    }
+
+    #[test]
+    fn carried_directives_survive_a_song_only_round_trip() {
+        // `viper fmt` and `viper check` go through Song alone, with no App, so
+        // the lines must survive there too or the CLI would strip them.
+        let text = "@song  bpm=120\n@scene 1 phrase=00\n@bind a.0 y = 4\n@phrase 00\n";
+        let (song, warns) = vip::from_vip(text).unwrap();
+        assert!(warns.is_empty(), "no more 'reserved but not implemented': {:?}", warns);
+        assert_eq!(song.extras, vec!["scene 1 phrase=00".to_string(), "bind a.0 y = 4".to_string()]);
+        let out = vip::to_vip(&song);
+        assert!(out.contains("@scene 1 phrase=00") && out.contains("@bind a.0 y = 4"), "{}", out);
+        let (again, _) = vip::from_vip(&out).unwrap();
+        assert_eq!(again.extras, song.extras);
+    }
+
 }
