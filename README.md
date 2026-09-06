@@ -56,11 +56,17 @@ sound driver. `viper compile` links your song's data against one you supply as
 a `driver.bin` plus a `driver.sym` symbol map.
 
 A working driver ships in this repo at `tests/fixtures/driver.bin`, so the
-`viper compile` line above runs as written. It is ABI v1: 1613 bytes, strict
+`viper compile` line above runs as written. It is ABI v3: 1685 bytes, strict
 2A03 (no expansion audio), 16 rows per pattern, and it implements every effect
 the IR emits — note, off, volume, duty, instrument, retrigger, portamento,
 vibrato, arpeggio and envelope reset. That is enough for the whole toolchain,
 including `viper render` and `viper verify`.
+
+viper links against ABI v1 through v3, picking the header layout from the
+driver's own declared version, so an older driver keeps working. A second
+fixture, `driver-fceux.bin`, is the exact v1 build that FCEUX played when the
+comparison log in `tests/golden/` was captured; it is pinned there so that
+receipt stays evidence about the driver it actually ran.
 
 Its source, and the ABI it implements, live in
 [nintendo-metal](https://github.com/sadovsky/nintendo-metal) under `driver/`.
@@ -211,7 +217,7 @@ mouse-driven DAWs never quite do.
 
 ## Status
 
-**Stages 1–31 are shipped.** The tracker, the NSF pipeline and the generation
+**Stages 1–34 are shipped.** The tracker, the NSF pipeline and the generation
 layer are all complete against the roadmap in
 [`docs/STAGES.md`](docs/STAGES.md).
 
@@ -241,8 +247,14 @@ to encode DPCM samples with a trellis encoder that returns the DAC to its start
 level; `viper import` to turn a MIDI file into a `.vip`; and `viper gen` to
 compose whole songs from a style directory.
 
-Next up: real VRC6 expansion audio. Today `expansion=vrc6` sets a header bit
-and emits no VRC6 data, which is a file that lies about itself.
+**Rendering VRC6.** `viper render` and `viper verify` drive a real VRC6 core —
+two pulses and the sawtooth — so any existing VRC6 NSF renders deterministically
+to a mix, per-channel stems and a register log. The header can no longer claim a
+chip the driver does not drive. *Authoring* for VRC6 is a separate job: the
+channel count is baked into the wire format, so it needs a driver that
+implements the extra channels.
+
+Next up: `viper rip`, turning an NSF back into an editable `.vip`.
 
 ## Contributing
 

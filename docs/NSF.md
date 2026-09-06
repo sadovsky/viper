@@ -77,7 +77,8 @@ extended with VRC6 `VP1 VP2 SAW` rows, and that the emitter never
 special-cases expansion. Both were false, and not merely unimplemented:
 the order-entry stride and the driver's zero-page channel arrays are
 sized by the channel count, so expansion audio is an ABI change, not a
-flag. Authoring VRC6 needs an ABI v2 and a driver that implements it.
+flag. Authoring VRC6 needs a driver that implements the extra channels; the
+ABI is at v3 and none of its versions carry them.
 
 What *is* true as of Stage 33: viper can **render** VRC6, and the
 expansion byte can no longer lie. See below.

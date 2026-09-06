@@ -278,6 +278,27 @@ lives in viper.
   a set and PLAY frames exactly, and exits 1 at the first divergence. See
   `NSF.md` § Verification.
 
+- **Stage 35** ✅ — **A driver ABI range, so a receipt stays evidence.**
+  viper linked against exactly one ABI version, so the moment the driver
+  moved, the Stage 24 FCEUX capture could no longer be reproduced and the
+  only way to keep the test green was to rewrite the evidence. The emitter
+  now speaks v1 through v3, choosing the header layout from the driver's
+  own declared version and refusing only what a given driver cannot do: an
+  order list past 255 entries on v1 or v2, a mid-song tempo change on v1.
+
+  The FCEUX comparison is pinned to `tests/fixtures/driver-fceux.bin`, the
+  exact 1613-byte v1 build that was captured. Re-linking a receipt against
+  a newer driver would silently rewrite what it is evidence about; when the
+  driver changes its register writes, recapture and replace the fixture and
+  the log together.
+
+  The vendored `driver.bin` moves to 1685 bytes, picking up the downstream
+  fix where a held note no longer walks into its release segment. That is
+  why the golden log changed: 159 lines differ and every one is a `$4000`
+  or `$4004` volume write. A held note read `10 9 7 4 7 4 2 0` — the
+  release ran, then ran again — and now reads `10 9 9 9 7 4 2 0`. No
+  note, period or timing moved.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first
@@ -492,7 +513,7 @@ lives in viper.
 
   **Authoring VRC6 is not built** and is not a small follow-up: the channel
   count is baked into the wire format (the order-entry stride and the
-  driver's zero-page arrays), so it needs an ABI v2 and a driver that
+  driver's zero-page arrays), so it needs a new ABI and a driver that
   implements it. `docs/NSF.md` claimed channels were "a table, not an enum"
   and that the emitter never special-cased expansion; both were false and
   are now corrected there.

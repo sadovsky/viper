@@ -1,4 +1,4 @@
-//! End-to-end: compile the bundled stress song against a vendored ABI v1
+//! End-to-end: compile the bundled stress song against a vendored ABI v3
 //! driver (tests/fixtures, built from nintendo-metal/driver), render it
 //! through viper-apu, and check the things that would break silently:
 //! the NSF header, the exact loop length, deterministic output, and the

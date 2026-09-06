@@ -6,7 +6,7 @@
 //! events into the driver's bytecode and lay out the NSF image.
 //!
 //! viper does not own the driver. [`Driver::load`] reads a position-fixed
-//! binary plus its ld65 symbol map (ABI v1, see nintendo-metal/driver/ABI.md)
+//! binary plus its ld65 symbol map (ABI v1-v3, see nintendo-metal/driver/ABI.md)
 //! and the emitter appends song data at `song_table`.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,7 +37,7 @@ pub struct Driver {
     pub abi: u32,
     /// NSF expansion-chip bits this driver actually drives, from the optional
     /// `DRIVER_EXPANSION` symbol. Absent means 0 — a strict 2A03 driver, which
-    /// is what every ABI v1 driver is.
+    /// is what every driver so far is.
     ///
     /// This exists so an NSF cannot claim a chip nothing writes to. The header
     /// describes what the *file's code does*, so it is written from here
@@ -75,7 +75,7 @@ impl Driver {
         let play = get("driver_play")? as u16;
         let song_table = get("song_table")? as u16;
         // The blob is position-fixed; its load address is where init lives
-        // rounded down to the start of the image — for ABI v1 that is $8000.
+        // rounded down to the start of the image — so far that is $8000.
         // Optional: a driver that says nothing drives nothing but the 2A03.
         let expansion = symbols.get("DRIVER_EXPANSION").copied().unwrap_or(0) as u8;
         let load = 0x8000u16;
