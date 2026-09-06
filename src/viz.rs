@@ -19,6 +19,79 @@ use crate::audio::VizFrame;
 use crate::sprite::{SpriteSheet, PALETTE_SIZE};
 use crate::CHANNELS;
 
+/// A pixel canvas at twice the terminal's vertical resolution: two pixel
+/// rows pack into one cell as `▀` (top only), `▄` (bottom only), `█` (both
+/// the same colour) or a `▀` with a background (both, different colours).
+///
+/// Every renderer in this module hand-rolled that same collapse loop. The
+/// instrument panel's ADSR curve needed a sixth copy, so it lives here once
+/// instead. Existing renderers can migrate onto it as they are touched;
+/// there is no need to churn them all at once.
+pub(crate) struct HalfBlock {
+    cols: usize,
+    /// Height in pixels — twice the terminal rows.
+    px_rows: usize,
+    px: Vec<Option<Color>>,
+}
+
+impl HalfBlock {
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        let (cols, px_rows) = (cols as usize, rows as usize * 2);
+        Self { cols, px_rows, px: vec![None; cols * px_rows] }
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.cols
+    }
+
+    /// Height in pixels, not terminal rows.
+    pub(crate) fn height(&self) -> usize {
+        self.px_rows
+    }
+
+    /// Paint one pixel. Out-of-range coordinates are dropped, so callers
+    /// can plot a curve without clamping every point themselves.
+    pub(crate) fn set(&mut self, x: i32, y: i32, color: Color) {
+        if x < 0 || y < 0 || x as usize >= self.cols || y as usize >= self.px_rows {
+            return;
+        }
+        let i = y as usize * self.cols + x as usize;
+        self.px[i] = Some(color);
+    }
+
+    /// Draw a vertical run between two pixel rows inclusive — the workhorse
+    /// for curves, which are sampled per column and joined vertically so
+    /// they read as a line rather than a dotted scatter.
+    pub(crate) fn column(&mut self, x: i32, y0: i32, y1: i32, color: Color) {
+        let (lo, hi) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+        for y in lo..=hi {
+            self.set(x, y, color);
+        }
+    }
+
+    /// Collapse the pixel buffer into terminal lines.
+    pub(crate) fn lines(&self) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(self.px_rows / 2);
+        for r in 0..self.px_rows / 2 {
+            let mut spans = Vec::with_capacity(self.cols);
+            for x in 0..self.cols {
+                let top = self.px[(r * 2) * self.cols + x];
+                let bot = self.px[(r * 2 + 1) * self.cols + x];
+                let (glyph, style) = match (top, bot) {
+                    (Some(a), Some(b)) if a == b => ("█", Style::default().fg(a)),
+                    (Some(a), Some(b)) => ("▀", Style::default().fg(a).bg(b)),
+                    (Some(a), None) => ("▀", Style::default().fg(a)),
+                    (None, Some(b)) => ("▄", Style::default().fg(b)),
+                    (None, None) => (" ", Style::default()),
+                };
+                spans.push(Span::styled(glyph, style));
+            }
+            out.push(Line::from(spans));
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VizKind {
     Bars,
@@ -26,6 +99,9 @@ pub(crate) enum VizKind {
     Grid,
     Orbit,
     Sprites,
+    /// DESIGN.md's register panel: a mini rendering of what is in the yank
+    /// register, so you can see the shape you are about to paste.
+    Register,
 }
 
 impl VizKind {
@@ -36,6 +112,7 @@ impl VizKind {
             VizKind::Grid => "grid",
             VizKind::Orbit => "orbit",
             VizKind::Sprites => "sprites",
+            VizKind::Register => "register",
         }
     }
 
@@ -46,6 +123,7 @@ impl VizKind {
             "grid" => Some(VizKind::Grid),
             "orbit" => Some(VizKind::Orbit),
             "sprites" | "sprite" => Some(VizKind::Sprites),
+            "register" | "reg" => Some(VizKind::Register),
             _ => None,
         }
     }
@@ -60,6 +138,11 @@ pub(crate) struct VizCtx<'a> {
     pub placements: &'a [crate::modulation::EffectivePlacement],
     pub palettes: &'a HashMap<String, [Color; PALETTE_SIZE]>,
     pub bg: Color,
+    /// The unnamed yank register, for [`VizKind::Register`].
+    pub register: &'a crate::Register,
+    /// Foreground for register notes; the pane has no Theme of its own.
+    pub fg: Color,
+    pub dim: Color,
 }
 
 /// Per-channel palette. NES-ish: green pulse, amber pulse, violet triangle,
@@ -105,7 +188,54 @@ pub(crate) fn render(f: &mut Frame, area: Rect, kind: VizKind, ctx: &VizCtx) {
         VizKind::Grid => render_grid(f, inner, ctx.frame),
         VizKind::Orbit => render_orbit(f, inner, ctx.frame),
         VizKind::Sprites => render_sprites(f, inner, ctx),
+        VizKind::Register => render_register(f, inner, ctx),
     }
+}
+
+// ---------- Register ----------
+
+/// A thumbnail of the yank register: one glyph per cell, so you read the
+/// *shape* of what you are about to paste rather than its contents.
+///
+/// DESIGN.md describes "a grid of yanked phrases"; viper has exactly one
+/// unnamed register (there is no `"x` prefix anywhere in the input layer),
+/// so this shows that one. Named registers would be a separate feature.
+fn render_register(f: &mut Frame, area: Rect, ctx: &VizCtx) {
+    let reg = ctx.register;
+    if reg.rows.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::from(Span::styled("  register empty", Style::default().fg(ctx.dim))),
+            Line::from(Span::styled("  y{motion} to fill it", Style::default().fg(ctx.dim))),
+        ]);
+        f.render_widget(empty, area);
+        return;
+    }
+    let width = reg.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("  {} row(s) × {} ch{}", reg.rows.len(), width,
+            if reg.is_full_row() { ", full-width" } else { "" }),
+        Style::default().fg(ctx.dim),
+    ))];
+    for (i, row) in reg.rows.iter().enumerate().take(area.height.saturating_sub(2) as usize) {
+        let mut spans = vec![Span::styled(format!(" {:02X} ", i), Style::default().fg(ctx.dim))];
+        for cell in row {
+            // A filled cell shows its note letter, so a melodic shape and a
+            // drum pattern look different at a glance; empty stays faint.
+            let (glyph, style) = match cell.note {
+                Some(n) => (
+                    crate::note_name(Some(n)).chars().next().unwrap_or('?'),
+                    Style::default().fg(ctx.fg),
+                ),
+                None => ('·', Style::default().fg(ctx.dim)),
+            };
+            spans.push(Span::styled(format!("{} ", glyph), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    if reg.rows.len() > area.height.saturating_sub(2) as usize {
+        lines.push(Line::from(Span::styled("  …", Style::default().fg(ctx.dim))));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 // ---------- Bars ----------

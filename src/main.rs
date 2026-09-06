@@ -1874,7 +1874,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         row(":driver BIN SYM",  "set the NSF driver (paths relative to the .vip)"),
         row(":compile PATH",    "compile the song to an NSF against the @driver"),
         row(":unmute [N|off]",  "unmute specific / all channels"),
-        row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites)"),
+        row(":viz [kind]",      "toggle viz pane (bars / scope / grid / orbit / sprites / register)"),
         row(":sprite load P WxH [q]", "load PNG sheet (≤3 opaque colors, or 'q' to quantize)"),
         row(":sprite place N I x y", "place sheet N's tile I at viz pixel (x,y)"),
         row(":sprite palette N c0 c1 c2 c3", "define named palette (hex or 'transparent')"),
@@ -2064,16 +2064,153 @@ fn render_instrument(f: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  j/k select · h/l or -/+ adjust · [ ] prev/next instr · Esc back",
-        Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC),
-    )));
-
     let block = Block::default()
         .title(format!(" INSTRUMENT EDITOR  (current: {:02X}) ", idx))
         .borders(Borders::ALL);
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // The hint spans the full width along the bottom; splitting it into the
+    // parameter column would clip it mid-sentence.
+    let (body, hint_area) = if inner.height > 2 {
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        (v[0], Some(v[1]))
+    } else {
+        (inner, None)
+    };
+
+    // The parameter list keeps the left; the graphs take whatever is left
+    // over. Below ~54 columns there is no room for a legible curve, so the
+    // list simply gets the whole pane — the editor still works, it just
+    // stops drawing pictures.
+    let (list_area, graph_area) = if body.width >= 54 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(32), Constraint::Min(20)])
+            .split(body);
+        (split[0], Some(split[1]))
+    } else {
+        (body, None)
+    };
+    f.render_widget(Paragraph::new(lines), list_area);
+    if let Some(h) = hint_area {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  j/k select · h/l or -/+ adjust · [ ] prev/next instr · Esc back",
+                Style::default().fg(theme.hint).add_modifier(Modifier::ITALIC),
+            ))),
+            h,
+        );
+    }
+
+    if let Some(g) = graph_area {
+        render_instrument_graphs(f, g, app, inst);
+    }
+}
+
+/// The ADSR envelope and the waveform it shapes, drawn in half-blocks.
+///
+/// The segment belonging to the selected parameter is drawn in the accent
+/// colour, so `h`/`l` on `attack` visibly moves that ramp. That connection
+/// is real; a "the envelope lights up as a note plays" animation is not,
+/// because an instrument is not bound to a channel anywhere in the model,
+/// so there is no honest way to know which voice is sounding this one.
+fn render_instrument_graphs(f: &mut Frame, area: Rect, app: &App, inst: Instrument) {
+    let theme = &app.theme;
+    if area.height < 6 || area.width < 12 {
+        return;
+    }
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1), Constraint::Min(2)])
+        .split(area);
+
+    let label = |t: &str| Line::from(Span::styled(t.to_string(), Style::default().fg(theme.instr_label)));
+    f.render_widget(Paragraph::new(label(" envelope")), split[0]);
+    f.render_widget(Paragraph::new(label(" waveform")), split[2]);
+
+    // ---- envelope ----
+    let mut c = viz::HalfBlock::new(split[1].width, split[1].height);
+    let (w, h) = (c.width() as i32, c.height() as i32);
+    if w > 4 && h > 1 {
+        // Time is shared out proportionally between the three timed stages,
+        // with a quarter of the width reserved for the sustain hold so a
+        // held note is visible even when the ramps are long.
+        let hold = (w / 4).max(1);
+        let avail = (w - hold).max(1);
+        let (ta, td, tr) = (inst.attack_ms as f32, inst.decay_ms as f32, inst.release_ms as f32);
+        let sum = (ta + td + tr).max(1.0);
+        let ca = (avail as f32 * ta / sum).round() as i32;
+        let cd = (avail as f32 * td / sum).round() as i32;
+        let cr = (avail - ca - cd).max(0);
+        let peak = inst.volume.clamp(0.0, 1.0);
+        let sus = (inst.sustain.clamp(0.0, 1.0) * peak).clamp(0.0, 1.0);
+        // Envelope amplitude → pixel row, with 0 at the bottom.
+        let y_of = |a: f32| ((1.0 - a) * (h - 1) as f32).round() as i32;
+
+        let seg_color = |seg: usize| {
+            if seg == app.instr_param { theme.accent } else { theme.instr_value }
+        };
+        let mut x = 0;
+        let mut prev = y_of(0.0);
+        // Four segments, indexed to match INSTR_PARAM_NAMES: 0 attack,
+        // 1 decay, 2 sustain, 3 release.
+        let stages: [(i32, f32, f32, usize); 4] = [
+            (ca, 0.0, peak, 0),
+            (cd, peak, sus, 1),
+            (hold, sus, sus, 2),
+            (cr, sus, 0.0, 3),
+        ];
+        for (cols, from, to, seg) in stages {
+            let color = seg_color(seg);
+            for i in 0..cols {
+                let t = if cols <= 1 { 1.0 } else { i as f32 / (cols - 1) as f32 };
+                let y = y_of(from + (to - from) * t);
+                // Join to the previous sample so the curve reads as a line
+                // rather than a dotted scatter on steep ramps.
+                c.column(x, prev, y, color);
+                prev = y;
+                x += 1;
+            }
+            if cols == 0 {
+                // A zero-length stage is a vertical jump, which is exactly
+                // what a 0 ms attack sounds like.
+                let y = y_of(to);
+                c.column(x, prev, y, color);
+                prev = y;
+            }
+        }
+        f.render_widget(Paragraph::new(c.lines()), split[1]);
+    }
+
+    // ---- waveform ----
+    let mut c = viz::HalfBlock::new(split[3].width, split[3].height);
+    let (w, h) = (c.width() as i32, c.height() as i32);
+    if w > 3 && h > 1 {
+        let duty = inst.duty.clamp(0.05, 0.95);
+        let amp = inst.volume.clamp(0.0, 1.0);
+        let cycles = 2;
+        let period = (w as f32 / cycles as f32).max(2.0);
+        let hi = ((0.5 - 0.5 * amp) * (h - 1) as f32).round() as i32;
+        let lo = ((0.5 + 0.5 * amp) * (h - 1) as f32).round() as i32;
+        let color = if app.instr_param == 4 || app.instr_param == 5 { theme.accent } else { theme.instr_value };
+        let mut prev: Option<i32> = None;
+        for x in 0..w {
+            let phase = (x as f32 % period) / period;
+            let y = if phase < duty { hi } else { lo };
+            // Draw the vertical edge where the level flips, so a square
+            // wave looks square instead of two dashed lines.
+            match prev {
+                Some(p) if p != y => c.column(x, p, y, color),
+                _ => c.set(x, y, color),
+            }
+            prev = Some(y);
+        }
+        f.render_widget(Paragraph::new(c.lines()), split[3]);
+    }
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
@@ -2136,8 +2273,24 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         let target = app.scenes[slot].map_or("??".into(), |p| format!("{:02X}", p));
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
-            format!(" ▸ {} → {} ({}) ", slot + 1, target, wait),
+            format!(" ▸ {} → {} ", slot + 1, target),
             Style::default().bg(theme.accent).fg(theme.mode_fg).add_modifier(Modifier::BOLD),
+        ));
+        // DESIGN.md's queue-drain: the countdown as a bar that empties, so
+        // the commit point is something you watch arrive rather than a
+        // number you have to read. The remaining fraction comes off the
+        // sub-step phase as well as the step count, so it drains smoothly
+        // instead of in four jerks.
+        const DRAIN_W: usize = 8;
+        let frac = drain_fraction(wait, app.viz_frame.step_phase);
+        let full = (frac * DRAIN_W as f32).round() as usize;
+        left_spans.push(Span::styled(
+            "█".repeat(full),
+            Style::default().fg(theme.accent),
+        ));
+        left_spans.push(Span::styled(
+            "░".repeat(DRAIN_W - full),
+            Style::default().fg(theme.dim),
         ));
     }
     left_spans.push(Span::raw("  "));
@@ -2219,6 +2372,9 @@ fn ui(f: &mut Frame, app: &App) {
             placements: &app.effective_placements,
             palettes: &app.sprite_palettes,
             bg: app.theme.viz_bg,
+            register: &app.register,
+            fg: app.theme.note,
+            dim: app.theme.dim,
         };
         viz::render(f, area, app.viz_kind, &ctx);
     }
@@ -3901,6 +4057,13 @@ fn queue_or_launch_scene(app: &mut App, slot: usize) {
     );
 }
 
+/// How much of the wait before a queued scene commits is still ahead, 1.0
+/// down to 0.0. Counts the sub-step phase as well as whole steps so the
+/// drain bar empties smoothly rather than in four jerks.
+fn drain_fraction(wait: usize, step_phase: f32) -> f32 {
+    ((wait as f32 - step_phase.clamp(0.0, 1.0)) / 4.0).clamp(0.0, 1.0)
+}
+
 /// Count of steps between `step` and the next bar boundary (step % 4 == 0).
 /// Used for the countdown in the status line. A step that IS a bar boundary
 /// returns 4, not 0 — "0 steps to launch" would lie.
@@ -4977,6 +5140,60 @@ mod tests {
         }
     }
 
+
+    // ---------- Stage 28: the panels ----------
+
+    #[test]
+    fn half_block_packs_two_pixel_rows_into_one_cell() {
+        let mut c = viz::HalfBlock::new(4, 1);
+        assert_eq!((c.width(), c.height()), (4, 2));
+        c.set(0, 0, Color::Red);                 // top only
+        c.set(1, 1, Color::Red);                 // bottom only
+        c.set(2, 0, Color::Red);
+        c.set(2, 1, Color::Red);                 // both, same colour
+        c.set(3, 0, Color::Red);
+        c.set(3, 1, Color::Blue);                // both, different
+        let lines = c.lines();
+        assert_eq!(lines.len(), 1);
+        let glyphs: Vec<String> = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(glyphs, vec!["▀", "▄", "█", "▀"]);
+        assert_eq!(lines[0].spans[3].style.bg, Some(Color::Blue));
+        // Out-of-range writes are dropped rather than panicking, so callers
+        // can plot a curve without clamping every point.
+        c.set(-1, 0, Color::Red);
+        c.set(0, 99, Color::Red);
+        c.set(99, 0, Color::Red);
+    }
+
+    #[test]
+    fn half_block_column_joins_a_vertical_run() {
+        let mut c = viz::HalfBlock::new(1, 2);
+        c.column(0, 3, 0, Color::Red); // reversed ends still fill
+        let glyphs: Vec<String> = c.lines().iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        assert_eq!(glyphs, vec!["█", "█"]);
+    }
+
+    #[test]
+    fn the_instrument_panel_draws_a_curve_and_survives_any_size() {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.mode = Mode::Instrument;
+        // Wide enough for graphs: the envelope should put ink on screen.
+        let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        t.draw(|f| render_instrument(f, f.area(), &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let ink = (0..buf.area().width)
+            .flat_map(|x| (0..buf.area().height).map(move |y| (x, y)))
+            .filter(|&(x, y)| matches!(buf.cell((x, y)).map(|c| c.symbol()), Some("█") | Some("▀") | Some("▄")))
+            .count();
+        assert!(ink > 20, "the envelope and waveform should draw, got {} cells", ink);
+        // Narrow and tiny panes must not panic, and must still show the list.
+        for (w, h) in [(40u16, 16u16), (80, 6), (20, 4), (8, 3), (4, 2)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| render_instrument(f, f.area(), &app)).unwrap();
+        }
+    }
+
     #[test]
     fn a_seeded_generator_previews_and_commits_the_same_notes() {
         // The randomised path is where a stray seed bump would show up.
@@ -5151,4 +5368,75 @@ mod tests {
         assert_eq!(bg, app.theme.cursor_bg, "the mark tint must not cover the cursor");
     }
 
+
+    #[test]
+    fn the_selected_parameter_highlights_its_own_envelope_segment() {
+        // Editing `attack` should visibly mark the attack ramp — that link
+        // is the honest version of "the envelope lights up".
+        let mut app = App::new();
+        app.show_splash = false;
+        app.mode = Mode::Instrument;
+        let accent_cells = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            t.draw(|f| render_instrument(f, f.area(), app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area().width)
+                .flat_map(|x| (0..buf.area().height).map(move |y| (x, y)))
+                .filter(|&(x, y)| {
+                    let c = buf.cell((x, y)).unwrap();
+                    x >= 32 && c.fg == app.theme.accent && matches!(c.symbol(), "█" | "▀" | "▄")
+                })
+                .count()
+        };
+        app.instr_param = 3; // release — the longest stage by default
+        let release = accent_cells(&app);
+        app.instr_param = 0; // attack — 2 ms, so a much shorter ramp
+        let attack = accent_cells(&app);
+        assert!(release > 0 && attack > 0, "both segments should be drawn");
+        assert!(release > attack, "release ({}) is far longer than attack ({})", release, attack);
+    }
+
+    #[test]
+    fn the_queue_drain_empties_smoothly_and_never_overflows() {
+        // Four steps out, full bar; on the boundary step with the phase run
+        // out, empty. Monotonic in between, and clamped at both ends.
+        assert_eq!(drain_fraction(4, 0.0), 1.0);
+        assert_eq!(drain_fraction(1, 1.0), 0.0);
+        assert!(drain_fraction(2, 0.5) < drain_fraction(2, 0.0));
+        assert!(drain_fraction(1, 0.0) < drain_fraction(2, 0.0));
+        // Out-of-range phases from a stale frame must not escape 0..=1.
+        assert_eq!(drain_fraction(9, 0.0), 1.0);
+        assert_eq!(drain_fraction(0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn the_register_thumbnail_shows_shape_and_says_when_it_is_empty() {
+        let mut app = App::new();
+        app.show_splash = false;
+        app.viz_kind = viz::VizKind::Register;
+        let text = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(50, 12)).unwrap();
+            t.draw(|f| {
+                let ctx = viz::VizCtx {
+                    frame: &app.viz_frame, tick: 0, sheets: &app.sprite_sheets,
+                    placements: &app.effective_placements, palettes: &app.sprite_palettes,
+                    bg: app.theme.viz_bg, register: &app.register,
+                    fg: app.theme.note, dim: app.theme.dim,
+                };
+                viz::render(f, f.area(), viz::VizKind::Register, &ctx);
+            }).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area().height)
+                .map(|y| (0..buf.area().width).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>())
+                .collect::<Vec<_>>().join("\n")
+        };
+        assert!(text(&app).contains("register empty"), "an empty register says so");
+        // Yank two rows of the demo phrase and check the shape reads out.
+        app.cursor_step = 0;
+        app.yank_range(0..2, 0..CHANNELS);
+        let out = text(&app);
+        assert!(out.contains("2 row(s)"), "{}", out);
+        assert!(out.contains('·'), "empty cells render faint: {}", out);
+        assert!(out.contains('A'), "a note shows its letter: {}", out);
+    }
 }
