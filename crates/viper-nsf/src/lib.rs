@@ -31,6 +31,14 @@ pub struct Driver {
     pub play: u16,
     pub song_table: u16,
     pub abi: u32,
+    /// NSF expansion-chip bits this driver actually drives, from the optional
+    /// `DRIVER_EXPANSION` symbol. Absent means 0 — a strict 2A03 driver, which
+    /// is what every ABI v1 driver is.
+    ///
+    /// This exists so an NSF cannot claim a chip nothing writes to. The header
+    /// describes what the *file's code does*, so it is written from here
+    /// rather than from the song's request.
+    pub expansion: u8,
     pub symbols: HashMap<String, u32>,
 }
 
@@ -64,6 +72,8 @@ impl Driver {
         let song_table = get("song_table")? as u16;
         // The blob is position-fixed; its load address is where init lives
         // rounded down to the start of the image — for ABI v1 that is $8000.
+        // Optional: a driver that says nothing drives nothing but the 2A03.
+        let expansion = symbols.get("DRIVER_EXPANSION").copied().unwrap_or(0) as u8;
         let load = 0x8000u16;
         if (song_table as usize) < load as usize || song_table as usize - load as usize != bin.len() {
             bail!(
@@ -73,7 +83,7 @@ impl Driver {
                 load as usize + bin.len()
             );
         }
-        Ok(Self { bin, load, init, play, song_table, abi, symbols })
+        Ok(Self { bin, load, init, play, song_table, abi, expansion, symbols })
     }
 
     pub fn load(bin_path: &Path, sym_path: &Path) -> Result<Self> {

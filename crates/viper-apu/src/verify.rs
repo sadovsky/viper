@@ -64,7 +64,12 @@ fn parse_line(line: &str) -> Option<RegWrite> {
         let h = strip_hex_prefix(t);
         if h.len() == 4 {
             if let Ok(a) = u16::from_str_radix(h, 16) {
-                if (0x4000..=0x4017).contains(&a) {
+                // The 2A03 range plus the VRC6's ten exact addresses. Kept an
+                // exact set rather than the whole $9000-$BFFF window: this
+                // parser deliberately scans loose text for any 4-hex-digit
+                // token, and a wide range would start matching PC values and
+                // pointers in a foreign emulator's dump.
+                if (0x4000..=0x4017).contains(&a) || crate::vrc6::is_vrc6_reg(a) {
                     break a;
                 }
             }

@@ -7,6 +7,7 @@
 //! * [`render`] — offline rendering: full mix, per-channel stems, triggers
 //! * [`wav`], [`midi`] — tiny writers, no dependencies
 //! * [`verify`] — diff a register-write log against another emulator's
+//! * [`vrc6`] — the VRC6 expansion chip, summed externally to the 2A03
 
 pub mod apu;
 pub mod cpu;
@@ -15,6 +16,7 @@ pub mod midi;
 pub mod nsf;
 pub mod render;
 pub mod verify;
+pub mod vrc6;
 pub mod wav;
 
 pub use host::{Player, RegWrite, Trigger, TriggerKind};

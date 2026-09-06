@@ -71,10 +71,16 @@ Primitives, chosen for what fast minor-key music needs:
 | `loop` | count | pattern-local repeat |
 | `jump` | pattern index | song-order jump |
 
-Channels are a table, not an enum. The 2A03 set is `PU1 PU2 TRI NOI
-DPCM`; an `expansion` flag on the channel table adds VRC6 `VP1 VP2 SAW`
-as more rows. The emitter never special-cases expansion beyond the
-header bits and the driver build variant it links against.
+Channels are an enum of exactly the 2A03 five: `PU1 PU2 TRI NOI DPCM`.
+This section used to claim they were a table that an expansion flag
+extended with VRC6 `VP1 VP2 SAW` rows, and that the emitter never
+special-cases expansion. Both were false, and not merely unimplemented:
+the order-entry stride and the driver's zero-page channel arrays are
+sized by the channel count, so expansion audio is an ABI change, not a
+flag. Authoring VRC6 needs an ABI v2 and a driver that implements it.
+
+What *is* true as of Stage 33: viper can **render** VRC6, and the
+expansion byte can no longer lie. See below.
 
 ## Emitter and driver linkage (Stage 18)
 
@@ -130,6 +136,14 @@ Playback in the TUI:
    from APU-side state (channel enable, period, volume) so the
    visualizer keeps working unchanged.
 
+**What a log diff does and does not prove.** It validates the CPU, the
+memory map, the bankswitching and the frame clock — the half of the
+system that decides *which registers get written when*. It says nothing
+about the sound cores, because no APU or VRC6 register is readable, so
+nothing a core computes can ever feed back into the log. Two emulators
+with wildly different mixers produce identical logs. Validating a core
+needs audio comparison, not a log diff.
+
 **Register-write log.** Every render emits `(frame, addr, value)`
 triples as `frame addr value` text lines (decimal frame, hex address and
 value; INIT's writes are frame 0). A verifier normalizes another
@@ -177,6 +191,32 @@ viper gen --style <dir> --seed N [-o songs/]
 
 is deterministic per seed and style version; the output `.vip` records
 both in `@meta` so a track can always be regenerated.
+
+## Expansion audio (Stage 33)
+
+`viper-apu` implements the VRC6 — two pulses and a sawtooth — so viper
+renders any VRC6 NSF deterministically: full mix, per-channel stems
+(`vp1`, `vp2`, `saw`), register log, `viper verify`. The chip is a
+sibling of the 2A03, not a member of it, because that is the hardware:
+it sits on the cartridge with its own linear DAC and is summed onto the
+audio pin externally, bypassing the 2A03's non-linear tables.
+
+Interception of `$9000-$9003`, `$A000-$A002` and `$B000-$B002` is gated
+on the NSF header's expansion bit, so a plain 2A03 file cannot gain a
+single line in its register log. That is what keeps the Stage 24 golden
+log byte-identical.
+
+**The header can no longer lie.** `@driver expansion=vrc6` used to set
+header byte `0x7B` and emit no VRC6 data whatsoever — a file claiming a
+chip nothing in it ever writes to, which nothing downstream could catch
+because the header was the only claim and it was self-consistent. A
+driver now declares what it drives through an optional `DRIVER_EXPANSION`
+symbol, the header byte is written from *that*, and a song asking for
+more than its driver provides fails to compile.
+
+**Authoring VRC6 is not built.** Nothing emits VRC6 events, because the
+channel count is baked into the wire format (see above) and the only
+driver in existence is strict 2A03.
 
 ## Verification (Stage 24)
 

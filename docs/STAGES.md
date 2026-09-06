@@ -457,6 +457,46 @@ lives in viper.
   `edit_file` never cleared this state, so opening a second song inherited the
   first one's visualizer and scene slots.
 
+### Expansion audio
+
+- **Stage 33a** ✅ — **Render VRC6, and stop the header lying.** Two halves
+  of the same correctness problem.
+
+  `@driver expansion=vrc6` used to set NSF header byte `0x7B` and emit no
+  VRC6 data at all, producing a file that claimed a chip nothing in it ever
+  wrote to. Nothing downstream could catch that, because the header was the
+  only claim and it was self-consistent. A driver now declares what it
+  drives through an optional `DRIVER_EXPANSION` symbol; the header byte is
+  written from the driver rather than the song's wish, and a song asking for
+  more than its driver provides fails to compile with a message saying how
+  to fix it.
+
+  `viper-apu` gained a VRC6 core — two pulses and a sawtooth — so viper
+  renders any VRC6 NSF deterministically, with `vp1`/`vp2`/`saw` stems and
+  the register log extended to the chip's ten addresses. It is a sibling of
+  `Apu`, not a member: the VRC6 sits on the cartridge with its own linear
+  DAC and is summed externally, so putting it inside the struct whose whole
+  contract is the 2A03's non-linear tables would hide that.
+
+  Two hardware details are easy to get wrong and are pinned by tests. The
+  pulse duty generator counts *sixteenths*, not eighths, so a VRC6 pulse
+  never exceeds 50% width. The sawtooth accumulates on even clocks only, six
+  times per 14-clock cycle, and rates above 42 overflow the accumulator —
+  that buzz is a technique, not a bug to clamp. The mix level is derived
+  from nesdev's measurement rather than tuned by ear, and a test asserts the
+  identity so nobody can quietly retune it.
+
+  Interception is gated on the header bit, so a plain 2A03 file cannot gain
+  a line in its register log — which is what keeps the Stage 24 golden log
+  byte-identical, and it does.
+
+  **Authoring VRC6 is not built** and is not a small follow-up: the channel
+  count is baked into the wire format (the order-entry stride and the
+  driver's zero-page arrays), so it needs an ABI v2 and a driver that
+  implements it. `docs/NSF.md` claimed channels were "a table, not an enum"
+  and that the emitter never special-cased expansion; both were false and
+  are now corrected there.
+
 ### Generators
 
 - **Stage 25** ✅ — **Pattern generators from `GENERATION.md`.** `:gen

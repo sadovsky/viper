@@ -41,6 +41,11 @@ struct HostBus<'a> {
     log: &'a mut Vec<RegWrite>,
     frame: u32,
     pending: Vec<(u16, u8)>,
+    /// Whether this NSF's header declares VRC6. Gating the extra write
+    /// interception on it is load-bearing: it guarantees a plain 2A03 file
+    /// cannot gain a single new line in its register log, which is what keeps
+    /// the golden log byte-identical.
+    vrc6: bool,
 }
 
 impl Bus for HostBus<'_> {
@@ -52,7 +57,7 @@ impl Bus for HostBus<'_> {
         }
     }
     fn write(&mut self, addr: u16, v: u8) {
-        if (0x4000..=0x4017).contains(&addr) {
+        if (0x4000..=0x4017).contains(&addr) || (self.vrc6 && crate::vrc6::is_vrc6_reg(addr)) {
             self.log.push(RegWrite { frame: self.frame, addr, value: v });
             self.pending.push((addr, v));
         } else {
@@ -66,6 +71,9 @@ pub struct Player {
     cpu: Cpu,
     mem: Memory,
     pub apu: Apu,
+    /// Present only when the NSF header declares VRC6; see `HostBus::vrc6`.
+    pub vrc6: crate::vrc6::Vrc6,
+    has_vrc6: bool,
     pub log: Vec<RegWrite>,
     pub triggers: Vec<Trigger>,
     pub frame: u32,
@@ -88,6 +96,7 @@ pub struct Player {
 impl Player {
     pub fn new(nsf: Nsf, sample_rate: u32) -> Self {
         let mem = Memory::new(&nsf);
+        let has_vrc6 = nsf.expansion & 0x01 != 0;
         let speed_us = if nsf.ntsc_speed_us == 0 { 16639 } else { nsf.ntsc_speed_us };
         let cycles_per_frame = speed_us as f64 * CPU_HZ / 1_000_000.0;
         Self {
@@ -95,6 +104,8 @@ impl Player {
             cpu: Cpu::default(),
             mem,
             apu: Apu::new(),
+            vrc6: crate::vrc6::Vrc6::new(),
+            has_vrc6,
             log: Vec::new(),
             triggers: Vec::new(),
             frame: 0,
@@ -113,8 +124,10 @@ impl Player {
         }
     }
 
+    /// One `u8` covers both chips: bits 0-4 are the 2A03, bits 5-7 the VRC6.
     pub fn set_mask(&mut self, mask: u8) {
         self.apu.mask = mask & CH_ALL;
+        self.vrc6.mask = mask & crate::vrc6::CH_VRC6_ALL;
     }
 
     /// Run INIT for `song` (0-based). Register writes are logged as frame 0.
@@ -154,6 +167,7 @@ impl Player {
                     log: &mut self.log,
                     frame: self.frame,
                     pending: std::mem::take(&mut pending),
+                    vrc6: self.has_vrc6,
                 };
                 let c = self.cpu.step(&mut bus);
                 pending = bus.pending;
@@ -179,6 +193,10 @@ impl Player {
     }
 
     fn apu_write(&mut self, addr: u16, v: u8, cycle: u32) {
+        if crate::vrc6::is_vrc6_reg(addr) {
+            self.vrc6.write(addr, v);
+            return;
+        }
         self.apu.write(addr, v);
         if let Some(s) = self.apu.last_dmc_start.take() {
             self.triggers.push(Trigger { frame: self.frame, cycle, kind: TriggerKind::Dpcm { addr_reg: s.addr_reg } });
@@ -191,7 +209,9 @@ impl Player {
 
     fn tick_apu(&mut self) {
         let mem = &self.mem;
-        let out = self.apu.clock(|a| mem.read(a));
+        // The VRC6 is summed onto the audio pin externally, so it is a second
+        // term here rather than a channel inside the 2A03's mixing tables.
+        let out = self.apu.clock(|a| mem.read(a)) + self.vrc6.clock();
         // Box-filter decimation to the output rate.
         self.resample_acc += out;
         self.resample_n += 1;
@@ -258,3 +278,109 @@ impl Player {
         &self.mem
     }
 }
+
+#[cfg(test)]
+mod vrc6_host_tests {
+    use super::*;
+    use crate::vrc6::is_vrc6_reg;
+
+    /// A whole VRC6 NSF, hand-assembled. viper cannot assemble 6502, but the
+    /// program is four stores and a return, so the opcodes go in as a literal.
+    /// This is the fixture that makes the VRC6 path testable end to end with
+    /// no driver and no third-party file.
+    fn vrc6_nsf(expansion: u8) -> Nsf {
+        // INIT: set duty/volume, period lo, then enable + period hi. PLAY: rts.
+        //   A9 7F  LDA #$7F      ; duty 7 (50%), volume 15
+        //   8D 00 90  STA $9000
+        //   A9 7F  LDA #$7F      ; period lo
+        //   8D 01 90  STA $9001
+        //   A9 80  LDA #$80      ; enable, period hi = 0
+        //   8D 02 90  STA $9002
+        //   60     RTS
+        let mut code: Vec<u8> = vec![
+            0xA9, 0x7F, 0x8D, 0x00, 0x90,
+            0xA9, 0x7F, 0x8D, 0x01, 0x90,
+            0xA9, 0x80, 0x8D, 0x02, 0x90,
+            0x60,
+        ];
+        let play = 0x8000 + code.len() as u16;
+        code.push(0x60); // PLAY: rts
+        let header = Nsf::build_header(0x8000, 0x8000, play, 1, "vrc6", "", "", expansion);
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&code);
+        Nsf::parse(&bytes).unwrap()
+    }
+
+    /// Peak amplitude *after* the startup transient has settled.
+    ///
+    /// A 2A03 that has never been written leaves its triangle DAC at a
+    /// constant level, and the 90 Hz high-pass takes about 50 ms to decay that
+    /// DC step. Measuring from sample zero would read that as "sound", so
+    /// these tests look at the tail.
+    fn tail_peak(p: &Player) -> f32 {
+        let skip = p.samples.len() / 2;
+        p.samples[skip..].iter().cloned().fold(0f32, |a, b| a.max(b.abs()))
+    }
+
+    fn run(nsf: Nsf, mask: Option<u8>) -> Player {
+        let mut p = Player::new(nsf, 44_100);
+        if let Some(m) = mask {
+            p.set_mask(m);
+        }
+        p.init(0).unwrap();
+        for _ in 0..30 {
+            p.frame().unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn a_vrc6_nsf_reaches_the_chip_and_makes_sound() {
+        let p = run(vrc6_nsf(0x01), None);
+        // The three register writes are logged, at frame 0 (INIT).
+        let writes: Vec<(u16, u8)> = p
+            .log
+            .iter()
+            .filter(|w| is_vrc6_reg(w.addr))
+            .map(|w| (w.addr, w.value))
+            .collect();
+        assert_eq!(writes, vec![(0x9000, 0x7F), (0x9001, 0x7F), (0x9002, 0x80)]);
+        assert!(p.log.iter().all(|w| w.frame == 0 || !is_vrc6_reg(w.addr)));
+        // And it is audible at the level the mix constant predicts. A 50%-duty
+        // pulse at volume 15 swings between 0 and 15 units; the 90 Hz
+        // high-pass removes the DC half, leaving ±7.5 units.
+        let predicted = 7.5 * crate::vrc6::VRC6_UNIT;
+        let got = tail_peak(&p);
+        assert!(
+            (got - predicted).abs() < predicted * 0.15,
+            "expected about {:.4}, got {:.4}",
+            predicted,
+            got,
+        );
+    }
+
+    #[test]
+    fn a_plain_2a03_nsf_never_sees_a_vrc6_write() {
+        // The gate on the header bit is what keeps the golden log unchanged:
+        // the same program with expansion 0 must route those stores to ROM.
+        let p = run(vrc6_nsf(0x00), None);
+        assert!(
+            p.log.iter().all(|w| !is_vrc6_reg(w.addr)),
+            "a 2A03 file must not log VRC6 writes",
+        );
+        assert!(tail_peak(&p) < 1e-3, "and must stay silent, peak {}", tail_peak(&p));
+    }
+
+    #[test]
+    fn muting_the_vrc6_channels_silences_only_them() {
+        let render = |mask: u8| tail_peak(&run(vrc6_nsf(0x01), Some(mask)));
+        let full = render(crate::apu::CH_ALL | crate::vrc6::CH_VRC6_ALL);
+        assert!(full > 0.05, "everything audible, got {}", full);
+        assert!(render(crate::apu::CH_ALL) < 1e-3, "2A03-only mask drops the VRC6");
+        assert!(
+            (render(crate::vrc6::CH_VP1) - full).abs() < 1e-6,
+            "the VP1 stem carries the whole signal, since only VP1 is sounding",
+        );
+    }
+}
+
