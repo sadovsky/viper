@@ -292,12 +292,18 @@ pub fn trace_nsf(nsf: &crate::nsf::Nsf, song: u8, frames: Option<u32>) -> anyhow
     let looped = crate::render::find_loop(nsf, song, 300.0)?;
     let n = match (frames, looped) {
         (Some(n), _) => n,
-        // `start + len` covers the intro plus one whole loop whatever the
-        // start really is. RAM hashing finds the first frame whose driver
-        // state repeats, which can sit later than the musical loop point, so
-        // this can include a whole extra pass. That is the safe direction to
-        // be wrong in: transcribing a repeat costs nothing once identical
-        // phrases collapse, whereas stopping short loses music.
+        // RAM hashing reports the first frame whose *driver state* repeats,
+        // which sits at the end of the first pass rather than at the musical
+        // loop point. When that lands inside one period there is no intro to
+        // preserve and the first pass is the whole song, so take exactly one
+        // period: capturing two passes of the same music and folding them
+        // back together afterwards is both wasteful and fragile, because the
+        // driver's row-clock phase need not survive the loop and the second
+        // copy can transcribe a frame off from the first.
+        //
+        // A genuine intro pushes the repeat past one period, and then the
+        // intro plus one pass is what has to be run.
+        (None, Some((start, len))) if start < len => len,
         (None, Some((start, len))) => start + len,
         (None, None) => anyhow::bail!(
             "no loop found: this song's driver state never repeats within 300s, \

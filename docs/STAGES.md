@@ -337,6 +337,56 @@ lives in viper.
   log agree frame for frame — which is what makes the log path trustworthy
   for material that can only ever arrive as a dump.
 
+- **Stage 36b** ✅ — **Notes, and a `.vip` you can open.** `viper rip
+  song.nsf -o song.vip` now writes a song. Ripping the bundled stress song
+  recovers **220 BPM, 48 rows and 3 phrases**, matching the source exactly,
+  and 224 of its 240 note cells.
+
+  **The grid is the hard part, and neither obvious method finds it.**
+  Scoring candidate row lengths by how nearly the onsets fall on multiples
+  of them always picks one frame per row: any divisor of the true row length
+  fits at least as well, and the ambiguity only ever runs that way, so the
+  rule is the *largest* row length that fits rather than the best-fitting
+  one. That still is not the driver's grid, because the row clock is an 8.8
+  fixed-point accumulator, not a line — at 220 BPM it runs 4, 4, 4 and then
+  a 5. So detection ends by simulating that accumulator at each nearby
+  integer tempo. Where the driver sits inside its own fractional cycle is
+  invisible from outside, so that phase is searched too.
+
+  **Ties are the normal case, not a corner.** A row length is usually a
+  whole number of frames, so every tempo that rounds to it explains the same
+  onsets exactly: sixteen rows six frames apart are equally good evidence
+  for 149, 150 and 151 BPM. The middle of the tied range is taken, which is
+  both the best estimate and — not coincidentally — the round number a
+  composer typed, and the report names the range instead of sounding
+  certain.
+
+  **Three things had to be got right or the transcription drifts.**
+  Onsets are assigned to the *nearest* row rather than the row whose frame
+  window contains them, because a reconstructed grid can sit a frame from
+  the real one and a window rule then transcribes the same bar two ways on
+  two passes. A note is held only if it is still audible in the *next* row,
+  since an instrument's release sounds for several frames after the row that
+  ended it and "still making noise" would turn every note-off into a
+  sustain. And the volume column is inverted rather than copied: `Event::Vol`
+  scales the instrument envelope through a fixed-point multiply, so a
+  recompiled rip plays `(vol * 15) >> 4` and a song ripped five times over
+  fades away one step at a time.
+
+  Placeholder instruments are a flat gate — no attack, decay or release — so
+  note lengths come from the cells and nowhere else. viper's usual default
+  has a 120 ms release, and lending that to a ripped song makes every note
+  ring past the row that ended it.
+
+  **What the 16 remaining cells are.** Eight are noise:
+  `compile::noise_period_index` folds four semitones onto each index, so a
+  ripped noise note can only land somewhere in the right bucket. The other
+  eight are triangle rows where the source writes a note-off and the
+  register log shows the triangle still sounding into the next row — the rip
+  describes the chip, so a hold is the truthful transcription of what
+  happened. All six songs in `projects/` rip and recompile; five recover
+  their source tempo exactly and the sixth is one BPM out and says so.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first

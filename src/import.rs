@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::style::kv;
-use crate::{Cell, DpcmRef, Instrument, Phrase, Song, CHANNELS, INSTRUMENTS, STEPS_PER_PHRASE};
+use crate::{Cell, DpcmRef, Instrument, Song, CHANNELS, INSTRUMENTS, STEPS_PER_PHRASE};
 
 // ---------------------------------------------------------------- SMF reader
 
@@ -693,25 +693,11 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let mut song = Song::default();
     song.bpm = ((bpm as f64 * grid_mul).round() as u16).max(1);
     song.tempo_map = tempo_map;
-    song.phrases.clear();
-    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-    for p in 0..nphr {
-        let mut ph = Phrase::default();
-        for s in 0..STEPS_PER_PHRASE {
-            ph.cells[s] = grid[p * STEPS_PER_PHRASE + s];
-        }
-        let key: Vec<u8> = ph.cells.iter().flatten().flat_map(|c| [c.note.unwrap_or(if c.hold { 0xFE } else { 0xFF }), c.instr, c.vol, c.fx.map(|f| f.0).unwrap_or(0), c.fx.map(|f| f.1).unwrap_or(0)]).collect();
-        let idx = *index.entry(key).or_insert_with(|| {
-            song.phrases.push(ph.clone());
-            song.phrases.len() - 1
-        });
-        song.order.push(idx);
-    }
+    let (phrases, order) = crate::phrases_from_rows(&grid)?;
+    song.phrases = phrases;
+    song.order = order;
     report.phrases_total = nphr;
     report.phrases_unique = song.phrases.len();
-    if song.phrases.len() > 256 {
-        bail!("{} unique phrases; the .vip format holds 256", song.phrases.len());
-    }
     song.loop_pos = 0;
     song.current_phrase = song.order.first().copied().unwrap_or(0);
     for (i, inst) in &map.instruments {

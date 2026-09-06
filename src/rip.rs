@@ -1,0 +1,854 @@
+//! Reading music back out of a register log.
+//!
+//! [`viper_apu::trace`] says what the chip was doing each frame. This module
+//! decides what a tracker would have written to make it do that: where the
+//! rows are, which key-ons are notes, what pitch each one was, and which of
+//! them are the same phrase played again.
+//!
+//! Everything here is inference, and the [`Report`] is as much the product as
+//! the song is. An NSF does not record its tempo, its phrase boundaries or
+//! its instruments; those are recovered by argument, and a reader deserves to
+//! know which numbers were read and which were guessed.
+
+use anyhow::{bail, Result};
+
+use crate::{Cell, Instrument, Song, CHANNELS, STEPS_PER_PHRASE};
+use viper_apu::trace::{FrameTrace, NOI, PU1, PU2, TRI};
+
+/// NTSC CPU clock, the divisor behind every period on the chip.
+const CPU_HZ: f64 = 1_789_773.0;
+
+/// How far off a row an onset may land before the grid is in doubt, in rows.
+/// A quarter row is generous enough to absorb a driver that keys a note one
+/// frame late and tight enough that a grid twice too fine cannot hide.
+const TOL_ROWS: f64 = 0.25;
+
+#[derive(Clone, Debug, Default)]
+pub struct RipOptions {
+    /// Tempo, if the caller knows it. Skips detection entirely.
+    pub bpm: Option<u16>,
+}
+
+/// How well the chosen grid explains the onsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fit {
+    /// Every onset lands exactly on a row start. Only an integer tempo
+    /// simulated through the driver's own row clock can achieve this, so it
+    /// is a real claim rather than a rounding artefact.
+    ///
+    /// `ambiguous` names the range of tempos that fit *equally* well, when
+    /// more than one does. An exact fit says the grid explains every onset,
+    /// not that the tempo is pinned: a short song at a whole number of frames
+    /// per row leaves several tempos indistinguishable, and reporting the
+    /// chosen one alone would be a confident answer to a question the
+    /// evidence did not settle.
+    Exact { ambiguous: Option<(u16, u16)> },
+    /// Close, with the worst offset in rows and the fraction inside `TOL_ROWS`.
+    Fitted { worst_rows: f64, within: f64 },
+    /// Not really explained. `collisions` counts onsets that had to share a
+    /// row with an earlier one on the same channel, which is the signature of
+    /// a grid that is too coarse.
+    Guessed { worst_rows: f64, collisions: usize },
+    /// The caller supplied the tempo, so nothing was inferred.
+    Told,
+}
+
+#[derive(Clone, Debug)]
+pub struct Grid {
+    pub bpm: u16,
+    pub frames_per_row: f64,
+    /// Frame at which row 0 begins. Drivers call PLAY before their first
+    /// row, so this is rarely zero.
+    #[allow(dead_code)] // reported by callers that print the grid
+    pub phase: u32,
+    /// Frame each row starts on.
+    pub starts: Vec<u32>,
+    pub fit: Fit,
+}
+
+/// The frames at which rows begin, under the driver's 8.8 fixed-point row
+/// clock, starting from a given accumulator residual.
+///
+/// Reproducing that accumulator matters. At 220 BPM the clock runs 4, 4, 4
+/// and then a 5, so a straight line through the onsets drifts off by a whole
+/// row every few hundred. Reproducing it is not enough on its own either:
+/// where the driver sits *within* that 4-4-4-5 cycle when the first note
+/// lands is not visible from outside, so `cnt0` is a parameter to be
+/// searched rather than assumed zero. Getting it wrong costs one frame every
+/// twelve rows, which is exactly the kind of error that looks like sloppy
+/// timing instead of a wrong model.
+fn row_starts(frames_per_row: f64, phase: u32, until: u32, cnt0: i64) -> Vec<u32> {
+    let speed = ((frames_per_row * 256.0).round() as i64).max(256);
+    let mut cnt = cnt0;
+    let mut f = phase;
+    let mut out = Vec::new();
+    while f <= until {
+        if cnt >> 8 == 0 {
+            out.push(f);
+            cnt += speed;
+        }
+        cnt -= 256;
+        f += 1;
+    }
+    out
+}
+
+/// The distinct accumulator residuals this row clock passes through.
+///
+/// The fractional part cycles with a short period — twelve rows at 220 BPM —
+/// so the whole space of "where the driver was" is small enough to try
+/// exhaustively rather than solve.
+fn residuals(frames_per_row: f64) -> Vec<i64> {
+    let speed = ((frames_per_row * 256.0).round() as i64).max(256);
+    let mut cnt: i64 = 0;
+    let mut seen = Vec::new();
+    for _ in 0..512 {
+        if cnt >> 8 == 0 {
+            if seen.contains(&cnt) {
+                break;
+            }
+            seen.push(cnt);
+            cnt += speed;
+        }
+        cnt -= 256;
+    }
+    if seen.is_empty() {
+        seen.push(0);
+    }
+    seen
+}
+
+/// Frames on which some channel started an audible note.
+///
+/// Audible is the operative word. A key-on whose channel has no volume makes
+/// no sound, and viper's own driver emits three of them on an empty row; a
+/// grid fitted to those is fitted partly to silence.
+fn onsets(t: &[FrameTrace]) -> Vec<u32> {
+    t.iter()
+        .filter(|f| f.ch.iter().any(|c| c.keyed && c.level > 0))
+        .map(|f| f.frame)
+        .collect()
+}
+
+/// The volume column that reproduces an observed level.
+///
+/// A cell's volume is not the level the chip ends up playing. `Event::Vol`
+/// scales the instrument's envelope, and the multiply is fixed-point: with a
+/// full-scale envelope the driver plays `(vol * 15) >> 4`, one step short of
+/// the volume asked for. Writing the observed level straight into the cell
+/// therefore loses a step on every round trip — measurably, a song ripped and
+/// recompiled five times fades away — so the mapping has to be inverted, not
+/// copied.
+///
+/// Measured against the reference driver in `tests/fixtures`, where the map
+/// is exactly `(vol * 15) >> 4` clamped to a floor of 1. Level 15 is the one
+/// value out of reach: it needs an envelope peak of 16, which does not fit in
+/// four bits, so it comes back as 14.
+///
+/// Zero is never produced. It means "channel default" everywhere else in
+/// viper, so an audible note must not map to it.
+fn cell_volume(level: u8) -> u8 {
+    ((16 * level as u16 + 14) / 15).clamp(1, 15) as u8
+}
+
+/// Whether a note on this channel is still sounding when the *next* row
+/// begins.
+///
+/// This is what separates a note being held from a note that has ended, and
+/// it is the tracker's own question rather than a guess about envelope
+/// shapes. Hearing sound at a row start proves nothing on its own: an
+/// instrument's release is audible for several frames after the row that
+/// ended it, so "still making noise" would turn every note-off into a
+/// sustain and fill the transcription with holds nobody wrote.
+///
+/// Asking whether it survives to the next row is exactly the distinction the
+/// format draws. viper's `===` emits nothing and lets a note ring on, while
+/// an empty cell emits a note-off — and a note whose sound does not reach the
+/// following row is one that ended inside this one.
+fn spans_row(t: &[FrameTrace], c: usize, starts: &[u32], r: usize) -> bool {
+    // Whole rows, not the single frame each one starts on. A reconstructed
+    // grid can sit a frame away from the driver's real one, and sampling one
+    // frame at the edge of a gate turns that frame into a coin toss — the
+    // same bar then transcribes two ways on two passes through a loop.
+    let audible = |from: u32, to: u32| t.iter().any(|f| f.frame >= from && f.frame < to && f.ch[c].level > 0);
+    let Some(&next) = starts.get(r + 1) else {
+        // The last row has no next row to reach, so nothing is held across it.
+        return false;
+    };
+    let after = starts.get(r + 2).copied().unwrap_or(next + 1);
+    audible(starts[r], next) && audible(next, after)
+}
+
+/// The row `t` belongs to: the nearest row start, not the enclosing one.
+fn nearest_row(starts: &[u32], t: u32) -> usize {
+    match starts.binary_search(&t) {
+        Ok(i) => i,
+        Err(i) => {
+            if i == 0 {
+                0
+            } else if i >= starts.len() {
+                starts.len() - 1
+            } else if t - starts[i - 1] <= starts[i] - t {
+                i - 1
+            } else {
+                i
+            }
+        }
+    }
+}
+
+/// Distance from `t` to the nearest row start, in frames.
+fn nearest(starts: &[u32], t: u32) -> u32 {
+    match starts.binary_search(&t) {
+        Ok(_) => 0,
+        Err(i) => {
+            let before = if i > 0 { t - starts[i - 1] } else { u32::MAX };
+            let after = starts.get(i).map(|&s| s - t).unwrap_or(u32::MAX);
+            before.min(after)
+        }
+    }
+}
+
+/// Find the row grid the driver was using.
+///
+/// Three steps, and the middle one is the whole problem.
+///
+/// A **coarse sweep** scores candidate row lengths by how nearly the onsets
+/// fall on multiples of them. That alone finds the wrong answer every time:
+/// any divisor of the true row length fits at least as well, and one frame
+/// per row fits perfectly, so the best-scoring candidate is always the
+/// uselessly fine one. The ambiguity only ever runs that way — a grid
+/// *coarser* than the truth genuinely fails — so the fix is to take the
+/// largest candidate that still fits rather than the best-fitting one.
+///
+/// Then a **snap to an integer tempo**, simulating the driver's real row
+/// clock for each nearby BPM and keeping whichever puts the most onsets
+/// exactly on a row. A regression through the onsets gets close, but the
+/// row clock is a fixed-point accumulator, not a line.
+pub fn fit_grid(t: &[FrameTrace], bpm: Option<u16>) -> Grid {
+    let ons = onsets(t);
+    let last = t.last().map(|f| f.frame).unwrap_or(0);
+    let phase = ons.first().copied().unwrap_or(0);
+
+    if let Some(b) = bpm {
+        let fpr = 900.0 / (b.max(1) as f64);
+        let (starts, _) = best_alignment(fpr, phase, last, &ons);
+        return Grid { bpm: b, frames_per_row: fpr, phase, starts, fit: Fit::Told };
+    }
+    if ons.len() < 2 {
+        // Nothing to fit. 150 BPM is viper's own default; say it was a guess.
+        let fpr = 900.0 / 150.0;
+        return Grid {
+            bpm: 150,
+            frames_per_row: fpr,
+            phase,
+            starts: row_starts(fpr, phase, last, 0),
+            fit: Fit::Guessed { worst_rows: 0.0, collisions: 0 },
+        };
+    }
+
+    // Coarse: the largest row length that puts every onset within tolerance.
+    let mut best_coarse = 0.0f64;
+    let mut fallback = (f64::MAX, 4.0f64);
+    let mut fpr = 1.5f64;
+    while fpr <= 32.0 {
+        let worst = ons
+            .iter()
+            .map(|&x| {
+                let r = (x - phase) as f64 / fpr;
+                (r - r.round()).abs()
+            })
+            .fold(0.0f64, f64::max);
+        if worst < TOL_ROWS {
+            best_coarse = fpr;
+        }
+        if worst < fallback.0 {
+            fallback = (worst, fpr);
+        }
+        fpr += 1.0 / 128.0;
+    }
+    // Nothing fit: keep the least-bad, and the confidence will say so.
+    if best_coarse == 0.0 {
+        best_coarse = fallback.1;
+    }
+
+    // Snap: try integer tempos either side and simulate the real row clock.
+    let bpm0 = (900.0 / best_coarse).round().clamp(1.0, 900.0) as u16;
+    // Score every nearby integer tempo, then take the middle of whichever
+    // ones tie for best.
+    //
+    // Ties are not a corner case. A row length is a whole number of frames
+    // most of the time, so any tempo that rounds to the same row length
+    // explains the same onsets exactly — sixteen rows six frames apart are
+    // equally good evidence for 149, 150 and 151 BPM. Picking the first or
+    // the nearest candidate then lands one off a round tempo for no reason,
+    // while the middle of the feasible range is the best estimate available
+    // and happens to be the round number a composer typed.
+    let lo = bpm0.saturating_sub(4).max(1);
+    let hi = (bpm0 + 4).min(900);
+    let scored: Vec<(u16, u64)> = (lo..=hi)
+        .map(|c| (c, best_alignment(900.0 / c as f64, phase, last, &ons).1))
+        .collect();
+    let score = scored.iter().map(|&(_, s)| s).min().unwrap_or(u64::MAX);
+    let tied: Vec<u16> = scored.iter().filter(|&&(_, s)| s == score).map(|&(c, _)| c).collect();
+    let bpm = tied[tied.len() / 2];
+    let fpr = 900.0 / bpm as f64;
+    let (starts, _) = best_alignment(fpr, phase, last, &ons);
+    let ambiguous = (tied.len() > 1).then(|| (tied[0], tied[tied.len() - 1]));
+
+    // Confidence. "Exact" is only claimed when every onset is on a row.
+    let worst_rows = ons.iter().map(|&x| nearest(&starts, x) as f64 / fpr).fold(0.0f64, f64::max);
+    let within = ons.iter().filter(|&&x| (nearest(&starts, x) as f64 / fpr) <= TOL_ROWS).count() as f64 / ons.len() as f64;
+    let fit = if score == 0 {
+        Fit::Exact { ambiguous }
+    } else if within >= 0.95 {
+        Fit::Fitted { worst_rows, within }
+    } else {
+        Fit::Guessed { worst_rows, collisions: collisions(t, &starts) }
+    };
+    Grid { bpm, frames_per_row: fpr, phase, starts, fit }
+}
+
+/// Cut a repeated tail off the row list, returning the period it folded at.
+///
+/// Loop detection by RAM hashing finds the first frame whose *driver state*
+/// repeats, which routinely sits a pass later than the musical loop point, so
+/// a rip arrives holding the song roughly twice. The rows themselves say
+/// where it actually repeats, and they are the better witness: this is the
+/// same question phrase deduplication answers one bar at a time, asked of the
+/// whole song at once.
+///
+/// Only whole phrases are considered, because a period that is not a multiple
+/// of the phrase length would not survive being written to a `.vip` anyway.
+///
+/// The very last row is left out of the comparison. A render stops on a frame
+/// boundary rather than a row boundary, so the final row is always cut short:
+/// a note still sounding there has nowhere to be held to, and it would differ from
+/// its own earlier copy for that reason alone.
+fn fold_repeats(rows: &mut Vec<[Cell; CHANNELS]>) -> Option<usize> {
+    let n = rows.len();
+    let mut p = STEPS_PER_PHRASE;
+    while p * 2 <= n {
+        if (0..n.saturating_sub(p + 1)).all(|i| rows[i] == rows[i + p]) {
+            rows.truncate(p);
+            return Some(p);
+        }
+        p += STEPS_PER_PHRASE;
+    }
+    None
+}
+
+/// Row starts for this tempo under whichever accumulator phase explains the
+/// onsets best, with that phase's total error in frames.
+fn best_alignment(fpr: f64, phase: u32, last: u32, ons: &[u32]) -> (Vec<u32>, u64) {
+    let mut best = (Vec::new(), u64::MAX);
+    for cnt0 in residuals(fpr) {
+        let starts = row_starts(fpr, phase, last + 1, cnt0);
+        let score: u64 = ons.iter().map(|&x| nearest(&starts, x) as u64).sum();
+        if score < best.1 {
+            best = (starts, score);
+        }
+    }
+    best
+}
+
+/// Onsets that had to share a row with an earlier one on the same channel.
+/// A tracker row holds one note, so this counts music the grid cannot hold —
+/// the signature of a grid that is too coarse.
+fn collisions(t: &[FrameTrace], starts: &[u32]) -> usize {
+    let mut n = 0;
+    let mut last_row = [usize::MAX; CHANNELS];
+    for f in t {
+        for c in 0..CHANNELS {
+            if f.ch[c].keyed && f.ch[c].level > 0 {
+                let r = match starts.binary_search(&f.frame) {
+                    Ok(i) => i,
+                    Err(i) => i.saturating_sub(1),
+                };
+                if last_row[c] == r {
+                    n += 1;
+                }
+                last_row[c] = r;
+            }
+        }
+    }
+    n
+}
+
+/// A pulse period back to a MIDI note. `None` for periods the hardware mutes
+/// or that fall outside the note range, rather than inventing a pitch.
+fn pulse_note(p: u16) -> Option<u8> {
+    if p < 8 {
+        return None;
+    }
+    note_of(CPU_HZ / (16.0 * (p as f64 + 1.0)))
+}
+
+/// The triangle divides by 32 rather than 16, which is why it reaches an
+/// octave below the pulses.
+fn tri_note(p: u16) -> Option<u8> {
+    if p < 2 {
+        return None;
+    }
+    note_of(CPU_HZ / (32.0 * (p as f64 + 1.0)))
+}
+
+fn note_of(hz: f64) -> Option<u8> {
+    let n = (69.0 + 12.0 * (hz / 440.0).log2()).round();
+    (0.0..=127.0).contains(&n).then_some(n as u8)
+}
+
+/// The noise channel's 4-bit index back to a note.
+///
+/// `compile::noise_period_index` maps four semitones onto each index, so this
+/// is irreducibly lossy: any of four notes could have produced a given index.
+/// Picking the top of the bucket is what round-trips the values a tracker
+/// actually writes, because integer division truncates downward.
+fn noise_note(idx: u16) -> u8 {
+    36 + 4 * (15 - idx.min(15) as u8) + 3
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub source: String,
+    pub frames: usize,
+    pub loop_frames: Option<(u32, u32)>,
+    pub bpm: u16,
+    pub frames_per_row: f64,
+    pub fit: Option<Fit>,
+    pub rows: usize,
+    pub phrases_total: usize,
+    pub phrases_unique: usize,
+    /// Audible notes written, per channel.
+    pub notes: [usize; CHANNELS],
+    /// Key-ons dropped because the channel had no volume at the time.
+    pub silent_keyons: usize,
+    /// Notes whose period was outside the range viper can name.
+    pub unpitched: usize,
+    pub holds: usize,
+    /// Notes dropped because another already held that row on that channel.
+    pub row_collisions: usize,
+    /// Row count the song was folded to, when its rows turned out to repeat.
+    pub folded_at: Option<usize>,
+    /// Frames on which a hardware sweep was moving a pitch.
+    pub sweep_frames: usize,
+    /// Frames whose level came from a simulated hardware envelope.
+    pub hw_env_frames: usize,
+    /// `$4012` values seen, in order of first use.
+    pub dpcm_samples: Vec<u8>,
+}
+
+impl Report {
+    pub fn summary(&self) -> String {
+        const NAMES: [&str; CHANNELS] = ["PU1", "PU2", "TRI", "NOI", "DPCM"];
+        let mut s = format!(
+            "source   {}, {} frames ({:.2}s)\n",
+            self.source,
+            self.frames,
+            self.frames as f64 / 60.0988
+        );
+        match self.loop_frames {
+            // The period is trustworthy; the start is not. RAM hashing finds
+            // the first frame whose driver state repeats, which can sit a
+            // whole pass after the musical loop point.
+            Some((start, len)) => s.push_str(&format!(
+                "loop     {} frames, repeating from frame {} (driver RAM state; the start can overshoot)\n",
+                len, start
+            )),
+            None => s.push_str("loop     not detected\n"),
+        }
+        if let Some(fit) = self.fit {
+            let how = match fit {
+                Fit::Told => "TOLD".to_string(),
+                Fit::Exact { ambiguous: None } => "INFERRED, exact: every onset lands on a row start".to_string(),
+                Fit::Exact { ambiguous: Some((lo, hi)) } => format!(
+                    "INFERRED, exact: every onset lands on a row start, but {}–{} BPM fit equally — \
+                     this song is too short to tell them apart",
+                    lo, hi
+                ),
+                Fit::Fitted { worst_rows, within } => format!(
+                    "INFERRED, fitted: {:.0}% of onsets within {:.2} rows, worst {:.2}",
+                    within * 100.0,
+                    TOL_ROWS,
+                    worst_rows
+                ),
+                Fit::Guessed { worst_rows, collisions } => format!(
+                    "INFERRED, GUESSED: worst {:.2} rows, {} onsets collided on a row{}",
+                    worst_rows,
+                    collisions,
+                    if collisions > 0 { " — the grid may be too coarse, try --bpm" } else { "" }
+                ),
+            };
+            s.push_str(&format!("tempo    {} BPM, {:.2} frames/row — {}\n", self.bpm, self.frames_per_row, how));
+        }
+        s.push_str(&format!(
+            "rows     {} → {} phrases ({} unique)\n",
+            self.rows, self.phrases_total, self.phrases_unique
+        ));
+        if let Some(p) = self.folded_at {
+            s.push_str(&format!("         the rows repeat every {}, so the trailing copy was folded away\n", p));
+        }
+        s.push_str("notes    ");
+        for c in 0..CHANNELS {
+            s.push_str(&format!("{} {:<5}", NAMES[c], self.notes[c]));
+        }
+        s.push_str(&format!("holds {}\n", self.holds));
+        if self.silent_keyons > 0 {
+            s.push_str(&format!(
+                "         {} key-on{} suppressed (no volume at onset)\n",
+                self.silent_keyons,
+                if self.silent_keyons == 1 { "" } else { "s" }
+            ));
+        }
+        if self.row_collisions > 0 {
+            s.push_str(&format!(
+                "         {} notes dropped: two onsets wanted the same row — the grid may be too coarse\n",
+                self.row_collisions
+            ));
+        }
+        if self.unpitched > 0 {
+            s.push_str(&format!("         {} onsets had no nameable pitch and were dropped\n", self.unpitched));
+        }
+        if !self.dpcm_samples.is_empty() {
+            s.push_str(&format!("dpcm     {} sample(s): {:02X?}\n", self.dpcm_samples.len(), self.dpcm_samples));
+        }
+        // Everything viper cannot express, counted rather than dropped in
+        // silence. A rip that quietly loses a feature is worse than one that
+        // says it did.
+        if self.sweep_frames > 0 {
+            s.push_str(&format!("lost     hardware sweep active on {} frames; viper has no sweep\n", self.sweep_frames));
+        }
+        if self.hw_env_frames > 0 {
+            s.push_str(&format!(
+                "approx   hardware envelopes on {} frames; those levels were simulated, not read\n",
+                self.hw_env_frames
+            ));
+        }
+        s.push_str("lost     instrument identity, phrase boundaries, groove; noise pitch is 4:1\n");
+        s
+    }
+}
+
+/// Turn a frame table into a song.
+pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> {
+    if t.is_empty() {
+        bail!("rip: nothing to transcribe");
+    }
+    let grid = fit_grid(t, opts.bpm);
+    if grid.starts.is_empty() {
+        bail!("rip: no rows — the trace has no audible note starts");
+    }
+    let mut report = Report {
+        frames: t.len(),
+        bpm: grid.bpm,
+        frames_per_row: grid.frames_per_row,
+        fit: Some(grid.fit),
+        ..Default::default()
+    };
+
+    let n_rows = grid.starts.len();
+    let mut rows = vec![[Cell::default(); CHANNELS]; n_rows];
+    let mut dpcm_slots: Vec<u8> = Vec::new();
+
+    // Notes first, each placed on the row it is *nearest* to rather than the
+    // row whose frame window it happens to land in.
+    //
+    // The difference is not pedantry. A driver's row clock is a fixed-point
+    // accumulator whose fractional phase is invisible from outside, and
+    // viper's own resets it somewhere across a loop, so a reconstructed grid
+    // can sit a frame away from the real one. Under a window rule that frame
+    // pushes a note into the neighbouring row and the same bar transcribes
+    // two different ways on two passes. Nearest-row assignment absorbs it,
+    // and does the right thing for a foreign driver whose quirks are not
+    // known at all.
+    for f in t {
+        for c in 0..CHANNELS {
+            let cf = f.ch[c];
+            if !cf.keyed || cf.level == 0 {
+                continue;
+            }
+            let r = nearest_row(&grid.starts, f.frame);
+            let note = match c {
+                PU1 | PU2 => pulse_note(cf.period),
+                TRI => tri_note(cf.period),
+                NOI => Some(noise_note(cf.period)),
+                _ => {
+                    // DPCM notes address a sample slot, not a pitch:
+                    // `dpcm::note_to_sample` is note - 60.
+                    let s = f.dpcm.unwrap_or(0);
+                    let slot = dpcm_slots.iter().position(|&x| x == s).unwrap_or_else(|| {
+                        dpcm_slots.push(s);
+                        dpcm_slots.len() - 1
+                    });
+                    Some(60u8.saturating_add(slot.min(67) as u8))
+                }
+            };
+            let Some(n) = note else {
+                report.unpitched += 1;
+                continue;
+            };
+            if rows[r][c].note.is_some() {
+                // Two notes, one row: the grid is too coarse to hold this
+                // music. Keep the first and say how much was lost.
+                report.row_collisions += 1;
+                continue;
+            }
+            rows[r][c] = Cell {
+                note: Some(n),
+                instr: c as u8,
+                vol: cell_volume(cf.level),
+                fx: None,
+                hold: false,
+            };
+            report.notes[c] += 1;
+        }
+    }
+
+    // Then sustains. A row with no note of its own either holds the previous
+    // one or ends it, and an empty cell is exactly how the format says ended.
+    for c in 0..CHANNELS {
+        // DPCM notes are one-shot triggers; a sample is not "held".
+        if c == crate::rip_dmc() {
+            continue;
+        }
+        let mut sounding = false;
+        for r in 0..n_rows {
+            if rows[r][c].note.is_some() {
+                sounding = true;
+            } else if sounding {
+                if spans_row(t, c, &grid.starts, r) {
+                    rows[r][c] = Cell::hold();
+                    report.holds += 1;
+                } else {
+                    sounding = false;
+                }
+            }
+        }
+    }
+
+    // Trailing empty rows are the render's tail, not music.
+    while rows.len() > STEPS_PER_PHRASE && rows.last().is_some_and(|r| r.iter().all(|c| c.note.is_none() && !c.hold)) {
+        rows.truncate(rows.len() - 1);
+    }
+    report.folded_at = fold_repeats(&mut rows);
+
+    let counted: usize = t
+        .iter()
+        .map(|f| f.ch.iter().filter(|c| c.keyed && c.level == 0).count())
+        .sum();
+    report.silent_keyons = counted;
+    report.sweep_frames = t.iter().filter(|f| f.ch.iter().any(|c| c.sweep != 0)).count();
+    report.hw_env_frames = t.iter().filter(|f| f.ch.iter().take(4).any(|c| !c.constant_vol && c.level > 0)).count();
+    report.dpcm_samples = dpcm_slots;
+    report.rows = rows.len();
+
+    let (phrases, order) = crate::phrases_from_rows(&rows)?;
+    report.phrases_total = order.len();
+    report.phrases_unique = phrases.len();
+
+    let mut song = Song::default();
+    song.bpm = grid.bpm;
+    song.phrases = phrases;
+    song.order = order;
+    song.loop_pos = 0;
+    song.current_phrase = song.order.first().copied().unwrap_or(0);
+    // One instrument per channel, carrying the duty that channel actually
+    // used. Recovering real envelopes is a separate job; pretending to have
+    // done it here would be the dishonest kind of default.
+    //
+    // The placeholder is a flat gate — no attack, no decay, no release — so
+    // that note lengths come from the cells and nowhere else. viper's normal
+    // default has a 120 ms release, and lending that to a ripped song makes
+    // every note ring past the row that ended it: recompile such a rip and
+    // the notes bleed into their neighbours, so ripping it again reports
+    // holds nobody transcribed. A gate reproduces exactly what was observed
+    // and leaves the envelope question honestly open.
+    for c in 0..CHANNELS.min(crate::INSTRUMENTS) {
+        let duty = t
+            .iter()
+            .find(|f| f.ch[c].keyed && f.ch[c].level > 0)
+            .map(|f| f.ch[c].duty)
+            .unwrap_or(2);
+        song.instruments[c] = Instrument {
+            attack_ms: 0,
+            decay_ms: 0,
+            sustain: 1.0,
+            release_ms: 0,
+            duty: [0.125, 0.25, 0.5, 0.75][duty.min(3) as usize],
+            volume: 1.0,
+        };
+    }
+    Ok((song, report, grid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use viper_apu::trace::ChannelFrame;
+
+    /// A trace of `n` frames with a key-on and level on one channel at the
+    /// given frames.
+    fn keyed(n: u32, c: usize, at: &[u32], period: u16) -> Vec<FrameTrace> {
+        (0..n)
+            .map(|frame| {
+                let mut f = FrameTrace { frame, ..Default::default() };
+                f.ch[c] = ChannelFrame {
+                    period,
+                    level: 10,
+                    keyed: at.contains(&frame),
+                    constant_vol: true,
+                    ..Default::default()
+                };
+                f
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_row_clock_is_an_accumulator_not_a_straight_line() {
+        // 220 BPM is 4.09 frames per row, which the driver's 8.8 fixed point
+        // renders as eleven 4-frame rows and then a 5.
+        let s = row_starts(900.0 / 220.0, 1, 60, 0);
+        assert_eq!(&s[..15], &[1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 50, 54, 58]);
+    }
+
+    /// Onsets a driver at `bpm` would actually produce, one per `every`
+    /// rows, over `frames`. Real length matters: a handful of onsets leaves
+    /// several tempos indistinguishable, so a test built on four bars proves
+    /// less than it looks like it does.
+    fn played_at(bpm: f64, every: usize, frames: u32) -> Vec<u32> {
+        row_starts(900.0 / bpm, 1, frames, 0).into_iter().step_by(every).collect()
+    }
+
+    #[test]
+    fn the_grid_is_the_coarsest_that_fits_not_the_best_fitting() {
+        // These onsets are consistent with 4.09 frames per row — and equally
+        // with 2.05, and perfectly with 1. Minimising error finds one frame
+        // per row every time, which is why the rule is "largest that fits".
+        let ons = played_at(220.0, 1, 200);
+        let t = keyed(202, PU1, &ons, 169);
+        let g = fit_grid(&t, None);
+        assert_eq!(g.bpm, 220);
+        assert!(g.frames_per_row > 4.0, "not a degenerate one-frame grid: {}", g.frames_per_row);
+        assert_eq!(g.fit, Fit::Exact { ambiguous: None }, "a full song's worth of onsets pins the tempo");
+    }
+
+    #[test]
+    fn a_half_speed_song_is_not_read_as_a_double_speed_one() {
+        // Every other row empty: the onsets fit 8.18 frames per row, and the
+        // coarser reading is the right one.
+        let ons = played_at(220.0, 2, 400);
+        let t = keyed(402, PU1, &ons, 169);
+        assert_eq!(fit_grid(&t, None).bpm, 110, "not 220 with every other row blank");
+    }
+
+    #[test]
+    fn a_tempo_the_evidence_cannot_pin_is_reported_as_ambiguous() {
+        // Sixteen rows exactly six frames apart are equally good evidence for
+        // 149, 150 and 151 BPM. The middle is the best estimate, and the
+        // report has to admit the other two rather than sound certain.
+        let ons: Vec<u32> = (0..16).map(|i| 1 + i * 6).collect();
+        let g = fit_grid(&keyed(100, PU1, &ons, 169), None);
+        assert_eq!(g.bpm, 150, "the middle of the tied range, not an edge of it");
+        assert_eq!(g.fit, Fit::Exact { ambiguous: Some((149, 151)) });
+    }
+
+    #[test]
+    fn a_told_tempo_is_never_reported_as_inferred() {
+        let t = keyed(120, PU1, &[1, 5, 9, 13], 169);
+        assert_eq!(fit_grid(&t, Some(150)).fit, Fit::Told);
+        assert_eq!(fit_grid(&t, Some(150)).bpm, 150);
+    }
+
+    #[test]
+    fn periods_invert_to_the_notes_that_produced_them() {
+        // The stress song's own first notes, from the golden log.
+        assert_eq!(pulse_note(169), Some(76), "E-5");
+        assert_eq!(pulse_note(213), Some(72), "C-5");
+        assert_eq!(tri_note(678), Some(40), "E-2");
+        // A period the hardware mutes is not given a pitch.
+        assert_eq!(pulse_note(4), None);
+    }
+
+    #[test]
+    fn every_pulse_note_survives_the_round_trip_through_a_period() {
+        // The driver's table is note - 24, and the emitter clamps below 33
+        // because an 11-bit period cannot reach lower.
+        for n in 33u8..=107 {
+            let hz = 440.0 * 2f64.powf((n as f64 - 69.0) / 12.0);
+            let p = (CPU_HZ / (16.0 * hz) - 1.0).round() as u16;
+            assert_eq!(pulse_note(p), Some(n), "period {} for note {}", p, n);
+        }
+    }
+
+    #[test]
+    fn noise_notes_round_trip_through_the_period_index() {
+        for idx in 0u16..=15 {
+            let n = noise_note(idx);
+            assert_eq!(crate::compile::noise_period_index(n) as u16, idx, "index {} -> note {}", idx, n);
+        }
+    }
+
+    #[test]
+    fn the_volume_column_is_inverted_rather_than_copied() {
+        // Measured against the reference driver: it plays (vol * 15) >> 4.
+        for level in 1u8..=14 {
+            let v = cell_volume(level);
+            assert_eq!((v as u16 * 15) >> 4, level as u16, "level {} needs volume {}", level, v);
+        }
+        // Never the "channel default" sentinel, and never past the column.
+        assert!((1..=15).contains(&cell_volume(0)));
+        assert_eq!(cell_volume(15), 15, "the one level out of reach clamps rather than overflowing");
+    }
+
+    #[test]
+    fn a_release_tail_is_not_mistaken_for_a_held_note() {
+        let mut t: Vec<FrameTrace> = (0..16).map(|frame| FrameTrace { frame, ..Default::default() }).collect();
+        // 10 9 9 9 | 7 4 2 0 | 0 ... — the driver's real envelope after the
+        // held-note fix: a plateau, then one release, inside rows of four.
+        for (i, l) in [10u8, 9, 9, 9, 7, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0].iter().enumerate() {
+            t[i].ch[PU1].level = *l;
+        }
+        let starts = [0u32, 4, 8, 12];
+        assert!(!spans_row(&t, PU1, &starts, 1), "the release does not reach row 2, so row 1 ended the note");
+        assert!(!spans_row(&t, PU1, &starts, 2), "and row 2 is silent throughout");
+        // One frame of grid error must not change the answer.
+        let shifted = [1u32, 5, 9, 13];
+        assert!(!spans_row(&t, PU1, &shifted, 1));
+
+        // A note that really is held reaches the next row at full level.
+        for f in t.iter_mut() {
+            f.ch[PU1].level = 9;
+        }
+        assert!(spans_row(&t, PU1, &starts, 1));
+        assert!(!spans_row(&t, PU1, &starts, 3), "the last row has no next row to reach");
+    }
+
+    #[test]
+    fn a_song_held_twice_is_folded_back_to_once() {
+        let note = |n: u8| {
+            let mut r = [Cell::default(); CHANNELS];
+            r[0] = Cell { note: Some(n), ..Default::default() };
+            r
+        };
+        let mut rows: Vec<[Cell; CHANNELS]> = (0..16).map(|i| note(60 + i)).collect();
+        rows.extend(rows.clone());
+        assert_eq!(fold_repeats(&mut rows), Some(16));
+        assert_eq!(rows.len(), 16);
+        // Music that merely resembles itself is left alone.
+        let mut once: Vec<[Cell; CHANNELS]> = (0..32).map(|i| note(60 + i)).collect();
+        assert_eq!(fold_repeats(&mut once), None);
+        assert_eq!(once.len(), 32);
+    }
+
+    #[test]
+    fn a_key_on_with_no_volume_never_becomes_a_note() {
+        let mut t = keyed(40, PU1, &[1, 5, 9], 169);
+        t[5].ch[PU1].level = 0;
+        let (song, report, _) = rip(&t, &RipOptions::default()).unwrap();
+        assert_eq!(report.notes[PU1], 2, "the silent key-on is not music");
+        assert_eq!(report.silent_keyons, 1);
+        let written: usize = song.phrases.iter().map(|p| p.cells.iter().filter(|r| r[PU1].note.is_some()).count()).sum();
+        assert_eq!(written, 2, "and it reaches no cell");
+    }
+}

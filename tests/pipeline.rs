@@ -346,3 +346,127 @@ fn tracing_the_nsf_and_tracing_its_log_agree() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The rip, end to end, against a song whose source is checked in beside it.
+///
+/// Every number here was measured, and the two kinds of difference that
+/// remain are both understood — which is the point. A transcriber that
+/// scores well without anyone knowing why is not evidence of anything.
+#[test]
+fn ripping_the_stress_song_recovers_its_notes_and_structure() {
+    let tmp = std::env::temp_dir().join(format!("viper_rip_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let vip = root().join("projects/stress_melodeath.vip");
+    let nsf = tmp.join("stress.nsf");
+    let out = viper().args(["compile"]).arg(&vip).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&nsf).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let ripped = tmp.join("ripped.vip");
+    let out = viper().args(["rip"]).arg(&nsf).arg("-o").arg(&ripped).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+
+    // The tempo is not read from the file — an NSF does not record one. It is
+    // recovered by simulating the driver's fixed-point row clock at candidate
+    // integer tempos, and "exact" means every onset landed on a row start.
+    assert!(report.contains("220 BPM"), "{}", report);
+    assert!(report.contains("INFERRED, exact"), "{}", report);
+    assert!(report.contains("rows     48 → 3 phrases (3 unique)"), "{}", report);
+    // The driver keys three channels on an empty row with no volume; those
+    // are not notes and must not be transcribed as any.
+    assert!(report.contains("3 key-ons suppressed"), "{}", report);
+
+    let src = std::fs::read_to_string(&vip).unwrap();
+    let got = std::fs::read_to_string(&ripped).unwrap();
+    let (a, b) = (note_grid(&src), note_grid(&got));
+    assert_eq!(a.len(), 48, "the source is three phrases");
+    assert_eq!(b.len(), a.len(), "and so is the rip");
+
+    let mut wrong: Vec<(usize, usize, String, String)> = Vec::new();
+    for r in 0..a.len() {
+        for c in 0..5 {
+            if a[r][c] != b[r][c] {
+                wrong.push((r, c, a[r][c].clone(), b[r][c].clone()));
+            }
+        }
+    }
+    // Both kinds of remaining difference are understood, so name them rather
+    // than accepting a percentage on trust.
+    for (r, c, want, got) in &wrong {
+        let noise_bucket = *c == 3 && want == "C-3" && got == "D#3";
+        // `compile::noise_period_index` folds four semitones onto each index,
+        // so a ripped noise note can only ever be somewhere in the right
+        // bucket. This one is irreducible, not a bug to be fixed later.
+        let triangle_rang_on = *c == 2 && want == "---" && got == "===";
+        // The source writes a note-off here, but the register log shows the
+        // triangle still sounding into the next row: the driver's release
+        // outlives the row that ended it. The rip describes the chip, so
+        // `===` is the truthful transcription of what actually happened.
+        assert!(noise_bucket || triangle_rang_on, "unexplained difference at row {} channel {}: {} → {}", r, c, want, got);
+    }
+    assert!(wrong.len() <= 16, "{} cells differ, expected at most 16", wrong.len());
+
+    // A rip must settle. Recompiling one and ripping it again may move once,
+    // because the placeholder instruments are a flat gate rather than the
+    // envelopes the original used — that is Stage 36c's job. After that it
+    // must not drift at all, or the tool cannot be used iteratively.
+    let mut prev = std::fs::read_to_string(&ripped).unwrap();
+    let mut settled = None;
+    for i in 0..4 {
+        let n = tmp.join(format!("r{}.nsf", i));
+        let v = tmp.join(format!("r{}.vip", i));
+        let out = viper().args(["compile"]).arg(tmp.join(if i == 0 { "ripped.vip".into() } else { format!("r{}.vip", i - 1) })).arg("--driver").arg(root().join("tests/fixtures/driver.bin")).arg("-o").arg(&n).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = viper().args(["rip"]).arg(&n).arg("-o").arg(&v).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let now = std::fs::read_to_string(&v).unwrap();
+        if rows_of(&now) == rows_of(&prev) && settled.is_none() {
+            settled = Some(i);
+        }
+        prev = now;
+    }
+    assert!(matches!(settled, Some(i) if i <= 1), "a rip must reach a fixed point, settled at {:?}", settled);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The note name in every cell of every phrase, in order.
+///
+/// Rows are placed by their step number, not by the order they appear: a
+/// `.vip` omits rows that are entirely empty, so counting lines would silently
+/// shorten a sparse phrase and misalign everything after it.
+fn note_grid(vip: &str) -> Vec<[String; 5]> {
+    let blank = || std::array::from_fn(|_| "---".to_string());
+    let mut out: Vec<[String; 5]> = Vec::new();
+    let mut base = 0usize;
+    let mut in_phrase = false;
+    for line in vip.lines() {
+        if line.starts_with("@phrase") {
+            base = out.len();
+            out.resize_with(base + 16, blank);
+            in_phrase = true;
+            continue;
+        }
+        if line.starts_with('@') {
+            in_phrase = false;
+        }
+        let t = line.trim_start();
+        if !in_phrase || t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        let mut f = t.split_whitespace();
+        let Some(step) = f.next() else { continue };
+        let Ok(step) = usize::from_str_radix(step, 16) else { continue };
+        if step >= 16 {
+            continue;
+        }
+        for (i, c) in f.take(5).enumerate() {
+            out[base + step][i] = c.split(':').next().unwrap_or("---").to_string();
+        }
+    }
+    out
+}
+
+/// Just the pattern rows of a `.vip`, for comparing two of them.
+fn rows_of(vip: &str) -> Vec<String> {
+    vip.lines().filter(|l| l.starts_with("  ") && l.trim_start().len() > 2).map(|l| l.trim_end().to_string()).collect()
+}

@@ -34,6 +34,7 @@ viper compile song.vip --driver tests/fixtures/driver.bin -o song.nsf
 viper render song.nsf -o mix.wav --stems stems/ --triggers drums.mid \
              --log writes.txt --vip song.vip
 viper verify song.nsf --against fceux.log --vip song.vip  # diff vs another emulator
+viper rip song.nsf -o ripped.vip                 # read the music back out
 viper gen --style styles/neutral --seed 7 -o songs/    # compose a song
 viper dpcm encode kick.wav -o kick.dmc                  # hand-crafted drum samples
 ```
@@ -254,7 +255,21 @@ chip the driver does not drive. *Authoring* for VRC6 is a separate job: the
 channel count is baked into the wire format, so it needs a driver that
 implements the extra channels.
 
-Next up: `viper rip`, turning an NSF back into an editable `.vip`.
+**Ripping.** `viper rip song.nsf -o song.vip` reads music back out of a
+compiled NSF — or out of any `frame addr value` register dump another
+emulator produced, which is how game music gets in without emulating the
+game. It runs the file, folds the register traffic into per-frame channel
+state, recovers the row grid by simulating the driver's fixed-point row
+clock at candidate tempos, and writes notes, volumes, holds, phrases and an
+order list. Ripping the bundled stress song recovers its tempo, its 48 rows
+and its 3 phrases exactly.
+
+An NSF records none of that, so all of it is inferred, and the report says
+which numbers were read and which were guessed — including when two tempos
+fit the evidence equally well. Instrument envelopes and effect columns are
+not recovered yet.
+
+Next up: recovering instruments and the effect columns.
 
 ## Contributing
 
