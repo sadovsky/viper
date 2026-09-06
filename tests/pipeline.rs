@@ -406,6 +406,22 @@ fn ripping_the_stress_song_recovers_its_notes_and_structure() {
     }
     assert!(wrong.len() <= 16, "{} cells differ, expected at most 16", wrong.len());
 
+    // Instruments are recovered from the envelopes the notes played, not
+    // guessed. The source's lead is `a=0 d=20 s=0.90 r=60 duty=0.25
+    // vol=0.70`, and the rip has to land near it without ever having seen
+    // the file — the only evidence is that its notes played 10 9 9 9 7 4 2 0.
+    assert!(report.contains("instr    4 synthesised"), "one instrument per voice: {}", report);
+    let lead = got.lines().find(|l| l.starts_with("@instr 00")).expect("a lead instrument");
+    for (field, want, tol) in [("s=", 0.90f32, 0.05f32), ("duty=", 0.25, 0.001), ("vol=", 0.70, 0.05)] {
+        let v: f32 = lead.split(field).nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!((v - want).abs() <= tol, "instr 00 {}{} should be near {}", field, v, want);
+    }
+    // The release is only visible on notes long enough to show one, and most
+    // of this song's are cut off by the next key-on. Finding it at all means
+    // the longest note in each group is what was read.
+    let r: u16 = lead.split("r=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    assert!((50..=80).contains(&r), "release {} ms should be near the source's 60", r);
+
     // A rip must settle. Recompiling one and ripping it again may move once,
     // because the placeholder instruments are a flat gate rather than the
     // envelopes the original used — that is Stage 36c's job. After that it

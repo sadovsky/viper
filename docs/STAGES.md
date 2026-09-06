@@ -387,6 +387,41 @@ lives in viper.
   happened. All six songs in `projects/` rip and recompile; five recover
   their source tempo exactly and the sixth is one BPM out and says so.
 
+- **Stage 36c** ✅ — **Instruments, read rather than fitted.** A rip now
+  recovers the `@instr` table from the envelopes its notes played. Against
+  the stress song, whose lead is `a=0 d=20 s=0.90 r=60 duty=0.25 vol=0.70`,
+  it produces `a=0 d=17 s=0.909 r=67 duty=0.250 vol=0.733` — having seen
+  nothing but the register log.
+
+  **The inversion is a construction, not a search.** `Envelope::from_adsr`
+  lays a note out as an attack ramp, a decay to a sustain level, a looping
+  held frame and a release to zero, so those parts can be read straight back
+  off the shape — but only once the shape is in envelope units. The driver
+  plays `(vol * env) >> 4`, and undoing that first is what makes the
+  reconstruction exact: `10 9 9 9 7 4 2 0` at full column volume is the
+  envelope `11 10 10 10 8 5 3 0`, which is `a=0 d=1 s=10/11 r=4` and nothing
+  else.
+
+  **Grouping is on the normalised shape**, so one voice played loud and
+  quiet stays one instrument and the loudness goes to the volume column
+  where it belongs. Two details earn their keep. The key is a fixed three
+  frames, because in fast music most notes are cut off by the next key-on
+  and a key that grew with the note would file the same voice under a
+  different instrument depending on how long it happened to sound. And it is
+  quantised to eight buckets, because a quiet note carries less of its own
+  curve than a loud one — 9 of 10 and 4 of 5 are the same envelope and do
+  not look it at full resolution. Each group's ADSR is read from its longest
+  member, since a note cut short never reveals its release.
+
+  **DPCM** notes recover their sample slots: a kick and a snare come back as
+  the same two notes the source wrote. The sample *data* is not extracted
+  yet, so a recompiled rip plays the default bank, and the report says so.
+
+  A rip is now a fixed point after one round trip. The first pass can move,
+  because a recovered release of 67 ms is not the 60 ms the original used
+  and a few notes ring a row further; after that, recompiling and ripping
+  again changes nothing at all.
+
 ### Interface
 
 - **Stage 26** ✅ — **Breath + the playhead as a character.** The first

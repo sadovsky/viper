@@ -264,12 +264,17 @@ clock at candidate tempos, and writes notes, volumes, holds, phrases and an
 order list. Ripping the bundled stress song recovers its tempo, its 48 rows
 and its 3 phrases exactly.
 
-An NSF records none of that, so all of it is inferred, and the report says
-which numbers were read and which were guessed — including when two tempos
-fit the evidence equally well. Instrument envelopes and effect columns are
-not recovered yet.
+Instruments come back too, read off the envelopes the notes played rather
+than guessed: the stress song's lead is written `s=0.90 r=60 duty=0.25
+vol=0.70` and rips as `s=0.909 r=67 duty=0.250 vol=0.733`, from the register
+log alone.
 
-Next up: recovering instruments and the effect columns.
+An NSF records none of this, so all of it is inferred, and the report says
+which numbers were read and which were guessed — including when two tempos
+fit the evidence equally well. Effect columns and DPCM sample data are not
+recovered yet.
+
+Next up: recovering the effect columns — vibrato, slides and arpeggios.
 
 ## Contributing
 

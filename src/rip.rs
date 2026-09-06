@@ -408,6 +408,247 @@ fn noise_note(idx: u16) -> u8 {
     36 + 4 * (15 - idx.min(15) as u8) + 3
 }
 
+/// The envelope value that produces an observed level at a given column
+/// volume, inverting the driver's `(vol * env) >> 4`.
+fn env_for(level: u8, vol: u8) -> u8 {
+    if level == 0 || vol == 0 {
+        return 0;
+    }
+    ((16 * level as u16).div_ceil(vol as u16)).min(15) as u8
+}
+
+/// One note's envelope, as the chip played it: levels from the key-on until
+/// the channel is keyed again or falls silent.
+#[derive(Clone, Debug)]
+struct NoteEnv {
+    ch: usize,
+    /// The `$4000`-family duty bits this note sounded with.
+    duty: u8,
+    levels: Vec<u8>,
+}
+
+/// An ADSR read off an observed envelope, in frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Adsr {
+    attack: usize,
+    decay: usize,
+    release: usize,
+    peak: u8,
+    sustain: u8,
+}
+
+/// Read an ADSR out of the levels one note actually played.
+///
+/// This is a construction, not a fit. `Envelope::from_adsr` lays a note out
+/// as a rising attack, a decay to a sustain level, a held frame that loops,
+/// and a release to zero — so those four parts can be read straight back off
+/// the shape, provided the shape is read in envelope units rather than
+/// audible ones. The driver plays `(vol * env) >> 4`, and inverting that
+/// first is what makes the reconstruction exact instead of approximate:
+/// `10 9 9 9 7 4 2 0` at full column volume is the envelope
+/// `11 10 10 10 8 5 3 0`, which is `a=0 d=1 s=10/11 r=4` and nothing else.
+fn read_adsr(levels: &[u8], vol: u8) -> Option<Adsr> {
+    let env: Vec<u8> = levels.iter().map(|&l| env_for(l, vol)).collect();
+    let peak = *env.iter().max()?;
+    if peak == 0 {
+        return None;
+    }
+    let at_peak = env.iter().position(|&v| v == peak)?;
+    // Everything before the peak is the attack ramp.
+    let attack = at_peak;
+    // The sustain is the level the envelope settles on: the last value
+    // before it starts falling to silence, or the final value if it never
+    // does. A note cut short by the next key-on never shows its release,
+    // which is why the longest note in a group is the one worth reading.
+    let tail = &env[at_peak..];
+    let end = tail.iter().position(|&v| v == 0).unwrap_or(tail.len());
+    let body = &tail[..end];
+    let released = end < tail.len();
+    // Walk back from the end of the body over the release ramp: strictly
+    // falling values that lead into the silence.
+    let mut r = 0usize;
+    if released {
+        while r + 1 < body.len() && body[body.len() - 1 - r] < body[body.len() - 2 - r] {
+            r += 1;
+        }
+        r += 1; // the step into zero
+    }
+    let sustain = *body.get(body.len().saturating_sub(r + 1)).unwrap_or(&peak);
+    // What is left between the peak and the sustain plateau is the decay.
+    let plateau = body.len().saturating_sub(r);
+    let decay = body[..plateau].iter().position(|&v| v == sustain).unwrap_or(0);
+    Some(Adsr { attack, decay, release: r, peak, sustain })
+}
+
+/// The levels one note played: from its key-on until the channel is keyed
+/// again or falls silent.
+///
+/// Capped, because a note held under a long rest would otherwise drag the
+/// whole remaining trace into one fingerprint. Two seconds is longer than
+/// any envelope the format can express.
+fn played(t: &[FrameTrace], c: usize, from: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in t.iter().skip_while(|f| f.frame < from).take(120) {
+        if f.frame > from && f.ch[c].keyed && f.ch[c].level > 0 {
+            break;
+        }
+        out.push(f.ch[c].level);
+        if f.ch[c].level == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Group the notes by the envelope they played and turn each group into an
+/// instrument, returning the instruments and which one each note uses.
+///
+/// Grouping is on the *shape*, normalised to its own peak, so two notes of
+/// the same voice at different volumes stay together — loudness belongs in
+/// the volume column, not in a second instrument. The longest note in a
+/// group is the one read for the ADSR, because a note cut short by the next
+/// key-on never reveals its release, and in fast music most of them are.
+fn synth_instruments(placed: &[(usize, usize, NoteEnv)]) -> (Vec<Instrument>, Vec<usize>) {
+    // Shape key: the channel, plus the first few frames scaled to the peak.
+    // The channel is part of it because one instrument cannot serve a pulse
+    // and the triangle — their duties and pitch tables differ.
+    // Three frames, padded — deliberately short and a fixed length. In fast
+    // music most notes are cut off by the next key-on long before their
+    // release, so a key that grew with the note would file the same voice
+    // under a different instrument depending on how long it happened to
+    // sound. Three frames reach the peak and the start of the decay, which
+    // is what distinguishes one timbre from another, and every note has
+    // them.
+    const SHAPE: usize = 3;
+    // Eight buckets, rounded. A quiet note carries less of its own shape than
+    // a loud one — four levels can only say so much about a curve — so
+    // comparing at full resolution splits one voice in two on the strength of
+    // rounding alone: 9 of 10 and 4 of 5 are the same envelope and do not
+    // look it. Eight buckets absorb that and still keep a plucked note apart
+    // from a held one.
+    const BUCKETS: u16 = 7;
+    let key = |n: &NoteEnv| -> (usize, Vec<u8>) {
+        let peak = n.levels.iter().copied().max().unwrap_or(0).max(1) as u16;
+        let mut shape: Vec<u8> = n
+            .levels
+            .iter()
+            .take(SHAPE)
+            .map(|&l| ((l as u16 * BUCKETS + peak / 2) / peak) as u8)
+            .collect();
+        let last = shape.last().copied().unwrap_or(0);
+        shape.resize(SHAPE, last);
+        (n.ch, shape)
+    };
+    let mut groups: Vec<((usize, Vec<u8>), Vec<usize>)> = Vec::new();
+    let mut assign = vec![0usize; placed.len()];
+    for (i, (_, _, n)) in placed.iter().enumerate() {
+        let k = key(n);
+        match groups.iter().position(|(g, _)| *g == k) {
+            Some(g) => groups[g].1.push(i),
+            None => groups.push((k, vec![i])),
+        }
+    }
+    // More voices than the table holds: keep the busiest and fold the rest
+    // into the nearest survivor on the same channel.
+    if groups.len() > crate::INSTRUMENTS {
+        groups.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        let spare: Vec<((usize, Vec<u8>), Vec<usize>)> = groups.split_off(crate::INSTRUMENTS);
+        for (k, members) in spare {
+            let home = groups
+                .iter()
+                .position(|(g, _)| g.0 == k.0)
+                .unwrap_or(0);
+            groups[home].1.extend(members);
+        }
+    }
+
+    let mut instruments = Vec::new();
+    for (gi, (_, members)) in groups.iter().enumerate() {
+        // The loudest note in the group is taken to have played at full
+        // column volume; every quieter one then scales down through its own
+        // volume column. Some such convention is needed, because an observed
+        // level is a product of two numbers and only their product is
+        // visible.
+        let longest = members.iter().copied().max_by_key(|&i| placed[i].2.levels.len()).unwrap_or(0);
+        let loudest = members
+            .iter()
+            .map(|&i| placed[i].2.levels.iter().copied().max().unwrap_or(0))
+            .max()
+            .unwrap_or(15);
+        let levels = &placed[longest].2.levels;
+        let scaled: Vec<u8> = levels
+            .iter()
+            .map(|&l| ((l as u16 * loudest as u16) / (levels.iter().copied().max().unwrap_or(1).max(1) as u16)) as u8)
+            .collect();
+        let adsr = read_adsr(&scaled, 15).unwrap_or(Adsr { attack: 0, decay: 0, release: 0, peak: 15, sustain: 15 });
+        instruments.push(adsr.to_instrument(duty_of(&placed[longest].2)));
+        for &m in members {
+            assign[m] = gi;
+        }
+    }
+    if instruments.is_empty() {
+        instruments.push(Instrument::default());
+    }
+    // Two groups that produced the same instrument are the same instrument.
+    // The shape key is a proxy, and a coarse one; this is the check that
+    // matters, and it keeps a song from spending its sixteen slots on
+    // duplicates of one voice.
+    let mut unique: Vec<Instrument> = Vec::new();
+    let mut remap: Vec<usize> = Vec::with_capacity(instruments.len());
+    for inst in &instruments {
+        let same = |a: &Instrument, b: &Instrument| {
+            a.attack_ms == b.attack_ms
+                && a.decay_ms == b.decay_ms
+                && a.release_ms == b.release_ms
+                && (a.sustain - b.sustain).abs() < 1e-3
+                && (a.duty - b.duty).abs() < 1e-3
+                && (a.volume - b.volume).abs() < 1e-3
+        };
+        match unique.iter().position(|u| same(u, inst)) {
+            Some(i) => remap.push(i),
+            None => {
+                unique.push(*inst);
+                remap.push(unique.len() - 1);
+            }
+        }
+    }
+    for a in assign.iter_mut() {
+        *a = remap[*a];
+    }
+    (unique, assign)
+}
+
+/// The duty a note sounded with, as the fraction an `@instr` line carries.
+///
+/// Only the pulses have one. `compile::nes_duty` quantises back to the same
+/// two bits, so these four values survive the round trip exactly; the
+/// triangle, noise and DPCM take the middle setting, which their channels
+/// ignore.
+fn duty_of(n: &NoteEnv) -> f32 {
+    match n.ch {
+        PU1 | PU2 => [0.125, 0.25, 0.5, 0.75][n.duty.min(3) as usize],
+        _ => 0.5,
+    }
+}
+
+/// Frames back to the milliseconds an `@instr` line carries.
+fn ms(frames: usize) -> u16 {
+    (frames as f64 * 1000.0 / 60.0988).round() as u16
+}
+
+impl Adsr {
+    fn to_instrument(self, duty: f32) -> Instrument {
+        Instrument {
+            attack_ms: ms(self.attack),
+            decay_ms: ms(self.decay),
+            sustain: self.sustain as f32 / self.peak.max(1) as f32,
+            release_ms: ms(self.release),
+            duty,
+            volume: self.peak as f32 / 15.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub source: String,
@@ -419,6 +660,8 @@ pub struct Report {
     pub rows: usize,
     pub phrases_total: usize,
     pub phrases_unique: usize,
+    /// Instruments synthesised from the envelopes the notes played.
+    pub instruments: usize,
     /// Audible notes written, per channel.
     pub notes: [usize; CHANNELS],
     /// Key-ons dropped because the channel had no volume at the time.
@@ -509,6 +752,10 @@ impl Report {
         if self.unpitched > 0 {
             s.push_str(&format!("         {} onsets had no nameable pitch and were dropped\n", self.unpitched));
         }
+        s.push_str(&format!(
+            "instr    {} synthesised from the envelopes the notes played\n",
+            self.instruments
+        ));
         if !self.dpcm_samples.is_empty() {
             s.push_str(&format!("dpcm     {} sample(s): {:02X?}\n", self.dpcm_samples.len(), self.dpcm_samples));
         }
@@ -523,6 +770,9 @@ impl Report {
                 "approx   hardware envelopes on {} frames; those levels were simulated, not read\n",
                 self.hw_env_frames
             ));
+        }
+        if !self.dpcm_samples.is_empty() {
+            s.push_str("         the samples themselves are not extracted, so the default bank is used\n");
         }
         s.push_str("lost     instrument identity, phrase boundaries, groove; noise pitch is 4:1\n");
         s
@@ -549,6 +799,9 @@ pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> 
     let n_rows = grid.starts.len();
     let mut rows = vec![[Cell::default(); CHANNELS]; n_rows];
     let mut dpcm_slots: Vec<u8> = Vec::new();
+    // Where each note landed, so its envelope can be turned into an
+    // instrument once every note has been seen.
+    let mut placed: Vec<(usize, usize, NoteEnv)> = Vec::new();
 
     // Notes first, each placed on the row it is *nearest* to rather than the
     // row whose frame window it happens to land in.
@@ -593,14 +846,9 @@ pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> 
                 report.row_collisions += 1;
                 continue;
             }
-            rows[r][c] = Cell {
-                note: Some(n),
-                instr: c as u8,
-                vol: cell_volume(cf.level),
-                fx: None,
-                hold: false,
-            };
+            rows[r][c] = Cell { note: Some(n), instr: 0, vol: cell_volume(cf.level), fx: None, hold: false };
             report.notes[c] += 1;
+            placed.push((r, c, NoteEnv { ch: c, duty: cf.duty, levels: played(t, c, f.frame) }));
         }
     }
 
@@ -642,6 +890,26 @@ pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> 
     report.dpcm_samples = dpcm_slots;
     report.rows = rows.len();
 
+    // Instruments, from the envelopes the notes actually played. This has to
+    // happen before the rows become phrases: an instrument's peak decides
+    // every cell's volume column, and two rows that differ only there are
+    // not the same phrase.
+    let (instruments, assign) = synth_instruments(&placed);
+    report.instruments = instruments.len();
+    for (k, &(r, c, _)) in placed.iter().enumerate() {
+        let idx = assign[k];
+        let peak = (instruments[idx].volume * 15.0).round().max(1.0) as u16;
+        let level = placed[k].2.levels.first().copied().unwrap_or(0) as u16;
+        // Folding may have dropped this row; only touch one that still holds
+        // the note this envelope came from.
+        if let Some(row) = rows.get_mut(r) {
+            if row[c].note.is_some() {
+                row[c].instr = idx as u8;
+                row[c].vol = ((16 * level).div_ceil(peak)).clamp(1, 15) as u8;
+            }
+        }
+    }
+
     let (phrases, order) = crate::phrases_from_rows(&rows)?;
     report.phrases_total = order.len();
     report.phrases_unique = phrases.len();
@@ -652,31 +920,8 @@ pub fn rip(t: &[FrameTrace], opts: &RipOptions) -> Result<(Song, Report, Grid)> 
     song.order = order;
     song.loop_pos = 0;
     song.current_phrase = song.order.first().copied().unwrap_or(0);
-    // One instrument per channel, carrying the duty that channel actually
-    // used. Recovering real envelopes is a separate job; pretending to have
-    // done it here would be the dishonest kind of default.
-    //
-    // The placeholder is a flat gate — no attack, no decay, no release — so
-    // that note lengths come from the cells and nowhere else. viper's normal
-    // default has a 120 ms release, and lending that to a ripped song makes
-    // every note ring past the row that ended it: recompile such a rip and
-    // the notes bleed into their neighbours, so ripping it again reports
-    // holds nobody transcribed. A gate reproduces exactly what was observed
-    // and leaves the envelope question honestly open.
-    for c in 0..CHANNELS.min(crate::INSTRUMENTS) {
-        let duty = t
-            .iter()
-            .find(|f| f.ch[c].keyed && f.ch[c].level > 0)
-            .map(|f| f.ch[c].duty)
-            .unwrap_or(2);
-        song.instruments[c] = Instrument {
-            attack_ms: 0,
-            decay_ms: 0,
-            sustain: 1.0,
-            release_ms: 0,
-            duty: [0.125, 0.25, 0.5, 0.75][duty.min(3) as usize],
-            volume: 1.0,
-        };
+    for (i, inst) in instruments.iter().enumerate() {
+        song.instruments[i] = *inst;
     }
     Ok((song, report, grid))
 }
@@ -850,5 +1095,87 @@ mod tests {
         assert_eq!(report.silent_keyons, 1);
         let written: usize = song.phrases.iter().map(|p| p.cells.iter().filter(|r| r[PU1].note.is_some()).count()).sum();
         assert_eq!(written, 2, "and it reaches no cell");
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn an_observed_note_gives_back_the_envelope_that_played_it() {
+        // The stress song's lead, exactly as the golden log records it. At
+        // full column volume the driver plays (vol * env) >> 4, so these
+        // levels are the envelope 11 10 10 10 8 5 3 0 — which is an instant
+        // attack, one frame of decay, a sustain at 10 of 11, and a release
+        // over four frames. Nothing here is fitted.
+        let a = read_adsr(&[10, 9, 9, 9, 7, 4, 2, 0], 15).unwrap();
+        assert_eq!(a, Adsr { attack: 0, decay: 1, release: 4, peak: 11, sustain: 10 });
+
+        let i = a.to_instrument(0.25);
+        assert_eq!(i.attack_ms, 0);
+        assert_eq!(i.release_ms, 67, "four frames");
+        assert!((i.sustain - 10.0 / 11.0).abs() < 0.01);
+        assert!((i.volume - 11.0 / 15.0).abs() < 0.01, "the source asked for 0.70");
+    }
+
+    #[test]
+    fn a_note_cut_short_reports_no_release_rather_than_a_wrong_one() {
+        // Most notes in fast music are stopped by the next key-on long
+        // before they release. Such a note knows its attack and decay and
+        // nothing about its tail, and must not invent one.
+        let a = read_adsr(&[10, 9, 9, 9], 15).unwrap();
+        assert_eq!(a.release, 0);
+        assert_eq!(a.peak, 11);
+        assert_eq!(a.sustain, 10);
+    }
+
+    #[test]
+    fn a_rising_attack_is_measured_not_assumed() {
+        let a = read_adsr(&[3, 6, 9, 14, 14, 14], 15).unwrap();
+        assert_eq!(a.attack, 3, "three frames before the peak");
+        assert_eq!(a.peak, 15);
+    }
+
+    #[test]
+    fn silence_is_not_an_envelope() {
+        assert!(read_adsr(&[0, 0, 0], 15).is_none());
+        assert!(read_adsr(&[], 15).is_none());
+    }
+
+    #[test]
+    fn the_same_voice_at_two_volumes_is_one_instrument() {
+        // Loudness belongs in the volume column. A quiet note and a loud one
+        // with the same shape must not become two instruments, or a song
+        // with any dynamics burns through the sixteen slots.
+        // The same curve at two volumes, as the chip would have rounded it.
+        let loud = NoteEnv { ch: PU1, duty: 1, levels: vec![10, 9, 9, 9, 7, 4, 2, 0] };
+        let soft = NoteEnv { ch: PU1, duty: 1, levels: vec![5, 4, 4, 4] };
+        let placed = vec![(0, PU1, loud), (4, PU1, soft)];
+        let (instr, assign) = synth_instruments(&placed);
+        assert_eq!(instr.len(), 1, "one voice, two volumes");
+        assert_eq!(assign, vec![0, 0]);
+        // And it is the loud one that sets the instrument's peak, so the
+        // quiet note can scale down through its own column.
+        assert!((instr[0].volume - 11.0 / 15.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn two_different_shapes_stay_apart() {
+        let plucked = NoteEnv { ch: PU1, duty: 1, levels: vec![15, 8, 4, 1, 0] };
+        let held = NoteEnv { ch: PU1, duty: 1, levels: vec![15, 15, 15, 15, 15] };
+        let (instr, assign) = synth_instruments(&vec![(0, PU1, plucked), (4, PU1, held)]);
+        assert_eq!(instr.len(), 2);
+        assert_ne!(assign[0], assign[1]);
+    }
+
+    #[test]
+    fn a_pulse_duty_survives_the_round_trip() {
+        for (bits, frac) in [(0u8, 0.125f32), (1, 0.25), (2, 0.5), (3, 0.75)] {
+            let n = NoteEnv { ch: PU1, duty: bits, levels: vec![15, 15] };
+            let (instr, _) = synth_instruments(&vec![(0, PU1, n)]);
+            assert!((instr[0].duty - frac).abs() < 1e-6);
+            assert_eq!(crate::compile::nes_duty(instr[0].duty), bits, "and quantises back");
+        }
     }
 }
