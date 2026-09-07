@@ -258,7 +258,10 @@ MIDI File into a `.vip` using a map in this same directive grammar:
 Rows are 16ths; held notes become `===`; chords collapse per `flatten`
 (`top` keeps the highest, `root` the lowest), except that a chord shared
 by PU1 and PU2 is voiced root on PU2, fifth on PU1. `midi=` matches a
-track name case-insensitively by substring.
+track name case-insensitively by substring; `nth=2` takes the second
+match when a tab exports two tracks with the same name, and `midi="*"`
+matches any track (so `midi="*" nth=7` is the seventh track with notes,
+for names the file stores in an encoding the importer cannot read).
 
 ### Velocity
 

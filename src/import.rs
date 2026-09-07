@@ -164,6 +164,9 @@ pub struct TrackMap {
     pub vibrato_min_rows: usize,
     /// Per-track override of the song's velocity handling.
     pub velocity: Option<Velocity>,
+    /// Which of the matching MIDI tracks to take, 1-based: tabs often
+    /// export two tracks with the same name.
+    pub nth: usize,
 }
 
 /// What an imported note does with its MIDI velocity.
@@ -305,7 +308,7 @@ pub fn parse_map(text: &str) -> Result<Map> {
                 }
             }
             "track" => {
-                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, fill: false, vibrato: None, vibrato_min_rows: 2, velocity: None };
+                let mut t = TrackMap { midi: String::new(), ch: None, instr: 0, flatten: "top".into(), octave: 0, drums: false, fill: false, vibrato: None, vibrato_min_rows: 2, velocity: None, nth: 1 };
                 for (k, v) in kv(args) {
                     match k.as_str() {
                         "midi" => t.midi = v,
@@ -318,6 +321,7 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "vibrato" => t.vibrato = parse_fx(&v),
                         "vibrato_min_rows" => t.vibrato_min_rows = v.parse().with_context(ctx)?,
                         "velocity" => t.velocity = Some(Velocity::parse(&v).with_context(ctx)?),
+                        "nth" => t.nth = v.parse::<usize>().with_context(ctx)?.max(1),
                         _ => {}
                     }
                 }
@@ -498,9 +502,14 @@ struct Cand {
     vel: u8,
 }
 
-fn find_track<'a>(midi: &'a Midi, name: &str) -> Option<&'a MidiTrack> {
+/// Case-insensitive substring match on the track name (`*` matches any
+/// track), taking the `nth` match (1-based) among tracks that have notes.
+fn find_track<'a>(midi: &'a Midi, name: &str, nth: usize) -> Option<&'a MidiTrack> {
     let want = name.to_ascii_lowercase();
-    midi.tracks.iter().find(|t| t.name.to_ascii_lowercase().contains(&want) && !t.notes.is_empty())
+    midi.tracks
+        .iter()
+        .filter(|t| !t.notes.is_empty() && (want == "*" || t.name.to_ascii_lowercase().contains(&want)))
+        .nth(nth.max(1) - 1)
 }
 
 pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
@@ -523,8 +532,8 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let mut pitched: Vec<(usize, &TrackMap)> = Vec::new();
     let mut drum_track: Option<(&MidiTrack, &TrackMap)> = None;
     for tm in &map.tracks {
-        let Some(t) = find_track(midi, &tm.midi) else {
-            bail!("no MIDI track matching {:?} (have: {})", tm.midi, midi.tracks.iter().map(|t| format!("{:?}", t.name)).collect::<Vec<_>>().join(", "));
+        let Some(t) = find_track(midi, &tm.midi, tm.nth) else {
+            bail!("no MIDI track matching {:?} (nth={}) (have: {})", tm.midi, tm.nth, midi.tracks.iter().map(|t| format!("{:?}", t.name)).collect::<Vec<_>>().join(", "));
         };
         report.tracks.push(format!("{} → {}", t.name, if tm.drums { "drums".to_string() } else { ["PU1", "PU2", "TRI", "NOI", "DPCM"][tm.ch.unwrap()].to_string() }));
         if tm.drums {
