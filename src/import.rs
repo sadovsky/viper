@@ -301,7 +301,7 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "velocity" => m.velocity = Velocity::parse(&v).with_context(ctx)?,
                         "grid" => {
                             m.grid = v.parse().with_context(ctx)?;
-                            if m.grid != 16 && m.grid != 32 { bail!("{}: grid must be 16 or 32", ctx()); }
+                            if m.grid != 16 && m.grid != 32 && m.grid != 48 { bail!("{}: grid must be 16, 32 or 48", ctx()); }
                         }
                         _ => {}
                     }
@@ -518,7 +518,10 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let bpm = map.bpm.unwrap_or(first_tempo.round() as u16);
     report.bpm = bpm;
     let tpq = midi.ticks_per_quarter as u64;
-    let rows_per_quarter = if map.grid == 32 { 8 } else { 4 } as u64;
+    // grid=16: a row is a 16th; 32: a 32nd; 48: a 48th, so 16ths and both
+    // triplet sizes land on integer rows (a tab in triplets otherwise
+    // rounds into a lurch of 3-row and 1-row notes).
+    let rows_per_quarter = match map.grid { 32 => 8, 48 => 12, _ => 4 } as u64;
     let row_ticks = (tpq / rows_per_quarter).max(1);
     let to_row = |tick: u64| -> usize { ((tick as f64 / row_ticks as f64).round()) as usize };
 

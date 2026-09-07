@@ -255,7 +255,8 @@ MIDI File into a `.vip` using a map in this same directive grammar:
 @instr / @dpcm / @driver           # as in .vip, copied into the output
 ```
 
-Rows are 16ths; held notes become `===`; chords collapse per `flatten`
+Rows are 16ths (`grid=32` makes them 32nds, `grid=48` 48ths for a tab in
+triplets); held notes become `===`; chords collapse per `flatten`
 (`top` keeps the highest, `root` the lowest), except that a chord shared
 by PU1 and PU2 is voiced root on PU2, fifth on PU1. `midi=` matches a
 track name case-insensitively by substring; `nth=2` takes the second
