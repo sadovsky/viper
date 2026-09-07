@@ -256,7 +256,8 @@ MIDI File into a `.vip` using a map in this same directive grammar:
 ```
 
 Rows are 16ths (`grid=32` makes them 32nds, `grid=48` 48ths for a tab in
-triplets, where a bar is three phrases and a long song can pass 256
+triplets, `grid=96` 96ths for one that mixes 32nds and triplets; on the
+finer grids a bar is three or six phrases and a long song can pass 256
 unique phrases: indices are hex of any width, without a ceiling); held notes
 become `===`; chords collapse per `flatten`
 (`top` keeps the highest, `root` the lowest), except that a chord shared

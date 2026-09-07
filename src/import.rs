@@ -325,7 +325,7 @@ pub fn parse_map(text: &str) -> Result<Map> {
                         "velocity" => m.velocity = Velocity::parse(&v).with_context(ctx)?,
                         "grid" => {
                             m.grid = v.parse().with_context(ctx)?;
-                            if m.grid != 16 && m.grid != 32 && m.grid != 48 { bail!("{}: grid must be 16, 32 or 48", ctx()); }
+                            if ![16, 32, 48, 96].contains(&m.grid) { bail!("{}: grid must be 16, 32, 48 or 96", ctx()); }
                         }
                         _ => {}
                     }
@@ -559,8 +559,10 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let tpq = midi.ticks_per_quarter as u64;
     // grid=16: a row is a 16th; 32: a 32nd; 48: a 48th, so 16ths and both
     // triplet sizes land on integer rows (a tab in triplets otherwise
-    // rounds into a lurch of 3-row and 1-row notes).
-    let rows_per_quarter = match map.grid { 32 => 8, 48 => 12, _ => 4 } as u64;
+    // rounds into a lurch of 3-row and 1-row notes); 96: a 96th, for a
+    // tab that mixes 32nds with triplets. The driver quantises rows to
+    // frames either way, so a finer grid costs nothing in timing.
+    let rows_per_quarter = match map.grid { 32 => 8, 48 => 12, 96 => 24, _ => 4 } as u64;
     let row_ticks = (tpq / rows_per_quarter).max(1);
     let to_row = |tick: u64| -> usize { ((tick as f64 / row_ticks as f64).round()) as usize };
 
@@ -665,6 +667,10 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     // --- a drum part for a tab that has none
     if drum_rows.is_empty() {
         if let Some(a) = &map.autodrums {
+            // A synthesised kit has no dynamics of its own; every hit lands
+            // at the same solid velocity and the map's `velocity=` handling
+            // decides what that becomes on the tracker side.
+            const AUTO_VEL: u8 = 100;
             let src = pitched.iter().find(|(_, tm)| tm.midi.to_ascii_lowercase().contains(&a.kick_from.to_ascii_lowercase()));
             let onsets: Vec<usize> = match src {
                 Some((ti, _)) => chords[*ti].keys().copied().collect(),
@@ -677,23 +683,23 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
             let mut last_kick = usize::MAX;
             for r in &onsets {
                 if last_kick == usize::MAX || r.saturating_sub(last_kick) >= a.kick_gap.max(1) {
-                    drum_rows.entry(*r).or_default().push(36);
+                    drum_rows.entry(*r).or_default().push((36, AUTO_VEL));
                     last_kick = *r;
                 }
             }
             for r in 0..=last_row {
                 if a.snare_rows.contains(&(r % STEPS_PER_PHRASE)) {
-                    drum_rows.entry(r).or_default().push(38);
+                    drum_rows.entry(r).or_default().push((38, AUTO_VEL));
                 }
                 if a.hat_every > 0 && r % a.hat_every == 0 {
-                    drum_rows.entry(r).or_default().push(42);
+                    drum_rows.entry(r).or_default().push((42, AUTO_VEL));
                 }
             }
             if a.crash_after > 0 {
                 let mut prev = usize::MAX;
                 for r in &onsets {
                     if prev == usize::MAX || r - prev >= a.crash_after {
-                        drum_rows.entry(*r).or_default().push(49);
+                        drum_rows.entry(*r).or_default().push((49, AUTO_VEL));
                     }
                     prev = *r;
                 }
