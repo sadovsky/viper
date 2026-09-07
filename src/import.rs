@@ -170,6 +170,29 @@ pub enum DrumTarget {
     Noi { note: u8, instr: u8 },
 }
 
+/// `@autodrums` — build a drum part for a tab that has none, out of the
+/// music that is there: the kick follows another track's onsets (the
+/// bass, normally), the snare marks the backbeat, the hat keeps time.
+#[derive(Clone, Debug)]
+pub struct AutoDrums {
+    /// MIDI track whose onsets the kick follows (substring match).
+    pub kick_from: String,
+    /// Rows within a 16-row bar that get a snare.
+    pub snare_rows: Vec<usize>,
+    /// A hat every N rows; 0 = none.
+    pub hat_every: usize,
+    /// Crash the first row and after a rest this long; 0 = none.
+    pub crash_after: usize,
+    /// Minimum rows between two kicks.
+    pub kick_gap: usize,
+}
+
+impl Default for AutoDrums {
+    fn default() -> Self {
+        Self { kick_from: String::new(), snare_rows: vec![4, 12], hat_every: 2, crash_after: 8, kick_gap: 2 }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Map {
     pub title: String,
@@ -190,6 +213,7 @@ pub struct Map {
     /// `@source midi=...` — the MIDI this map is written for, relative to
     /// the map file. Lets `viper import --map x.vmap` stand alone.
     pub source: Option<PathBuf>,
+    pub autodrums: Option<AutoDrums>,
 }
 
 fn parse_noi_target(v: &str) -> Result<DrumTarget> {
@@ -340,6 +364,20 @@ pub fn parse_map(text: &str) -> Result<Map> {
                 }
                 m.samples[idx] = r;
             }
+            "autodrums" => {
+                let mut a = AutoDrums::default();
+                for (k, v) in kv(args) {
+                    match k.as_str() {
+                        "kick" | "kick_from" => a.kick_from = v,
+                        "snare" => a.snare_rows = v.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+                        "hat" => a.hat_every = v.parse().with_context(ctx)?,
+                        "crash" => a.crash_after = v.parse().with_context(ctx)?,
+                        "kick_gap" => a.kick_gap = v.parse().with_context(ctx)?,
+                        _ => {}
+                    }
+                }
+                m.autodrums = Some(a);
+            }
             "source" => {
                 for (k, v) in kv(args) {
                     if k == "midi" { m.source = Some(PathBuf::from(v)); }
@@ -382,6 +420,7 @@ pub struct Report {
     pub notes_clamped: usize,
     pub tempo_changes: usize,
     pub filled_rows: usize,
+    pub drums_synthesised: usize,
     pub drum_dpcm_conflicts: usize,
     pub drum_fallbacks: usize,
     pub drum_dropped: usize,
@@ -392,9 +431,9 @@ pub struct Report {
 impl Report {
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "{} BPM, {} rows → {} phrases ({} unique); tracks: {}\nchords flattened {} (voiced across PU1/PU2 {}), notes clamped {}, tempo changes {}, fill notes placed {}\ndrums: DPCM conflicts {} (fallback {}, dropped {}), noise conflicts {}",
+            "{} BPM, {} rows → {} phrases ({} unique); tracks: {}\nchords flattened {} (voiced across PU1/PU2 {}), notes clamped {}, tempo changes {}, fill notes placed {}, drum rows synthesised {}\ndrums: DPCM conflicts {} (fallback {}, dropped {}), noise conflicts {}",
             self.bpm, self.rows, self.phrases_total, self.phrases_unique, self.tracks.join(", "),
-            self.chords_flattened, self.voiced_chords, self.notes_clamped, self.tempo_changes, self.filled_rows,
+            self.chords_flattened, self.voiced_chords, self.notes_clamped, self.tempo_changes, self.filled_rows, self.drums_synthesised,
             self.drum_dpcm_conflicts, self.drum_fallbacks, self.drum_dropped, self.noi_conflicts
         );
         for w in &self.warnings {
@@ -520,6 +559,46 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     }
     tempo_map.dedup_by_key(|e| e.0);
     report.tempo_changes = tempo_map.len();
+
+    // --- a drum part for a tab that has none
+    if drum_rows.is_empty() {
+        if let Some(a) = &map.autodrums {
+            let src = pitched.iter().find(|(_, tm)| tm.midi.to_ascii_lowercase().contains(&a.kick_from.to_ascii_lowercase()));
+            let onsets: Vec<usize> = match src {
+                Some((ti, _)) => chords[*ti].keys().copied().collect(),
+                None => {
+                    report.warnings.push(format!("@autodrums kick={:?} matches no mapped track; kick follows the first one", a.kick_from));
+                    chords.first().map(|c| c.keys().copied().collect()).unwrap_or_default()
+                }
+            };
+            let last_row = onsets.iter().copied().max().unwrap_or(0);
+            let mut last_kick = usize::MAX;
+            for r in &onsets {
+                if last_kick == usize::MAX || r.saturating_sub(last_kick) >= a.kick_gap.max(1) {
+                    drum_rows.entry(*r).or_default().push(36);
+                    last_kick = *r;
+                }
+            }
+            for r in 0..=last_row {
+                if a.snare_rows.contains(&(r % STEPS_PER_PHRASE)) {
+                    drum_rows.entry(r).or_default().push(38);
+                }
+                if a.hat_every > 0 && r % a.hat_every == 0 {
+                    drum_rows.entry(r).or_default().push(42);
+                }
+            }
+            if a.crash_after > 0 {
+                let mut prev = usize::MAX;
+                for r in &onsets {
+                    if prev == usize::MAX || r - prev >= a.crash_after {
+                        drum_rows.entry(*r).or_default().push(49);
+                    }
+                    prev = *r;
+                }
+            }
+            report.drums_synthesised = drum_rows.len();
+        }
+    }
 
     // --- total rows
     let mut last_row = 0usize;
