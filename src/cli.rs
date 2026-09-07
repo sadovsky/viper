@@ -509,6 +509,8 @@ fn render(a: &Args) -> Result<()> {
         let (intro, looped) = s.intro_and_loop_frames();
         let tail = (opts.tail_seconds * 60.0988) as u32;
         fixed_frames = Some(intro + looped * opts.loops.max(1) + tail);
+        // The tail is silence after the last loop, not the song starting over.
+        opts.cut_frame = Some(intro + looped * opts.loops.max(1));
         bpm_from_vip = Some(song.bpm as f64);
         println!("from {}: intro {} frames, loop {} frames × {}", vp.display(), intro, looped, opts.loops.max(1));
     }

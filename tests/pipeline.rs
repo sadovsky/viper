@@ -315,18 +315,18 @@ fn the_frame_table_decodes_the_golden_log_back_into_the_stress_song() {
     let text = std::fs::read_to_string(root().join("tests/golden/stress_melodeath.log")).unwrap();
     let log = viper_apu::verify::parse_log(&text);
     let t = viper_apu::trace(&log);
-    assert_eq!(t.len(), 257, "one entry per frame in the log");
+    assert_eq!(t.len(), 197, "one entry per frame in the log: the render cuts at the loop end, then a silent tail");
 
     use viper_apu::trace::{NOI, PU1, PU2, TRI};
     let keys = |c: usize| t.iter().filter(|f| f.ch[c].keyed).count();
     let audible = |c: usize| t.iter().filter(|f| f.ch[c].keyed && f.ch[c].level > 0).count();
-    assert_eq!([keys(PU1), keys(PU2), keys(TRI), keys(NOI)], [52, 52, 48, 49]);
+    assert_eq!([keys(PU1), keys(PU2), keys(TRI), keys(NOI)], [37, 37, 33, 34]);
 
     // Frame 127 is the last row of phrase 01, which is empty. The driver
     // keys three channels there anyway, with every volume at zero. Reading
     // key-ons as notes would invent three notes that were never audible —
     // so the level, not the key-on, is what makes a note.
-    assert_eq!([audible(PU1), audible(PU2), audible(TRI)], [51, 51, 47]);
+    assert_eq!([audible(PU1), audible(PU2), audible(TRI)], [36, 36, 32]);
     for c in [PU1, PU2, TRI] {
         assert!(t[127].ch[c].keyed && t[127].ch[c].level == 0, "silent key-on at frame 127");
     }

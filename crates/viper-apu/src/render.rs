@@ -20,11 +20,16 @@ pub struct RenderOptions {
     pub tail_seconds: f64,
     /// Render per-channel stems (and per-sample DPCM stems).
     pub stems: bool,
+    /// Frame at which to stop the song and let the tail be silence, for
+    /// callers that know the length (`--vip`). `render` cuts at the end
+    /// of the last loop on its own; without a cut the tail would be the
+    /// song starting over.
+    pub cut_frame: Option<u32>,
 }
 
 impl Default for RenderOptions {
     fn default() -> Self {
-        Self { song: 0, sample_rate: 44_100, loops: 1, max_seconds: 300.0, tail_seconds: 1.0, stems: false }
+        Self { song: 0, sample_rate: 44_100, loops: 1, max_seconds: 300.0, tail_seconds: 1.0, stems: false, cut_frame: None }
     }
 }
 
@@ -87,16 +92,36 @@ fn analyze(nsf: &Nsf, opts: &RenderOptions) -> Result<(Option<(u32, u32)>, Vec<u
     Ok((found, dpcm))
 }
 
-fn run(nsf: &Nsf, opts: &RenderOptions, frames: u32, mask: u8, dmc_filter: Option<u8>, keep_log: bool) -> Result<Player> {
+fn run(nsf: &Nsf, opts: &RenderOptions, frames: u32, mask: u8, dmc_filter: Option<u8>, keep_log: bool, cut: Option<u32>) -> Result<Player> {
     let mut p = Player::new(nsf.clone(), opts.sample_rate);
     p.keep_log = keep_log;
     p.set_mask(mask);
     p.apu.dmc_filter = dmc_filter;
     p.init(opts.song)?;
-    for _ in 0..frames {
-        p.frame()?;
+    for f in 0..frames {
+        match cut {
+            Some(c) if f >= c => {
+                if f == c { p.silence(); }
+                p.frame_idle();
+            }
+            _ => { p.frame()?; }
+        }
+    }
+    if let Some(c) = cut {
+        fade_into_cut(&mut p.samples, c, opts.sample_rate);
     }
     Ok(p)
+}
+
+/// A 10 ms ramp down to the cut so the silence does not start with a click.
+fn fade_into_cut(samples: &mut [f32], cut_frame: u32, sample_rate: u32) {
+    let at = (cut_frame as f64 * sample_rate as f64 / 60.0988) as usize;
+    let n = (sample_rate / 100) as usize;
+    if at == 0 || at > samples.len() { return; }
+    let start = at.saturating_sub(n);
+    for (i, s) in samples[start..at].iter_mut().enumerate() {
+        *s *= 1.0 - i as f32 / (at - start) as f32;
+    }
 }
 
 /// The per-channel stems this NSF has. The VRC6 three appear only when the
@@ -119,12 +144,13 @@ pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
     let (loop_info, dpcm_samples) = analyze(nsf, opts)?;
     let fps = 60.0988;
     let tail = (opts.tail_seconds * fps) as u32;
-    let (loop_frames, total_frames) = match loop_info {
-        Some((start, len)) => (Some(len), start + len * opts.loops.max(1) + tail),
-        None => (None, (opts.max_seconds * fps) as u32),
+    let (loop_frames, total_frames, cut) = match loop_info {
+        Some((start, len)) => (Some(len), start + len * opts.loops.max(1) + tail, Some(start + len * opts.loops.max(1))),
+        None => (None, (opts.max_seconds * fps) as u32, None),
     };
+    let cut = opts.cut_frame.or(cut);
 
-    let full = run(nsf, opts, total_frames, CH_ALL, None, true)?;
+    let full = run(nsf, opts, total_frames, CH_ALL, None, true, cut)?;
     let mut result = RenderResult {
         mix: full.samples,
         stems: Vec::new(),
@@ -137,15 +163,15 @@ pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
     };
     if opts.stems {
         for (name, mask) in stem_specs(nsf) {
-            let p = run(nsf, opts, total_frames, mask, None, false)?;
+            let p = run(nsf, opts, total_frames, mask, None, false, cut)?;
             result.stems.push(Stem { name: name.to_string(), samples: p.samples });
         }
         if dpcm_samples.is_empty() {
-            let p = run(nsf, opts, total_frames, CH_DMC, None, false)?;
+            let p = run(nsf, opts, total_frames, CH_DMC, None, false, cut)?;
             result.stems.push(Stem { name: "dpcm".to_string(), samples: p.samples });
         } else {
             for (i, &addr) in dpcm_samples.iter().enumerate() {
-                let p = run(nsf, opts, total_frames, CH_DMC, Some(addr), false)?;
+                let p = run(nsf, opts, total_frames, CH_DMC, Some(addr), false, cut)?;
                 result.stems.push(Stem { name: format!("dpcm{}", i), samples: p.samples });
             }
         }
@@ -157,7 +183,8 @@ pub fn render(nsf: &Nsf, opts: &RenderOptions) -> Result<RenderResult> {
 /// requested. Used when the caller already knows the song length.
 pub fn render_frames(nsf: &Nsf, opts: &RenderOptions, frames: u32) -> Result<RenderResult> {
     let (_, dpcm_samples) = analyze(nsf, &RenderOptions { max_seconds: frames as f64 / 60.0988 + 0.1, ..opts.clone() })?;
-    let full = run(nsf, opts, frames, CH_ALL, None, true)?;
+    let cut = opts.cut_frame;
+    let full = run(nsf, opts, frames, CH_ALL, None, true, cut)?;
     let mut result = RenderResult {
         mix: full.samples,
         stems: Vec::new(),
@@ -170,15 +197,15 @@ pub fn render_frames(nsf: &Nsf, opts: &RenderOptions, frames: u32) -> Result<Ren
     };
     if opts.stems {
         for (name, mask) in stem_specs(nsf) {
-            let p = run(nsf, opts, frames, mask, None, false)?;
+            let p = run(nsf, opts, frames, mask, None, false, cut)?;
             result.stems.push(Stem { name: name.to_string(), samples: p.samples });
         }
         if dpcm_samples.is_empty() {
-            let p = run(nsf, opts, frames, CH_DMC, None, false)?;
+            let p = run(nsf, opts, frames, CH_DMC, None, false, cut)?;
             result.stems.push(Stem { name: "dpcm".to_string(), samples: p.samples });
         } else {
             for (i, &addr) in dpcm_samples.iter().enumerate() {
-                let p = run(nsf, opts, frames, CH_DMC, Some(addr), false)?;
+                let p = run(nsf, opts, frames, CH_DMC, Some(addr), false, cut)?;
                 result.stems.push(Stem { name: format!("dpcm{}", i), samples: p.samples });
             }
         }

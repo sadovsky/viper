@@ -258,6 +258,31 @@ impl Player {
         Ok(spent)
     }
 
+    /// One frame with no PLAY call: the APU idles on whatever it was left
+    /// doing. Used for the tail after a render has been cut at the loop.
+    pub fn frame_idle(&mut self) {
+        self.frame += 1;
+        self.cycle_acc += self.cycles_per_frame;
+        let frame_cycles = self.cycle_acc.floor() as u32;
+        self.cycle_acc -= frame_cycles as f64;
+        for _ in 0..frame_cycles {
+            self.tick_apu();
+        }
+    }
+
+    /// Stop the song where it stands: pulses and noise to volume 0, the
+    /// triangle and DMC off. Not logged — it is the renderer's doing, not
+    /// the driver's.
+    pub fn silence(&mut self) {
+        self.apu.write(0x4000, 0x30);
+        self.apu.write(0x4004, 0x30);
+        self.apu.write(0x400C, 0x30);
+        self.apu.write(0x4015, 0x03);
+        self.vrc6.write(0x9000, 0);
+        self.vrc6.write(0xA000, 0);
+        self.vrc6.write(0xB000, 0);
+    }
+
     /// Hash of all CPU-visible RAM. Two frames with identical hashes at
     /// their boundary mean the driver is in an identical state: the song
     /// has looped.

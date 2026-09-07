@@ -634,10 +634,17 @@ pub fn import(midi: &Midi, map: &Map) -> Result<(Song, Report)> {
     let mut grid: Vec<[Cell; CHANNELS]> = vec![[Cell::default(); CHANNELS]; total_rows];
     for (ch, lane, tm) in &lanes {
         for (r, n) in lane {
-            // a fill track only writes where its channel is still free
+            // A fill track only writes where its channel is free. Its onset
+            // may land on the last hold row of the note before it (tab
+            // exports round note-offs onto the next onset's row); cutting
+            // that row keeps the fill continuous instead of dropping the
+            // note and leaving a gap. A hold that continues past the onset
+            // is a real sustain and still wins. Later rows stop at the next
+            // onset below.
             if tm.fill {
-                let busy = (0..n.len_rows).any(|h| r + h < total_rows && (grid[r + h][*ch].note.is_some() || grid[r + h][*ch].hold));
-                if busy { continue; }
+                let cell = grid[*r][*ch];
+                let sustained = cell.hold && r + 1 < total_rows && grid[r + 1][*ch].hold;
+                if cell.note.is_some() || sustained { continue; }
                 report.filled_rows += 1;
             }
             // The predicate ignores the vibrato itself: a note shorter than the
