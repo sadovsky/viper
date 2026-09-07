@@ -349,8 +349,7 @@ fn compile_cmd(a: &Args) -> Result<()> {
         }
         None => None,
     };
-    let mut module: Option<viper_nsf::Module> = None;
-    let mut total_frames = 0u32;
+    let mut songs = Vec::new();
     for path in &paths {
         let (mut song, warnings) = load_song(path)?;
         for w in &warnings {
@@ -365,26 +364,59 @@ fn compile_cmd(a: &Args) -> Result<()> {
                     .context("compile: pass --driver BIN or add an @driver directive to the song")?,
             );
         }
-        let lowered = compile::lower(&song, path.parent())?;
-        for w in &lowered.warnings {
-            eprintln!("warning: {}: {}", path.display(), w);
-        }
-        total_frames += lowered.module.songs[0].total_frames();
-        match module.as_mut() {
-            None => module = Some(lowered.module),
-            Some(m) => m.songs.extend(lowered.module.songs),
-        }
+        songs.push((song, path.clone()));
     }
-    let mut module = module.unwrap();
-    if let Some(t) = a.get("title") {
-        if module.songs.len() == 1 {
-            module.songs[0].title = t.to_string();
-        } else {
-            module.album = t.to_string();
+    let build = |pack: usize, warn: bool| -> Result<(viper_nsf::Module, u32)> {
+        let mut module: Option<viper_nsf::Module> = None;
+        let mut total_frames = 0u32;
+        for (song, path) in &songs {
+            let lowered = compile::lower_with(song, path.parent(), pack)?;
+            if warn {
+                for w in &lowered.warnings {
+                    eprintln!("warning: {}: {}", path.display(), w);
+                }
+            }
+            total_frames += lowered.module.songs[0].total_frames();
+            match module.as_mut() {
+                None => module = Some(lowered.module),
+                Some(m) => m.songs.extend(lowered.module.songs),
+            }
         }
-    }
+        let mut module = module.unwrap();
+        if let Some(t) = a.get("title") {
+            if module.songs.len() == 1 {
+                module.songs[0].title = t.to_string();
+            } else {
+                module.album = t.to_string();
+            }
+        }
+        Ok((module, total_frames))
+    };
     let driver = driver.unwrap();
-    let emitted = viper_nsf::emit(&module, &driver)?;
+    let (mut module, total_frames) = build(1, true)?;
+    let mut emitted = viper_nsf::emit(&module, &driver)?;
+    if emitted.spilled {
+        // Past $C000 the image is still a valid NSF but no cartridge bank
+        // can hold it. Packing phrases into longer patterns trades order
+        // list bytes for stream sharing, so try each run length and keep
+        // the smallest.
+        let unpacked = emitted.data_bytes;
+        let mut best_k = 1;
+        for k in [2usize, 3, 4, 6] {
+            let (packed, _) = build(k, false)?;
+            let again = viper_nsf::emit(&packed, &driver)?;
+            if again.data_bytes < emitted.data_bytes {
+                best_k = k;
+                module = packed;
+                emitted = again;
+            }
+        }
+        if best_k > 1 {
+            println!("packed   {} phrases a pattern: song data {} → {} bytes{}", best_k, unpacked, emitted.data_bytes, if emitted.spilled { " (still past $C000)" } else { "" });
+        } else {
+            println!("song data {} bytes runs past $C000; no pattern packing helps", unpacked);
+        }
+    }
     for w in &emitted.warnings {
         eprintln!("warning: {}", w);
     }

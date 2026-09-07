@@ -40,6 +40,9 @@ pub struct EmitResult {
     /// Bytes of song data (everything after the driver, before samples).
     pub data_bytes: usize,
     pub sample_bytes: usize,
+    /// Song data ran past the DPCM area at $C000. Still a valid NSF, but
+    /// a cartridge that banks the image below $C000 cannot carry it.
+    pub spilled: bool,
     pub warnings: Vec<String>,
 }
 
@@ -149,6 +152,7 @@ struct Layout {
     blobs: Vec<Vec<u8>>,
     blob_addr: Vec<usize>,
     samples_placed: bool,
+    spilled: bool,
 }
 
 impl Layout {
@@ -180,6 +184,9 @@ impl Layout {
         }
         if self.end() + bytes.len() > IMAGE_END {
             bail!("song data exceeds the 32 KB image (needs ${:04X})", self.end() + bytes.len());
+        }
+        if self.samples_placed && !bytes.is_empty() {
+            self.spilled = true;
         }
         let addr = self.end();
         self.image.extend_from_slice(bytes);
@@ -243,7 +250,7 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     }
     let sample_bytes = if sample_blobs.is_empty() { 0 } else { cursor - DPCM_BASE };
 
-    let mut lay = Layout { base, image: driver.bin.clone(), blobs: sample_blobs.clone(), blob_addr: sample_addr.clone(), samples_placed: false };
+    let mut lay = Layout { base, image: driver.bin.clone(), blobs: sample_blobs.clone(), blob_addr: sample_addr.clone(), samples_placed: false, spilled: false };
     debug_assert_eq!(lay.end(), driver.song_table as usize);
 
     // --- song table ---
@@ -407,7 +414,8 @@ pub fn emit(module: &Module, driver: &Driver) -> Result<EmitResult> {
     nsf.extend_from_slice(&header);
     nsf.extend_from_slice(&image);
     let nsfe = build_nsfe(module, driver, &image);
-    Ok(EmitResult { nsf, nsfe, data_bytes, sample_bytes, warnings })
+    let spilled = lay.spilled;
+    Ok(EmitResult { nsf, nsfe, data_bytes, sample_bytes, spilled, warnings })
 }
 
 fn viper_nsf_header(load: u16, init: u16, play: u16, songs: u8, name: &str, artist: &str, copyright: &str, expansion: u8) -> [u8; 128] {

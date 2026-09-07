@@ -46,7 +46,46 @@ pub struct Lowered {
 }
 
 /// Lower a song. `base_dir` resolves `@dpcm` sample paths.
+/// Pack runs of consecutive order entries into longer patterns. The
+/// driver reads rows-per-pattern from the header and keeps state across
+/// rows and patterns alike, so a bar of six 16-row phrases plays the
+/// same as one 96-row pattern; what changes is the order list, which
+/// costs ten bytes an entry and was most of a fine-grid song's data.
+/// Longer patterns share fewer streams, though, so which run length `k`
+/// is smallest depends on the song; the compiler tries each. A `k` that
+/// does not divide both the order and the loop point leaves the song as
+/// it is. Packed patterns are deduplicated.
+fn pack_patterns(patterns: Vec<Pattern>, order: Vec<usize>, loop_pos: usize, k: usize) -> (Vec<Pattern>, Vec<usize>, usize, u8) {
+    if k < 2 || order.len() < k || order.len() % k != 0 || loop_pos % k != 0 || STEPS_PER_PHRASE * k > 255 {
+        return (patterns, order, loop_pos, STEPS_PER_PHRASE as u8);
+    }
+    let mut packed: Vec<Pattern> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut new_order = Vec::with_capacity(order.len() / k);
+    for group in order.chunks(k) {
+        let mut rows = Vec::with_capacity(STEPS_PER_PHRASE * k);
+        for &pi in group {
+            rows.extend(patterns[pi].rows.iter().cloned());
+        }
+        let key = format!("{:?}", rows);
+        let idx = *index.entry(key).or_insert_with(|| {
+            packed.push(Pattern { rows: rows.clone() });
+            packed.len() - 1
+        });
+        new_order.push(idx);
+    }
+    (packed, new_order, loop_pos / k, (STEPS_PER_PHRASE * k) as u8)
+}
+
 pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
+    lower_with(song, base_dir, 1)
+}
+
+/// `pack` > 1 runs that many consecutive phrases together into longer
+/// patterns (see `pack_patterns`); the compiler asks for it only when a
+/// song's data would otherwise run past $C000, so ordinary songs keep
+/// their exact register logs.
+pub fn lower_with(song: &Song, base_dir: Option<&Path>, pack: usize) -> Result<Lowered> {
     let mut warnings: Vec<String> = Vec::new();
     let mut unknown_fx: BTreeSet<char> = BTreeSet::new();
     let mut low_notes = 0usize;
@@ -164,10 +203,11 @@ pub fn lower(song: &Song, base_dir: Option<&Path>) -> Result<Lowered> {
     }
 
     let title = if song.title.is_empty() { "viper".to_string() } else { song.title.clone() };
+    let (patterns, order, loop_pos, rows_per_pattern) = pack_patterns(patterns, order, loop_pos, pack);
     let nsf_song = NsfSong {
         title,
         frames_per_row: NsfSong::frames_per_row_for_bpm(song.bpm as f64),
-        rows_per_pattern: STEPS_PER_PHRASE as u8,
+        rows_per_pattern,
         patterns,
         order,
         loop_pos,
