@@ -140,8 +140,11 @@ pub(crate) fn phrases_from_rows(rows: &[[Cell; CHANNELS]]) -> anyhow::Result<(Ve
         });
         order.push(idx);
     }
-    if phrases.len() > 256 {
-        anyhow::bail!("{} unique phrases; the .vip format holds 256", phrases.len());
+    // Phrase indices are hex of any width in the text and usize in the
+    // song and the order list; the driver addresses patterns by pointer.
+    // 1024 is a sanity ceiling, not a format one.
+    if phrases.len() > 1024 {
+        anyhow::bail!("{} unique phrases; more than 1024 is not a song, it is a recording", phrases.len());
     }
     Ok((phrases, order))
 }
